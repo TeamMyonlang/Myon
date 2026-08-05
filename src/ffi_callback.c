@@ -42,10 +42,11 @@ long long myon_ffi_callback_dispatch(int slot, int argc, const long long *args);
  * One registration slot.  `active` guards against firing a trampoline whose
  * slot has been unregistered.  The Myon function value (fn) and interpreter
  * context (it) are owned by interpreter.c via the dispatch path; this file only
- * records the active flag and hands trampoline pointers out.
+ * records the arg_count and active flag and hands trampoline pointers out.
  */
 typedef struct {
     int active;
+    int arg_count;
     void *fn_ptr;   /* the trampoline pointer handed to C for this slot */
 } CBSlot;
 
@@ -128,6 +129,7 @@ void *ffi_callback_register(Interp *it, Value fn, int arg_count) {
     for (int s = 0; s < MYON_FFI_CB_SLOTS; s++) {
         if (!g_slots[s].active) {
             g_slots[s].active = 1;
+            g_slots[s].arg_count = arg_count;
             g_slots[s].fn_ptr = g_tramp[s][arg_count];
             myon_ffi_callback_bind_slot(s, it, fn, arg_count);
             return g_slots[s].fn_ptr;
@@ -141,6 +143,7 @@ void ffi_callback_unregister(void *ptr) {
     for (int s = 0; s < MYON_FFI_CB_SLOTS; s++) {
         if (g_slots[s].active && g_slots[s].fn_ptr == ptr) {
             g_slots[s].active = 0;
+            g_slots[s].arg_count = 0;
             g_slots[s].fn_ptr = NULL;
             myon_ffi_callback_clear_slot(s);
             return;
@@ -152,6 +155,7 @@ void ffi_callback_reset_all(void) {
     for (int s = 0; s < MYON_FFI_CB_SLOTS; s++) {
         if (g_slots[s].active) {
             g_slots[s].active = 0;
+            g_slots[s].arg_count = 0;
             g_slots[s].fn_ptr = NULL;
             myon_ffi_callback_clear_slot(s);
         }

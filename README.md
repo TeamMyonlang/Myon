@@ -114,15 +114,7 @@ Step 16 で最小実装した標準ライブラリ `myon.math` / `myon.string` �
 丸め誤差なく扱えます。文字列関数の `length` は **文字数**、`byte_length` は **バイト数**
 を返し、`substring` / `index_of` など索引系は全て **文字数ベース**（UTF-8 マルチバイト
 安全）です。`mod` / `substring` / `repeat` / `to_int` / `to_float` はゼロ除算・範囲外・
-パース失敗を `(value, error)` の2値で返します。
-
-> **注記（実装との食い違い）**：現在の実装では `myon.string.length` は **バイト数**
-> （`strlen`、後方互換のため）を返し、UTF-8 **文字数**（コードポイント数）は
-> `myon.string.length_chars` が返します。上記の記述・仕様書にあるバイト数関数
-> `byte_length` はこの時点では未実装です（実際のAPIは `length_chars`）。`substring` /
-> `index_of` などの索引系は引き続き文字数ベース（UTF-8 マルチバイト安全）です。
-
-回帰テストは
+パース失敗を `(value, error)` の2値で返します。回帰テストは
 `tests/cases/p35_math_int_precision`（境界値精度）、`p35_math_full`（数学フルセット）、
 `p35_string_utf8_length`（文字数/バイト数）、`p35_string_full`（文字列フルセット）で
 カバーします。全関数のシグネチャは仕様書

@@ -75,17 +75,6 @@ int env_get(Env *env, const char *name, Value *out) {
     return 0;
 }
 
-/* Borrowed lookup through the scope chain. Returns a pointer to the stored
- * value (not a copy), or NULL if unbound. The pointer stays valid until the
- * binding is mutated or freed. */
-Value *env_find(Env *env, const char *name) {
-    for (Env *e = env; e; e = e->parent) {
-        Binding *b = find_local(e, name);
-        if (b) return &b->value;
-    }
-    return NULL;
-}
-
 int env_set(Env *env, const char *name, Value v) {
     for (Env *e = env; e; e = e->parent) {
         Binding *b = find_local(e, name);
