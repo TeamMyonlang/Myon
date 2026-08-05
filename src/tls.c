@@ -19,6 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <limits.h>       /* INT_MAX */
 #include <sys/select.h>   /* fd_set, FD_ZERO, FD_SET, select() (Phase5.2) */
 
 #include <openssl/ssl.h>
@@ -109,10 +110,14 @@ TlsConn *tls_connect(int raw_fd, const char *hostname, char **err_msg) {
         int se = SSL_get_error(ssl, rc);
         if (se == SSL_ERROR_WANT_READ || se == SSL_ERROR_WANT_WRITE) {
             fd_set fds; FD_ZERO(&fds); FD_SET(raw_fd, &fds);
-            if (se == SSL_ERROR_WANT_WRITE)
-                select(raw_fd + 1, NULL, &fds, NULL, NULL);
-            else
-                select(raw_fd + 1, &fds, NULL, NULL, NULL);
+            int sr = (se == SSL_ERROR_WANT_WRITE)
+                ? select(raw_fd + 1, NULL, &fds, NULL, NULL)
+                : select(raw_fd + 1, &fds, NULL, NULL, NULL);
+            if (sr <= 0) { /* hard error / signal — avoid busy-spinning */
+                if (err_msg) *err_msg = dup_msg("tls_connect: select during handshake failed");
+                SSL_free(ssl);
+                return NULL;
+            }
             continue;
         }
         if (err_msg) *err_msg = dup_ssl_err("SSL_connect (TLS handshake failed)");
@@ -137,6 +142,10 @@ long long tls_read(TlsConn *conn, char *buf, long long len, char **err_msg) {
         if (err_msg) *err_msg = dup_msg("tls_read: invalid connection");
         return -1;
     }
+    if (len < 0 || len > INT_MAX) {
+        if (err_msg) *err_msg = dup_msg("tls_read: length out of range");
+        return -1;
+    }
     int n = SSL_read(conn->ssl, buf, (int)len);
     if (n > 0) return (long long)n;
     int se = SSL_get_error(conn->ssl, n);
@@ -151,6 +160,10 @@ long long tls_write(TlsConn *conn, const char *data, long long len,
                     char **err_msg) {
     if (!conn || !conn->ssl) {
         if (err_msg) *err_msg = dup_msg("tls_write: invalid connection");
+        return -1;
+    }
+    if (len < 0 || len > INT_MAX) {
+        if (err_msg) *err_msg = dup_msg("tls_write: length out of range");
         return -1;
     }
     int n = SSL_write(conn->ssl, data, (int)len);
