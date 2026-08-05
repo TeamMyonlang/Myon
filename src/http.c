@@ -157,11 +157,13 @@ char *http_build_response(int status, const char *status_text,
         content_type ? content_type : "text/plain",
         body_len);
     if (hn < 0) return NULL;
-    size_t total = (size_t)hn + body_len;
+    /* snprintf returns the would-be length; only copy what was written. */
+    size_t hlen = (size_t)hn < sizeof(header) - 1 ? (size_t)hn : sizeof(header) - 1;
+    size_t total = hlen + body_len;
     char *buf = (char *)malloc(total + 1);
     if (!buf) return NULL;
-    memcpy(buf, header, (size_t)hn);
-    if (body_len) memcpy(buf + hn, body, body_len);
+    memcpy(buf, header, hlen);
+    if (body_len) memcpy(buf + hlen, body, body_len);
     buf[total] = '\0';
     if (out_len) *out_len = total;
     return buf;
