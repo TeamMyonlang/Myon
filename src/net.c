@@ -264,7 +264,6 @@ int net_connect_check(NetState *st, int sock_id, char **err_msg) {
 
 long long net_send(NetState *st, int sock_id, const char *data, long long len, char **err_msg) {
     if (!valid_id(st, sock_id)) { if (err_msg) *err_msg = dup_msg("invalid socket id"); return -1; }
-    if (len < 0) { if (err_msg) *err_msg = dup_msg("negative send length"); return -1; }
     ssize_t n = send(st->fds[sock_id], data, (size_t)len, MSG_NOSIGNAL);
     if (n < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) return -2;
@@ -276,7 +275,6 @@ long long net_send(NetState *st, int sock_id, const char *data, long long len, c
 
 long long net_recv(NetState *st, int sock_id, char *buf, long long buf_len, char **err_msg) {
     if (!valid_id(st, sock_id)) { if (err_msg) *err_msg = dup_msg("invalid socket id"); return -1; }
-    if (buf_len < 0) { if (err_msg) *err_msg = dup_msg("negative recv buffer length"); return -1; }
     ssize_t n = recv(st->fds[sock_id], buf, (size_t)buf_len, 0);
     if (n < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) return -2;
@@ -289,7 +287,6 @@ long long net_recv(NetState *st, int sock_id, char *buf, long long buf_len, char
 long long net_sendto(NetState *st, int sock_id, const char *data, long long len,
                      const char *host, int port, char **err_msg) {
     if (!valid_id(st, sock_id)) { if (err_msg) *err_msg = dup_msg("invalid socket id"); return -1; }
-    if (len < 0) { if (err_msg) *err_msg = dup_msg("negative sendto length"); return -1; }
     struct sockaddr_in sa;
     if (fill_addr(&sa, host, port, st->kinds[sock_id], err_msg) < 0) return -1;
     ssize_t n = sendto(st->fds[sock_id], data, (size_t)len, 0,
@@ -305,7 +302,6 @@ long long net_sendto(NetState *st, int sock_id, const char *data, long long len,
 long long net_recvfrom(NetState *st, int sock_id, char *buf, long long buf_len,
                        char **from_addr_out, char **err_msg) {
     if (!valid_id(st, sock_id)) { if (err_msg) *err_msg = dup_msg("invalid socket id"); return -1; }
-    if (buf_len < 0) { if (err_msg) *err_msg = dup_msg("negative recvfrom buffer length"); return -1; }
     struct sockaddr_in from;
     socklen_t flen = sizeof(from);
     ssize_t n = recvfrom(st->fds[sock_id], buf, (size_t)buf_len, 0,

@@ -4041,15 +4041,16 @@ static void assign_or_define(Interp *it, Env *env, int line,
         env_set(env, name, v);
         return;
     }
-    /* Borrowed check for an outer binding (no copy needed for existence). */
-    Value *outer_binding = env->parent ? env_find(env->parent, name) : NULL;
-    if (outer_binding && env->is_block) {
+    Value tmp;
+    int outer = (env->parent && env_get(env->parent, name, &tmp));
+    if (outer) value_free(&tmp);
+    if (outer && env->is_block) {
         value_free(&v);
         runtime_error(it, line,
             "redefinition of '%s' shadows an outer variable (forbidden, spec 9.2)",
             name);
     }
-    if (outer_binding) {
+    if (outer) {
         /* assign through to the existing outer binding */
         env_set(env, name, v);
     } else {

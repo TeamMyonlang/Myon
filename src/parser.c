@@ -81,17 +81,6 @@ static const Token *expect(Parser *p, TokenType t, const char *msg) {
     return NULL;
 }
 
-/* Map a compound-assignment operator token to its arithmetic op. */
-static OpKind compound_op_from_token(TokenType tt) {
-    switch (tt) {
-        case TOK_PLUS_EQ:  return OP_ADD;
-        case TOK_MINUS_EQ: return OP_SUB;
-        case TOK_STAR_EQ:  return OP_MUL;
-        case TOK_SLASH_EQ: return OP_DIV;
-        default:           return (OpKind)-1;
-    }
-}
-
 static void skip_terminators(Parser *p) {
     while (check(p, TOK_NEWLINE) || check(p, TOK_SEMICOLON)) advance(p);
 }
@@ -582,7 +571,13 @@ static Stmt *parse_assignment(Parser *p) {
         /* plain */
     } else if (check(p, TOK_PLUS_EQ) || check(p, TOK_MINUS_EQ) ||
                check(p, TOK_STAR_EQ) || check(p, TOK_SLASH_EQ)) {
-        s->as.assign.compound = compound_op_from_token(cur(p));
+        switch (cur(p)) {
+            case TOK_PLUS_EQ:  s->as.assign.compound = OP_ADD; break;
+            case TOK_MINUS_EQ: s->as.assign.compound = OP_SUB; break;
+            case TOK_STAR_EQ:  s->as.assign.compound = OP_MUL; break;
+            case TOK_SLASH_EQ: s->as.assign.compound = OP_DIV; break;
+            default: break;
+        }
         s->as.assign.is_compound = 1;
         advance(p);
     } else {
@@ -821,7 +816,13 @@ static Stmt *parse_expr_or_target_assign(Parser *p) {
          check(p, TOK_STAR_EQ) || check(p, TOK_SLASH_EQ))) {
         Stmt *s = stmt_new(STMT_ASSIGN, line);
         s->as.assign.target = e;
-        s->as.assign.compound = compound_op_from_token(cur(p));
+        switch (cur(p)) {
+            case TOK_PLUS_EQ:  s->as.assign.compound = OP_ADD; break;
+            case TOK_MINUS_EQ: s->as.assign.compound = OP_SUB; break;
+            case TOK_STAR_EQ:  s->as.assign.compound = OP_MUL; break;
+            case TOK_SLASH_EQ: s->as.assign.compound = OP_DIV; break;
+            default: break;
+        }
         s->as.assign.is_compound = 1;
         advance(p);
         s->as.assign.value = parse_expression(p);

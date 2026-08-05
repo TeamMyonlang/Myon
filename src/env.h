@@ -45,10 +45,6 @@ int   env_define(Env *env, const char *name, Value v);
 /* Look up through the scope chain. Returns 1 and fills *out (a copy) on hit. */
 int   env_get(Env *env, const char *name, Value *out);
 
-/* Borrowed lookup through the scope chain: pointer to the stored value or
- * NULL if unbound. No copy is made. Valid until the binding mutates/frees. */
-Value *env_find(Env *env, const char *name);
-
 /* Assign to an existing binding anywhere in the chain. Returns 0 if unbound. */
 int   env_set(Env *env, const char *name, Value v);
 
