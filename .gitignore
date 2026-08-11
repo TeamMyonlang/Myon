@@ -4,6 +4,9 @@
 *.o
 tests/fixtures/libffi_callback_test.so
 
+# Step 5: compiled MVM bytecode output
+*.myc
+
 # Core dumps
 core
 core.*

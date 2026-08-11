@@ -1,0 +1,6 @@
+# MVM disassembly sample: arithmetic + variables (Step 5 verification #3).
+# Exercises constant-pool interning, LOAD/STORE_LOCAL and the ADD/MUL opcodes.
+a = 2
+b = 3
+c = a * b + 1
+myon.print(c)
