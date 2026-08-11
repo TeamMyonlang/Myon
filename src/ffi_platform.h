@@ -22,11 +22,11 @@
  *
  * A thin wrapper over the OS shared-library loader:
  *   POSIX   : dlopen / dlsym / dlclose
- *   Windows : LoadLibrary / GetProcAddress / FreeLibrary  (stub for now)
+ *   Windows : LoadLibrary / GetProcAddress / FreeLibrary
  *
- * Only Linux carries a real implementation in Phase3.  macOS / Windows and any
- * unknown platform compile fine but fail at run time with an error message so
- * the interpreter can surface a clean Myon `error(...)` value.
+ * Linux and Windows carry real implementations.  macOS and any unknown
+ * platform compile fine but fail at run time with an error message so the
+ * interpreter can surface a clean Myon `error(...)` value.
  */
 
 typedef struct FFILib FFILib; /* opaque library handle */
@@ -45,8 +45,8 @@ void *ffi_platform_sym(FFILib *lib, const char *name);
 void ffi_platform_close(FFILib *lib);
 
 /*
- * Whether FFI is usable on the current OS.  Returns 1 on Linux, 0 on the
- * macOS / Windows / unknown stubs.
+ * Whether FFI is usable on the current OS.  Returns 1 on Linux and Windows,
+ * 0 on the macOS / unknown stubs.
  */
 int ffi_platform_supported(void);
 
