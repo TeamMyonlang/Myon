@@ -22,12 +22,42 @@ LDLIBS  ?= -lm -lssl -lcrypto
 # Phase3 C FFI needs the dynamic loader (dlopen/dlsym/dlclose) on Linux.
 # On macOS these live in libSystem (no extra flag); Windows uses its own API.
 UNAME_S := $(shell uname -s 2>/dev/null)
+
+SRC_DIR  = src
+BUILD    = build
+
+# Platform branch.
+#
+# Windows (native MSYS2/MinGW-w64, or a MinGW-w64 cross build via
+# CC=x86_64-w64-mingw32-gcc) is detected through the OS environment variable,
+# which MSYS2/MinGW shells and Windows both set to "Windows_NT".  The Linux
+# branch below is left exactly as before so the existing Linux build is not
+# affected in any way.
+ifeq ($(OS),Windows_NT)
+# Windows build.
+#   * The FFI layer calls LoadLibrary/GetProcAddress/FreeLibrary, which live in
+#     kernel32.dll and are linked implicitly by the toolchain, so no -ldl (and
+#     no other extra loader flag) is needed here.
+#   * The output binary is named myon.exe.
+BIN      = myon.exe
+# NOTE (OpenSSL on Windows): myon.http links libssl/libcrypto (see LDLIBS
+# above).  Under MinGW-w64 the import/static library names and search paths
+# differ from Linux (e.g. an MSYS2 package may expose -lssl -lcrypto plus a
+# -L<prefix>/lib, while some builds need -lssl-3-x64 / -lcrypto-3-x64 or the
+# *.dll.a import libraries).  Resolving the concrete names/paths is deferred to
+# Step 3 / the integration step; override them here without touching the Linux
+# defaults, e.g.:
+#     make OPENSSL_LDLIBS="-L/mingw64/lib -lssl -lcrypto"
+# For now WIN_OPENSSL_LDLIBS is a placeholder that folds into LDLIBS only on
+# Windows, so the Linux link line is unchanged.
+WIN_OPENSSL_LDLIBS ?=
+LDLIBS  += $(WIN_OPENSSL_LDLIBS)
+else
+BIN      = myon
 ifeq ($(UNAME_S),Linux)
 LDLIBS  += -ldl
 endif
-SRC_DIR  = src
-BUILD    = build
-BIN      = myon
+endif
 
 SOURCES  = $(wildcard $(SRC_DIR)/*.c)
 OBJECTS  = $(patsubst $(SRC_DIR)/%.c,$(BUILD)/%.o,$(SOURCES))

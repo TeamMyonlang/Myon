@@ -1,0 +1,15 @@
+# Phase3: myon.ffi.load platform layer.
+#
+# This exercises the platform-independent contract of the shared-library
+# loader (Linux: dlopen, Windows: LoadLibraryA): loading a library that does
+# not exist must surface a (value, error) pair with a negative handle and a
+# non-nil error, rather than crashing.  The exact error text is
+# platform-specific (dlerror vs. FormatMessageA), so we only assert the
+# handle value and that an error was returned -- keeping the expected output
+# identical on every OS where FFI is supported.
+module myon.ffi
+
+handle, err = myon.ffi.load(str("this_library_does_not_exist_zzz.so"))
+
+myon.print(handle)
+myon.if err != myon.nil then { myon.print(str("load_err")) } myon.else { myon.print(str("load_ok")) }

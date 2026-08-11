@@ -579,9 +579,20 @@ myon.print(myon.file.exists("/tmp/does_not_exist.txt"))  // false
 
 **対応プラットフォーム**
 
-本フェーズの本命は Linux。macOS / Windows では `myon.ffi.load` を呼んだ
-時点で「FFI is not supported on this platform yet (Phase3 stub)」という
-`error` を返す（コンパイル自体は3OSとも通る）。
+Linux と Windows で本実装済み。
+
+- **Linux**: `dlopen`/`dlsym`/`dlclose` を用いて `.so` を読み込む。
+- **Windows**: `LoadLibraryA`/`GetProcAddress`/`FreeLibrary`（`kernel32`）を
+  用いて `.dll` を読み込む。読み込み失敗時のエラーメッセージは
+  `GetLastError()` + `FormatMessageA`（`FORMAT_MESSAGE_FROM_SYSTEM |
+  FORMAT_MESSAGE_IGNORE_INSERTS`）で人間可読な文字列へ変換される。
+  なお、拡張子（`.dll`）の自動補完は行わないため、呼び出し側が
+  `myon.ffi.load(str("xxx.dll"))` のようにパスを明示する
+  （Windows の DLL 検索順序については各自の配布形態に従うこと）。
+
+macOS では引き続きスタブで、`myon.ffi.load` を呼んだ時点で
+「FFI is not supported on macOS yet (Phase3 stub)」という `error` を返す
+（コンパイル自体は3OSとも通る）。
 
 ```myon
 module myon.ffi
