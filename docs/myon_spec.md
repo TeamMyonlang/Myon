@@ -1245,8 +1245,10 @@ bad, berr = myon.random.int(5, 1)    // berr != myon.nil（lo > hi）
 
 IPv4 の TCP / UDP ソケットを直接扱うための低水準モジュール。POSIX
 ソケットAPI（`socket`/`bind`/`listen`/`accept`/`connect`/`send`/`recv`/
-`sendto`/`recvfrom`）の薄いラッパである。**現状の対応プラットフォームは
-Linux のみ**で、それ以外では全関数が即座に `error` を返す（後述）。
+`sendto`/`recvfrom`）の薄いラッパである。**Linux と Windows で本実装済み**で、
+それ以外のプラットフォームでは全関数が即座に `error` を返す（後述）。
+Windows では同等のソケット機能を **Winsock2**（`ws2_32`）で提供する
+（下記「Windows 実装（Winsock2）」を参照）。
 
 ソケットは整数の**ソケットID**で識別する。IDは内部テーブル（最大256個）の
 インデックスであり、生のfdではない。全関数は非ブロッキングfdで動作し、
@@ -1287,9 +1289,46 @@ IPv4アドレスの直打ち（例 `"127.0.0.1"`）に加えて**ホスト名**�
 `getaddrinfo()` でDNS名前解決を行う（`AF_INET` に限定、ソケット種別に応じた
 `SOCK_STREAM`/`SOCK_DGRAM` をヒントに指定）。複数の候補が返った場合は最初の
 1つを使う（ラウンドロビン/フォールバックは未対応）。解決に失敗した場合は
-`cannot resolve host '<name>': <gai_strerror>` の形の error を返す。
+`cannot resolve host '<name>': <理由>` の形の error を返す（理由の文字列は
+プラットフォーム依存：Linux は `gai_strerror`、Windows は `WSAGetLastError`
+を `FormatMessageA` で整形したもの）。
 
-**未サポート**：Linux以外のプラットフォーム、IPv6。非対応プラットフォームでは
+**Windows 実装（Winsock2）**：Windows では同じ関数群を Winsock2 で実装する。
+POSIX 版との主な差異は以下の通り（挙動・戻り値の規約は Linux と同一）。
+
+- **初期化/終了**：`net_state_create()` の初回呼び出しで
+  `WSAStartup(MAKEWORD(2,2), ...)` を、最後の `net_state_destroy()` で
+  `WSACleanup()` を呼ぶ。Winsock 自体が参照カウント式であることに加え、
+  net.c 側でも初期化カウンタを持ち、多重初期化・早すぎる解放を防ぐ。
+- **ソケット型**：ソケットは `int` ではなく `SOCKET`（`UINT_PTR`）で保持し、
+  無効値は `-1` ではなく `INVALID_SOCKET`、失敗の戻り値は `SOCKET_ERROR`。
+  Windows 版の `NetState` は `SOCKET socks[]` を持つ別定義（`net.h` の
+  opaque 宣言により問題なし）。
+- **非ブロッキング設定**：`fcntl(O_NONBLOCK)` の代わりに
+  `ioctlsocket(s, FIONBIO, &mode)`（`mode=1`）を使う。
+- **クローズ**：`close()` の代わりに `closesocket()`。
+- **would-block 判定**：`EAGAIN`/`EWOULDBLOCK` の代わりに `WSAEWOULDBLOCK`
+  を、非ブロッキング接続の進行中は `WSAEALREADY`/`WSAEINVAL` も `-2`（進行中）
+  として扱う。接続完了検査は `getsockopt(SO_ERROR)` を用いる。
+- **送受信長**：Winsock の `send`/`recv`/`sendto`/`recvfrom` は長さを `int`
+  で受け取るため、内部で `INT_MAX` にクランプする。`MSG_NOSIGNAL` は
+  Windows には無い（SIGPIPE が発生しない）ため指定しない。
+- **エラー文字列**：`errno`/`strerror` の代わりに `WSAGetLastError()` の値を
+  `FormatMessageA` で整形して `<prefix>: <text>` 形式の error を作る
+  （FFI の Windows 実装 `ffi_platform.c` と同じ手法）。
+- **リンク**：Windows ビルドでは `-lws2_32` を追加でリンクする（Makefile）。
+
+**Step3（イベントループ）への申し送り**：`net_raw_fd()` の戻り値型は現状 `int`
+だが、Windows の `SOCKET` は 64bit 環境では `UINT_PTR`（64bit）である。現状は
+Winsock のカーネルハンドルが 32bit に収まる仕様に依拠して `int` へキャスト
+しており、同一プラットフォーム内で id ↔ fd を往復するだけの現在の用途では安全。
+ただし Step3 で `event_loop.c` の `select()` 多重化を Windows 対応する際、生の
+`SOCKET` を直接 `fd_set` に渡す設計にするなら、`net_raw_fd()` の戻り値型および
+その呼び出し元（`event_loop.c`/`interpreter.c`）を `intptr_t` 相当に拡張して
+切り詰めを避けることを検討すること。**本ステップでは `event_loop.c` は変更して
+いない。**
+
+**未サポート**：上記以外のプラットフォーム、IPv6。非対応プラットフォームでは
 全関数が `myon.net unsupported on this platform` の error を返す。
 
 ```myon
