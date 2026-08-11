@@ -83,6 +83,19 @@ long long net_recvfrom(NetState *st, int sock_id, char *buf, long long buf_len,
 /* Raw fd (for the interpreter to register with the event loop's select). */
 int net_raw_fd(NetState *st, int sock_id);
 
+/*
+ * Synchronous single-fd wait (Windows helper, Phase5 Step3).
+ *
+ * Blocks until `fd` (a value previously returned by net_raw_fd) is readable
+ * (for_write == 0) or writable (for_write != 0).  This exists so the
+ * interpreter's synchronous (non-coroutine) net fallback does not have to
+ * include the Winsock headers itself: on Windows <winsock2.h> drags in
+ * <windows.h>/<winnt.h>, whose `TokenType` enum collides with Myon's own
+ * TokenType.  On Linux the interpreter still uses select(2) inline; this
+ * helper's Linux/stub definitions are provided only for symmetry.
+ */
+void net_sync_wait_fd(int fd, int for_write);
+
 void net_close(NetState *st, int sock_id);
 
 #endif /* MYON_NET_H */
