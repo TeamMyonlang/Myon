@@ -1,0 +1,34 @@
+# Phase5 Step3 (Windows Fiber) regression: exercises the task-lifecycle path
+# that both the ucontext (Linux) and Fiber (Windows) schedulers share.
+#
+# A "producer" async task sleeps longer, prints, then returns a value; an
+# "early" async task sleeps a shorter time and finishes first.  The top-level
+# script then awaits the producer's Task value (TASK_WAITING_TASK) and prints
+# the awaited result, then awaits the early task.  The visible ordering
+# (early, produced, consumed=42, all done) verifies that:
+#   * cooperative sleep ordering works (early finishes before producer),
+#   * awaiting a not-yet-finished task suspends the awaiter and later resumes
+#     it correctly once the target reaches TASK_DONE,
+#   * a finished task's result survives until awaited (its fiber/stack stays
+#     parked, not freed, which is the delicate part of the Fiber lifecycle).
+module myon.stdio
+module myon.time
+
+myon.async myon.func producer() ret int {
+    myon.await myon.time.sleep_ms(60)
+    myon.print(str("produced"))
+    ret 42
+}
+myon.async myon.func early() ret int {
+    myon.await myon.time.sleep_ms(20)
+    myon.print(str("early"))
+    ret 0
+}
+
+tp = producer()
+te = early()
+
+v = myon.await tp
+myon.print(str("consumed=") + str(v))
+myon.await te
+myon.print(str("all done"))

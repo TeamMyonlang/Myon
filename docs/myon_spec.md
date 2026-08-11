@@ -1318,15 +1318,36 @@ POSIX 版との主な差異は以下の通り（挙動・戻り値の規約は L
   （FFI の Windows 実装 `ffi_platform.c` と同じ手法）。
 - **リンク**：Windows ビルドでは `-lws2_32` を追加でリンクする（Makefile）。
 
-**Step3（イベントループ）への申し送り**：`net_raw_fd()` の戻り値型は現状 `int`
-だが、Windows の `SOCKET` は 64bit 環境では `UINT_PTR`（64bit）である。現状は
-Winsock のカーネルハンドルが 32bit に収まる仕様に依拠して `int` へキャスト
-しており、同一プラットフォーム内で id ↔ fd を往復するだけの現在の用途では安全。
-ただし Step3 で `event_loop.c` の `select()` 多重化を Windows 対応する際、生の
-`SOCKET` を直接 `fd_set` に渡す設計にするなら、`net_raw_fd()` の戻り値型および
-その呼び出し元（`event_loop.c`/`interpreter.c`）を `intptr_t` 相当に拡張して
-切り詰めを避けることを検討すること。**本ステップでは `event_loop.c` は変更して
-いない。**
+**Step3（イベントループ）での fd 型の決着（Step2 申し送りの解消）**：
+`net_raw_fd()` の戻り値型は `int` だが、Windows の `SOCKET` は
+64bit 環境で `UINT_PTR`（64bit）である。Step3 で `event_loop.c` の Windows
+版（Fiber + Winsock `select()`）を実装するにあたり、fd の型設計を次のように
+**確定**した。
+
+- **公開インターフェースの fd 型は全プラットフォームで `int` のまま維持する**
+  （`event_loop.h` の `event_loop_wait_readable/writable(int fd)`、`net.h` の
+  `net_raw_fd() ret int`）。これは Linux 側では fd がまさに `int` であり、
+  ここを `intptr_t` 相当へ広げるのは Linux にとって無意味なインターフェース
+  破壊になるため。また `interpreter.c` 内で fd を持ち回る多数の `int fd`
+  ローカル変数への波及も避けられる。
+- **Windows 側では `SOCKET` の再構成を局所化する**。`event_loop.c` と `net.c`
+  の Windows 分岐で、Winsock `select()`/`fd_set` に渡す直前にのみ
+  `(SOCKET)(UINT_PTR)(unsigned int)fd` で `int` → `SOCKET` を復元する。
+  Winsock のカーネルハンドルは 32bit に収まる仕様（Microsoft Learn
+  "Socket Handles"）であり、`(unsigned int)` によるゼロ拡張で元の
+  `SOCKET` 値がロスなく復元される。したがって `int` 往復は実用上安全であり、
+  切り詰めによる不具合は生じない。
+
+**Windows 同期待機ヘルパ `net_sync_wait_fd(int fd, int for_write)`**：
+コルーチン外（同期文脈）での単一 fd 待機は、従来 `interpreter.c` が
+`select(2)` を直接呼んでいた。Windows では Winsock の `select()` が
+`<winsock2.h>`（→ `<windows.h>` → `<winnt.h>`）を引き込み、`winnt.h` の
+`TokenType` 列挙が Myon 自身の `TokenType`（`src/token.h`）と衝突する。
+これを避けるため、Windows の同期単一 fd 待機は Winsock ヘッダを正しく内包
+している `net.c` の `net_sync_wait_fd()` に委譲する。Linux では従来どおり
+`interpreter.c` 内で `select(2)` を呼ぶ（`net_sync_wait_fd` の Linux 版は
+対称性のために用意されているが未使用）。この設計により `interpreter.c` は
+Windows でも `windows.h` を取り込まずにコンパイルできる。
 
 **未サポート**：上記以外のプラットフォーム、IPv6。非対応プラットフォームでは
 全関数が `myon.net unsupported on this platform` の error を返す。
@@ -1760,9 +1781,48 @@ I/O 待ち地点で `swapcontext` によりループ本体へ制御を返す。
 侵襲が大きすぎるため（Phase2 P6 の判断を継続）。プリエンプティブなタスク切り替えも
 行わない。
 
-**対応プラットフォーム**：`ucontext` ベースのイベントループは Linux（glibc）を
-本命とする。`ucontext` を欠くプラットフォームでは未対応スタブとしてコンパイルされる
+**対応プラットフォーム**：イベントループは Linux（glibc）と Windows の双方で
+本実装済みである。`ucontext`／Fiber のいずれも欠くプラットフォームでは未対応
+スタブ（`event_loop_supported()` が `0` を返す）としてコンパイルされる
 （FFI サブシステムと同じポリシー）。
+
+**Windows 実装（Win32 Fiber、Phase5 Step3）**：`ucontext` は Windows に存在
+しないため、Windows では同等のユーザーモード・スタック切り替え機構である
+**Win32 Fiber API** でコルーチンを実装する（`src/event_loop.c` の
+`#elif defined(_WIN32)` 分岐、マクロ `MYON_EVENT_LOOP_FIBER`）。Linux 版
+（`MYON_EVENT_LOOP_UCONTEXT` 分岐）は一切変更していない。API 対応は次の通り
+（Microsoft Learn の winbase.h／winsock2.h リファレンスで確認）：
+
+| ucontext（Linux） | Fiber（Windows） | 役割 |
+|---|---|---|
+| `getcontext`＋`makecontext` | `CreateFiber(stack, proc, param)` | タスク用スタック確保＋エントリ設定 |
+| `swapcontext` | `SwitchToFiber(fiber)` | コンテキスト切り替え |
+| `loop->core_ctx` | `ConvertThreadToFiber(NULL)`（`main_fiber`） | ループ本体（復帰先） |
+| （`uc_stack` の `malloc`） | `CreateFiber` の第1引数（256KB） | スタックは Fiber API が内部確保 |
+| `uc_link` による自動復帰 | **なし**（下記の注意点を参照） | タスク終了時の復帰 |
+| `free(stack)` | `DeleteFiber(fiber)` | スタック破棄 |
+
+`CreateFiber` はエントリ関数へパラメータを直接渡せるため、`ucontext` 版に
+あったグローバル変数 `g_bootstrapping_task` によるバイパスは不要になり、
+`Task*` を素直に渡している。時刻取得は `clock_gettime(CLOCK_MONOTONIC)` の
+代わりに `GetTickCount64()`（システム起動からの単調増加ミリ秒）を用いる。
+I/O 多重化は Winsock の `select()` を用いる（`fd_set` は `SOCKET` の配列で、
+第1引数 `nfds` は無視されるため `0` を渡す。fd → `SOCKET` の復元は 10.7 を
+参照）。
+
+**Fiber のライフサイクル上の最重要注意点（`uc_link` 相当の不在）**：Fiber の
+エントリ関数（fiber proc）は**決して `return` してはならない**。return すると
+`ExitThread` が呼ばれスレッドごと終了する（`ucontext` の `uc_link` のような
+「呼び出し元へ自動復帰する」仕組みが Fiber には無い）。そこで Windows 版の
+`task_fiber_proc` は、タスク本体 `entry()` の完了後に状態を `TASK_DONE` にした
+うえで**無限ループに入り、`SwitchToFiber(main_fiber)` でループ本体へ制御を
+返し続ける**設計とした。スケジューラは `DONE` のタスクを二度と `SwitchToFiber`
+しないため、このループ本体は完了時に一度だけ実行され、以後 Fiber は
+`DeleteFiber` されるまで待機（park）状態で留まる。`DeleteFiber` は
+`event_loop_destroy()`（ループ本体＝別 Fiber）から、待機中（＝実行中でない）の
+タスク Fiber に対して呼ぶ。Microsoft のドキュメント上、実行中の Fiber を
+他 Fiber から削除するのは危険だが、破棄時点で全タスク Fiber は
+`SwitchToFiber` 地点で待機しており実行中ではないため安全である。
 
 ---
 

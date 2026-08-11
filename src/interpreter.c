@@ -49,9 +49,23 @@
 
 /* Phase5 myon.net: the synchronous fallback path in net_wait_fd() uses
  * select(2) directly (outside a coroutine).  On Linux this lives behind
- * <sys/select.h>; other platforms fall back to net.c's unsupported stub. */
+ * <sys/select.h>.  On Windows the equivalent Winsock select() lives in
+ * <winsock2.h>, but that header transitively drags in <windows.h> ->
+ * <winnt.h>, whose `TokenType` enum collides with Myon's own `TokenType`
+ * (src/token.h) that interpreter.c already includes.  Rather than pull the
+ * whole Win32 surface into this translation unit (a Step7 integration concern),
+ * the Windows synchronous single-fd wait is delegated to net.c via
+ * net_sync_wait_fd(), which owns the Winsock headers cleanly.  See
+ * docs/myon_spec.md 10.7 / 14.9. */
 #if defined(__linux__)
 #include <sys/select.h>
+#endif
+/* Windows lacks nanosleep; Sleep() (Win32, in kernel32) is the blocking
+ * millisecond primitive used by the synchronous myon.time.sleep_ms fallback.
+ * Declare it locally with the exact kernel32 prototype so we avoid including
+ * <windows.h> here (see the TokenType-collision note above). */
+#if defined(_WIN32)
+__declspec(dllimport) void __stdcall Sleep(unsigned long dwMilliseconds);
 #endif
 
 /* Some C standard libraries only expose M_PI / M_E under _GNU_SOURCE or
@@ -1549,10 +1563,17 @@ static int call_time(Interp *it, Env *env, const char *name, Expr *call, Value *
             if (it->current_task && it->loop) {
                 event_loop_sleep_ms(it->loop, ms);
             } else {
+                /* Synchronous (non-coroutine) fallback: block the process.
+                 * Windows has neither nanosleep nor CLOCK_MONOTONIC; its native
+                 * millisecond blocking primitive is Sleep() (Win32). */
+#if defined(_WIN32)
+                Sleep((unsigned long)ms);
+#else
                 struct timespec req;
                 req.tv_sec  = (time_t)(ms / 1000);
                 req.tv_nsec = (long)((ms % 1000) * 1000000L);
                 nanosleep(&req, NULL);
+#endif
             }
         }
         *out = value_void();
@@ -1602,10 +1623,14 @@ static int call_time(Interp *it, Env *env, const char *name, Expr *call, Value *
                 if (it->current_task && it->loop) {
                     event_loop_sleep_ms(it->loop, remaining);
                 } else {
+#if defined(_WIN32)
+                    Sleep((unsigned long)remaining);
+#else
                     struct timespec req;
                     req.tv_sec  = (time_t)(remaining / 1000);
                     req.tv_nsec = (long)((remaining % 1000) * 1000000L);
                     nanosleep(&req, NULL);
+#endif
                 }
                 elapsed = target_ms;
             }
@@ -1707,6 +1732,10 @@ static void net_wait_fd(Interp *it, int fd, int for_write) {
     fd_set fds; FD_ZERO(&fds); FD_SET(fd, &fds);
     if (for_write) select(fd + 1, NULL, &fds, NULL, NULL);
     else           select(fd + 1, &fds, NULL, NULL, NULL);
+#elif defined(_WIN32)
+    /* Delegate to net.c, which owns the Winsock select()/fd_set surface (see
+     * the header-collision note at the top of this file). */
+    net_sync_wait_fd(fd, for_write);
 #else
     (void)fd; (void)for_write;
 #endif

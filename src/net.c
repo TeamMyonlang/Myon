@@ -36,6 +36,7 @@
 #ifdef MYON_NET_POSIX
 
 #include <sys/socket.h>
+#include <sys/select.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
@@ -318,6 +319,13 @@ long long net_recvfrom(NetState *st, int sock_id, char *buf, long long buf_len,
 int net_raw_fd(NetState *st, int sock_id) {
     if (!valid_id(st, sock_id)) return -1;
     return st->fds[sock_id];
+}
+
+void net_sync_wait_fd(int fd, int for_write) {
+    if (fd < 0) return;
+    fd_set fds; FD_ZERO(&fds); FD_SET(fd, &fds);
+    if (for_write) select(fd + 1, NULL, &fds, NULL, NULL);
+    else           select(fd + 1, &fds, NULL, NULL, NULL);
 }
 
 void net_close(NetState *st, int sock_id) {
@@ -773,6 +781,21 @@ int net_raw_fd(NetState *st, int sock_id) {
     return (int)st->socks[sock_id];
 }
 
+void net_sync_wait_fd(int fd, int for_write) {
+    if (fd < 0) return;
+    /* Reconstruct the SOCKET from the int fd (net_raw_fd truncated it; Winsock
+     * socket handles are documented to fit in 32 bits — see the Step3 hand-off
+     * note above and docs/myon_spec.md 10.7).  Zero-extend via (unsigned int)
+     * so the value is not sign-extended into the 64-bit UINT_PTR SOCKET.
+     *
+     * Winsock select(): the fd_set is an array of SOCKETs and the first (nfds)
+     * argument is ignored (kept only for BSD source compatibility), so pass 0. */
+    SOCKET s = (SOCKET)(UINT_PTR)(unsigned int)fd;
+    fd_set fds; FD_ZERO(&fds); FD_SET(s, &fds);
+    if (for_write) select(0, NULL, &fds, NULL, NULL);
+    else           select(0, &fds, NULL, NULL, NULL);
+}
+
 void net_close(NetState *st, int sock_id) {
     if (!valid_id(st, sock_id)) return;
     closesocket(st->socks[sock_id]);
@@ -809,6 +832,7 @@ long long net_recv(NetState *st, int sock_id, char *buf, long long buf_len, char
 long long net_sendto(NetState *st, int sock_id, const char *data, long long len, const char *host, int port, char **err_msg) { (void)st;(void)sock_id;(void)data;(void)len;(void)host;(void)port; unsupported(err_msg); return -1; }
 long long net_recvfrom(NetState *st, int sock_id, char *buf, long long buf_len, char **from_addr_out, char **err_msg) { (void)st;(void)sock_id;(void)buf;(void)buf_len;(void)from_addr_out; unsupported(err_msg); return -1; }
 int net_raw_fd(NetState *st, int sock_id) { (void)st;(void)sock_id; return -1; }
+void net_sync_wait_fd(int fd, int for_write) { (void)fd; (void)for_write; }
 void net_close(NetState *st, int sock_id) { (void)st;(void)sock_id; }
 
 #endif /* MYON_NET_POSIX / _WIN32 / stub */
