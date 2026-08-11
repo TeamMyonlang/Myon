@@ -40,6 +40,10 @@ ifeq ($(OS),Windows_NT)
 #     no other extra loader flag) is needed here.
 #   * The output binary is named myon.exe.
 BIN      = myon.exe
+# The myon.net socket layer (src/net.c, _WIN32 branch) is implemented against
+# Winsock2, so the Windows link line must pull in the Winsock 2 library
+# (ws2_32.dll -> -lws2_32).  This has no effect on the Linux branch below.
+LDLIBS  += -lws2_32
 # NOTE (OpenSSL on Windows): myon.http links libssl/libcrypto (see LDLIBS
 # above).  Under MinGW-w64 the import/static library names and search paths
 # differ from Linux (e.g. an MSYS2 package may expose -lssl -lcrypto plus a

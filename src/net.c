@@ -326,7 +326,460 @@ void net_close(NetState *st, int sock_id) {
     st->fds[sock_id] = -1;
 }
 
-#else /* !MYON_NET_POSIX : unsupported-platform stub */
+#elif defined(_WIN32)
+
+/* ================================================================== */
+/* Windows (Winsock2) implementation                                  */
+/* ================================================================== */
+/*
+ * Phase5, Step2 (Windows): a Winsock2-based port of the Linux socket layer
+ * above.  The Linux block (#ifdef MYON_NET_POSIX) is left completely
+ * unchanged; this branch only compiles on _WIN32 (native MSYS2/MinGW-w64 or a
+ * MinGW-w64 cross build).
+ *
+ * The Winsock port follows the Win32 sockets specification (Microsoft Learn,
+ * "Windows Sockets 2").  The notable differences from BSD/POSIX sockets that
+ * shape this file are:
+ *
+ *   * winsock2.h MUST be included before windows.h, otherwise the older
+ *     winsock.h gets pulled in via windows.h and the declarations clash.  We
+ *     also define WIN32_LEAN_AND_MEAN so that including windows.h (which
+ *     winsock2.h drags in) does not itself re-include winsock.h.
+ *   * Sockets are of type SOCKET (an UINT_PTR), not int; the invalid value is
+ *     INVALID_SOCKET (not -1) and failing calls return SOCKET_ERROR.
+ *   * Winsock must be initialised with WSAStartup(MAKEWORD(2,2), ...) and torn
+ *     down with a matching WSACleanup().  Both are reference counted by the
+ *     Winsock DLL: only the final WSACleanup performs the real cleanup, so we
+ *     mirror that with a simple process-wide init counter guarded by the calls
+ *     being confined to net_state_create/net_state_destroy.
+ *   * Non-blocking mode is selected with ioctlsocket(s, FIONBIO, &mode) where
+ *     mode != 0, not fcntl(O_NONBLOCK).
+ *   * A socket is closed with closesocket(), not close().
+ *   * Per-call error codes come from WSAGetLastError() (WSAExxx values), not
+ *     errno; "would block" is WSAEWOULDBLOCK.  We format them into text with
+ *     FormatMessageA, mirroring the FFI Windows layer (ffi_platform.c).
+ *   * send/recv/sendto/recvfrom take an int length and a char * buffer and
+ *     return int, so the long long lengths coming from the interpreter are
+ *     clamped to INT_MAX before the call.
+ *   * getsockopt/getsockname take (char *, int *) rather than (void *,
+ *     socklen_t *).
+ *
+ * getaddrinfo/freeaddrinfo behave the same as on POSIX (they come from
+ * ws2tcpip.h), so the DNS-resolution logic is a near-verbatim port.
+ */
+
+#ifndef WIN32_LEAN_AND_MEAN
+#  define WIN32_LEAN_AND_MEAN 1
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+
+#include <limits.h>
+
+#define NET_MAX_SOCKETS 256
+
+/* Windows-specific NetState: the fd table must hold SOCKET (UINT_PTR) values,
+ * which do not fit in the `int fds[]` the Linux struct uses.  net.h forward-
+ * declares NetState as an opaque type, so a distinct definition here is fine. */
+struct NetState {
+    SOCKET socks[NET_MAX_SOCKETS]; /* INVALID_SOCKET if slot free */
+    int    kinds[NET_MAX_SOCKETS]; /* 0=TCP, 1=UDP */
+};
+
+/* ------------------------------------------------------------------ */
+/* Winsock global init (reference counted, matching WSAStartup/WSACleanup) */
+/* ------------------------------------------------------------------ */
+/*
+ * WSAStartup/WSACleanup are themselves reference counted inside the Winsock
+ * DLL, but we still keep our own counter so that:
+ *   (a) we only call WSAStartup the first time a NetState is created (and can
+ *       surface an init failure as a NULL from net_state_create), and
+ *   (b) we call WSACleanup exactly once per successful WSAStartup, on the last
+ *       NetState destruction — avoiding both a leaked init and a premature
+ *       teardown while another NetState is still live.
+ * Myon runs its interpreter single-threaded, so a plain counter is sufficient;
+ * no locking is required here. */
+static int net_wsa_refcount = 0;
+
+static int wsa_global_init(void) {
+    if (net_wsa_refcount == 0) {
+        WSADATA wsa;
+        int rc = WSAStartup(MAKEWORD(2, 2), &wsa);
+        if (rc != 0) return -1; /* WSAStartup returns the error code directly */
+    }
+    net_wsa_refcount++;
+    return 0;
+}
+
+static void wsa_global_shutdown(void) {
+    if (net_wsa_refcount > 0) {
+        net_wsa_refcount--;
+        if (net_wsa_refcount == 0) WSACleanup();
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* helpers                                                             */
+/* ------------------------------------------------------------------ */
+
+static char *dup_msg(const char *s) {
+    char *m = (char *)malloc(strlen(s) + 1);
+    if (m) strcpy(m, s);
+    return m;
+}
+
+/* Turn a specific WSA error code into a "<prefix>: <text>" heap string.
+ *
+ * Uses FormatMessageA the same way ffi_platform.c does for GetLastError: the
+ * ALLOCATE_BUFFER flag makes the API LocalAlloc a buffer we must LocalFree,
+ * and IGNORE_INSERTS is mandatory when formatting an arbitrary system code so
+ * the formatter does not try to read insert arguments we never supply.  The
+ * result is copied into a malloc'd string so the interpreter frees it with the
+ * same free() it uses on the Linux path. */
+static char *dup_wsa_error(const char *prefix, int err) {
+    LPSTR sysbuf = NULL;
+    DWORD len = FormatMessageA(
+        FORMAT_MESSAGE_ALLOCATE_BUFFER |
+        FORMAT_MESSAGE_FROM_SYSTEM |
+        FORMAT_MESSAGE_IGNORE_INSERTS,
+        NULL,
+        (DWORD)err,
+        MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+        (LPSTR)&sysbuf,
+        0,
+        NULL);
+
+    const char *text;
+    char numbuf[64];
+    if (len == 0 || sysbuf == NULL) {
+        (void)snprintf(numbuf, sizeof(numbuf), "winsock error %d", err);
+        text = numbuf;
+    } else {
+        /* trim the trailing "\r\n" / spaces / '.' Windows appends, so the text
+         * lines up with the terse Linux strerror() strings */
+        while (len > 0 &&
+               (sysbuf[len - 1] == '\r' || sysbuf[len - 1] == '\n' ||
+                sysbuf[len - 1] == ' '  || sysbuf[len - 1] == '.')) {
+            sysbuf[--len] = '\0';
+        }
+        text = sysbuf;
+    }
+
+    size_t n = strlen(prefix) + strlen(text) + 3;
+    char *m = (char *)malloc(n);
+    if (m) snprintf(m, n, "%s: %s", prefix, text);
+
+    if (sysbuf) LocalFree(sysbuf);
+    return m;
+}
+
+/* Convenience: format the *current* WSAGetLastError() code. */
+static char *dup_wsa_last(const char *prefix) {
+    return dup_wsa_error(prefix, WSAGetLastError());
+}
+
+static int set_nonblocking(SOCKET s) {
+    u_long mode = 1; /* non-zero => non-blocking (FIONBIO) */
+    return (ioctlsocket(s, FIONBIO, &mode) == SOCKET_ERROR) ? -1 : 0;
+}
+
+static int valid_id(NetState *st, int id) {
+    return id >= 0 && id < NET_MAX_SOCKETS &&
+           st->socks[id] != INVALID_SOCKET;
+}
+
+static int alloc_slot(NetState *st, SOCKET s, int kind) {
+    for (int i = 0; i < NET_MAX_SOCKETS; i++) {
+        if (st->socks[i] == INVALID_SOCKET) {
+            st->socks[i] = s;
+            st->kinds[i] = kind;
+            return i;
+        }
+    }
+    return -1;
+}
+
+/* Build a "host:port" string from a sockaddr_in (malloc'd). */
+static char *addr_to_str(const struct sockaddr_in *sa) {
+    char ip[INET_ADDRSTRLEN];
+    if (!inet_ntop(AF_INET, (void *)&sa->sin_addr, ip, sizeof(ip)))
+        return NULL;
+    char buf[INET_ADDRSTRLEN + 8];
+    snprintf(buf, sizeof(buf), "%s:%d", ip, (int)ntohs(sa->sin_port));
+    return dup_msg(buf);
+}
+
+/* Resolve `host` (literal IPv4 address or DNS name) into `sa`.  This mirrors
+ * the Linux fill_addr(): literal addresses keep the fast inet_pton() path, and
+ * everything else is resolved with getaddrinfo() (available via ws2tcpip.h). */
+static int fill_addr(struct sockaddr_in *sa, const char *host, int port,
+                     int kind, char **err_msg) {
+    memset(sa, 0, sizeof(*sa));
+    sa->sin_family = AF_INET;
+    sa->sin_port = htons((unsigned short)port);
+    if (!host || host[0] == '\0' || strcmp(host, "0.0.0.0") == 0) {
+        sa->sin_addr.s_addr = INADDR_ANY;
+        return 0;
+    }
+    /* fast path: already a literal IPv4 address */
+    if (inet_pton(AF_INET, host, &sa->sin_addr) == 1) {
+        return 0;
+    }
+    /* otherwise resolve the hostname via DNS (getaddrinfo) */
+    struct addrinfo hints, *result = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = (kind == 1) ? SOCK_DGRAM : SOCK_STREAM;
+    int rc = getaddrinfo(host, NULL, &hints, &result);
+    if (rc != 0 || !result) {
+        if (err_msg) {
+            /* getaddrinfo failures report through WSAGetLastError() on Winsock
+             * (gai_strerror is not thread-safe there), so format that. */
+            char prefix[256];
+            (void)snprintf(prefix, sizeof(prefix),
+                           "cannot resolve host '%s'", host);
+            *err_msg = dup_wsa_last(prefix);
+        }
+        if (result) freeaddrinfo(result);
+        return -1;
+    }
+    /* use the first candidate (round-robin/fallback is out of scope) */
+    const struct sockaddr_in *ra = (const struct sockaddr_in *)result->ai_addr;
+    sa->sin_addr = ra->sin_addr;
+    freeaddrinfo(result);
+    return 0;
+}
+
+/* Clamp a long long length down to what the Winsock int-length calls accept. */
+static int clamp_len(long long len) {
+    if (len < 0) return 0;
+    if (len > (long long)INT_MAX) return INT_MAX;
+    return (int)len;
+}
+
+/* ------------------------------------------------------------------ */
+/* lifecycle                                                           */
+/* ------------------------------------------------------------------ */
+
+NetState *net_state_create(void) {
+    if (wsa_global_init() < 0) return NULL; /* WSAStartup failed */
+    NetState *st = (NetState *)malloc(sizeof(NetState));
+    if (!st) { wsa_global_shutdown(); return NULL; }
+    for (int i = 0; i < NET_MAX_SOCKETS; i++) {
+        st->socks[i] = INVALID_SOCKET;
+        st->kinds[i] = 0;
+    }
+    return st;
+}
+
+void net_state_destroy(NetState *st) {
+    if (!st) return;
+    for (int i = 0; i < NET_MAX_SOCKETS; i++)
+        if (st->socks[i] != INVALID_SOCKET) closesocket(st->socks[i]);
+    free(st);
+    wsa_global_shutdown();
+}
+
+int net_supported(void) { return 1; }
+
+/* ------------------------------------------------------------------ */
+/* socket operations                                                   */
+/* ------------------------------------------------------------------ */
+
+int net_socket_create(NetState *st, int kind, char **err_msg) {
+    int type = (kind == 1) ? SOCK_DGRAM : SOCK_STREAM;
+    SOCKET s = socket(AF_INET, type, 0);
+    if (s == INVALID_SOCKET) {
+        if (err_msg) *err_msg = dup_wsa_last("socket");
+        return -1;
+    }
+    BOOL one = TRUE;
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (const char *)&one, sizeof(one));
+    if (set_nonblocking(s) < 0) {
+        if (err_msg) *err_msg = dup_wsa_last("ioctlsocket(FIONBIO)");
+        closesocket(s);
+        return -1;
+    }
+    int id = alloc_slot(st, s, kind);
+    if (id < 0) {
+        if (err_msg) *err_msg = dup_msg("too many open sockets");
+        closesocket(s);
+        return -1;
+    }
+    return id;
+}
+
+int net_bind(NetState *st, int sock_id, const char *host, int port, char **err_msg) {
+    if (!valid_id(st, sock_id)) { if (err_msg) *err_msg = dup_msg("invalid socket id"); return -1; }
+    struct sockaddr_in sa;
+    if (fill_addr(&sa, host, port, st->kinds[sock_id], err_msg) < 0) return -1;
+    if (bind(st->socks[sock_id], (struct sockaddr *)&sa, sizeof(sa)) == SOCKET_ERROR) {
+        if (err_msg) *err_msg = dup_wsa_last("bind");
+        return -1;
+    }
+    return 0;
+}
+
+int net_listen(NetState *st, int sock_id, int backlog, char **err_msg) {
+    if (!valid_id(st, sock_id)) { if (err_msg) *err_msg = dup_msg("invalid socket id"); return -1; }
+    if (backlog <= 0) backlog = 16;
+    if (listen(st->socks[sock_id], backlog) == SOCKET_ERROR) {
+        if (err_msg) *err_msg = dup_wsa_last("listen");
+        return -1;
+    }
+    return 0;
+}
+
+int net_local_port(NetState *st, int sock_id, char **err_msg) {
+    if (!valid_id(st, sock_id)) { if (err_msg) *err_msg = dup_msg("invalid socket id"); return -1; }
+    struct sockaddr_in sa;
+    int len = (int)sizeof(sa); /* Winsock getsockname takes int *, not socklen_t * */
+    if (getsockname(st->socks[sock_id], (struct sockaddr *)&sa, &len) == SOCKET_ERROR) {
+        if (err_msg) *err_msg = dup_wsa_last("getsockname");
+        return -1;
+    }
+    return (int)ntohs(sa.sin_port);
+}
+
+int net_try_accept(NetState *st, int listen_sock_id, char **peer_addr_out,
+                   char **err_msg) {
+    if (!valid_id(st, listen_sock_id)) { if (err_msg) *err_msg = dup_msg("invalid socket id"); return -1; }
+    struct sockaddr_in peer;
+    int plen = (int)sizeof(peer);
+    SOCKET cs = accept(st->socks[listen_sock_id], (struct sockaddr *)&peer, &plen);
+    if (cs == INVALID_SOCKET) {
+        if (WSAGetLastError() == WSAEWOULDBLOCK) return -2;
+        if (err_msg) *err_msg = dup_wsa_last("accept");
+        return -1;
+    }
+    if (set_nonblocking(cs) < 0) {
+        if (err_msg) *err_msg = dup_wsa_last("ioctlsocket(FIONBIO)");
+        closesocket(cs);
+        return -1;
+    }
+    int id = alloc_slot(st, cs, 0);
+    if (id < 0) {
+        if (err_msg) *err_msg = dup_msg("too many open sockets");
+        closesocket(cs);
+        return -1;
+    }
+    if (peer_addr_out) *peer_addr_out = addr_to_str(&peer);
+    return id;
+}
+
+int net_connect(NetState *st, int sock_id, const char *host, int port, char **err_msg) {
+    if (!valid_id(st, sock_id)) { if (err_msg) *err_msg = dup_msg("invalid socket id"); return -1; }
+    struct sockaddr_in sa;
+    if (fill_addr(&sa, host, port, st->kinds[sock_id], err_msg) < 0) return -1;
+    int rc = connect(st->socks[sock_id], (struct sockaddr *)&sa, sizeof(sa));
+    if (rc == 0) return 0;
+    int e = WSAGetLastError();
+    /* Non-blocking connect in progress.  Per the Winsock spec the first call
+     * returns WSAEWOULDBLOCK; a repeated connect() while still pending returns
+     * WSAEALREADY (or WSAEINVAL on some stacks), which we also treat as
+     * "still in progress" to match the Linux EINPROGRESS/EALREADY handling. */
+    if (e == WSAEWOULDBLOCK || e == WSAEALREADY || e == WSAEINVAL) return -2;
+    if (err_msg) *err_msg = dup_wsa_error("connect", e);
+    return -1;
+}
+
+int net_connect_check(NetState *st, int sock_id, char **err_msg) {
+    if (!valid_id(st, sock_id)) { if (err_msg) *err_msg = dup_msg("invalid socket id"); return -1; }
+    int soerr = 0;
+    int len = (int)sizeof(soerr); /* Winsock getsockopt takes int * for optlen */
+    if (getsockopt(st->socks[sock_id], SOL_SOCKET, SO_ERROR,
+                   (char *)&soerr, &len) == SOCKET_ERROR) {
+        if (err_msg) *err_msg = dup_wsa_last("getsockopt(SO_ERROR)");
+        return -1;
+    }
+    if (soerr == 0) return 0;
+    if (soerr == WSAEWOULDBLOCK || soerr == WSAEALREADY || soerr == WSAEINVAL)
+        return -2;
+    /* soerr is itself a WSA error code, so format it directly. */
+    if (err_msg) *err_msg = dup_wsa_error("connect", soerr);
+    return -1;
+}
+
+long long net_send(NetState *st, int sock_id, const char *data, long long len, char **err_msg) {
+    if (!valid_id(st, sock_id)) { if (err_msg) *err_msg = dup_msg("invalid socket id"); return -1; }
+    /* No MSG_NOSIGNAL on Windows: send() never raises SIGPIPE there, so the
+     * POSIX-only flag is simply omitted. */
+    int n = send(st->socks[sock_id], data, clamp_len(len), 0);
+    if (n == SOCKET_ERROR) {
+        if (WSAGetLastError() == WSAEWOULDBLOCK) return -2;
+        if (err_msg) *err_msg = dup_wsa_last("send");
+        return -1;
+    }
+    return (long long)n;
+}
+
+long long net_recv(NetState *st, int sock_id, char *buf, long long buf_len, char **err_msg) {
+    if (!valid_id(st, sock_id)) { if (err_msg) *err_msg = dup_msg("invalid socket id"); return -1; }
+    int n = recv(st->socks[sock_id], buf, clamp_len(buf_len), 0);
+    if (n == SOCKET_ERROR) {
+        if (WSAGetLastError() == WSAEWOULDBLOCK) return -2;
+        if (err_msg) *err_msg = dup_wsa_last("recv");
+        return -1;
+    }
+    return (long long)n; /* 0 == peer closed (EOF) */
+}
+
+long long net_sendto(NetState *st, int sock_id, const char *data, long long len,
+                     const char *host, int port, char **err_msg) {
+    if (!valid_id(st, sock_id)) { if (err_msg) *err_msg = dup_msg("invalid socket id"); return -1; }
+    struct sockaddr_in sa;
+    if (fill_addr(&sa, host, port, st->kinds[sock_id], err_msg) < 0) return -1;
+    int n = sendto(st->socks[sock_id], data, clamp_len(len), 0,
+                   (struct sockaddr *)&sa, sizeof(sa));
+    if (n == SOCKET_ERROR) {
+        if (WSAGetLastError() == WSAEWOULDBLOCK) return -2;
+        if (err_msg) *err_msg = dup_wsa_last("sendto");
+        return -1;
+    }
+    return (long long)n;
+}
+
+long long net_recvfrom(NetState *st, int sock_id, char *buf, long long buf_len,
+                       char **from_addr_out, char **err_msg) {
+    if (!valid_id(st, sock_id)) { if (err_msg) *err_msg = dup_msg("invalid socket id"); return -1; }
+    struct sockaddr_in from;
+    int flen = (int)sizeof(from);
+    int n = recvfrom(st->socks[sock_id], buf, clamp_len(buf_len), 0,
+                     (struct sockaddr *)&from, &flen);
+    if (n == SOCKET_ERROR) {
+        if (WSAGetLastError() == WSAEWOULDBLOCK) return -2;
+        if (err_msg) *err_msg = dup_wsa_last("recvfrom");
+        return -1;
+    }
+    if (from_addr_out) *from_addr_out = addr_to_str(&from);
+    return (long long)n;
+}
+
+int net_raw_fd(NetState *st, int sock_id) {
+    if (!valid_id(st, sock_id)) return -1;
+    /* NOTE (Step3 hand-off): the public net_raw_fd() signature returns int, but
+     * a Windows SOCKET is a UINT_PTR (64-bit on x64).  The cast below truncates
+     * the handle to int.  It is currently safe *in practice* because Winsock
+     * kernel handles are documented to fit in 32 bits (see "Socket Handles" in
+     * the Winsock docs), and the interpreter only round-trips this value back
+     * through net.c on the same platform where int is 32-bit.  However, this is
+     * relied upon by event_loop.c's select() multiplexing, which Step3 will
+     * port to Windows.  If Step3 needs to pass the raw SOCKET to a Windows
+     * select()/fd_set directly (rather than re-looking it up by id), the
+     * net_raw_fd() return type — and its callers in event_loop.c /
+     * interpreter.c — should be widened to an intptr_t-sized type to avoid the
+     * truncation.  See the Step3 hand-off note in docs/myon_spec.md (10.7). */
+    return (int)st->socks[sock_id];
+}
+
+void net_close(NetState *st, int sock_id) {
+    if (!valid_id(st, sock_id)) return;
+    closesocket(st->socks[sock_id]);
+    st->socks[sock_id] = INVALID_SOCKET;
+}
+
+#else /* !MYON_NET_POSIX && !_WIN32 : unsupported-platform stub */
 
 struct NetState { int dummy; };
 
@@ -358,4 +811,4 @@ long long net_recvfrom(NetState *st, int sock_id, char *buf, long long buf_len, 
 int net_raw_fd(NetState *st, int sock_id) { (void)st;(void)sock_id; return -1; }
 void net_close(NetState *st, int sock_id) { (void)st;(void)sock_id; }
 
-#endif /* MYON_NET_POSIX */
+#endif /* MYON_NET_POSIX / _WIN32 / stub */
