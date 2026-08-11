@@ -1,0 +1,11 @@
+# MVM disassembly sample: if / while control flow (Step 5 verification #3).
+# Exercises JUMP_IF_FALSE branch patching and a backward JUMP loop.
+i = 0
+myon.while i < 3 {
+    myon.if i == 1 then {
+        myon.print("one")
+    } myon.else {
+        myon.print("other")
+    }
+    i = i + 1
+}

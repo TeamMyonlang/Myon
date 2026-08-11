@@ -1,0 +1,7 @@
+# MVM disassembly sample: function definition + call (Step 5 verification #3).
+# Exercises MAKE_CLOSURE for STMT_FUNC, CALL / RET and multiple returns.
+myon.func square(n: int) ret int {
+    ret n * n
+}
+r = square(5)
+myon.print(r)

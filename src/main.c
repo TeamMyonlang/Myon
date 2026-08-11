@@ -19,6 +19,8 @@
 #include "interpreter.h"
 #include "common.h"
 #include "diag.h"
+#include "mvm_compiler.h"
+#include "mvm_chunk.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -57,8 +59,123 @@ static void usage(const char *prog) {
         "usage: %s [--tokens] <file.myon>\n"
         "       %s --tokens -   (read source from stdin)\n"
         "       %s              (no argument: start interactive REPL)\n"
-        "  --tokens   print the token stream and exit (Step 1 check)\n",
+        "  --tokens               print the token stream and exit (Step 1 check)\n"
+        "  --compile <src> [-o out]  compile a .myon to MVM bytecode (.myc) (Step 5)\n"
+        "  --dump-bytecode <src>  compile a .myon and print its disassembly (Step 5)\n",
         prog, prog, prog);
+}
+
+/*
+ * Step 5 helper: parse a .myon source file into a Program.  Shared by the
+ * --compile and --dump-bytecode paths.  Returns a Program (caller frees with
+ * program_free) plus the TokenList (out param, caller frees) and the source
+ * buffer (out param, caller frees).  Returns NULL on error.
+ *
+ * NOTE: this is an additive path; it does not touch the tree-walking
+ * interpreter used for `.myon` execution (docs/mvm_spec.md §9.2 defers the
+ * final CLI wiring to Step 7).
+ */
+static Program *load_program(const char *path, char **out_source, TokenList *out_tokens) {
+    char *source = read_file(path);
+    if (!source) return NULL;
+    diag_set_source(source);
+    if (!lexer_tokenize(source, out_tokens)) {
+        diag_clear_source();
+        free(source);
+        return NULL;
+    }
+    Program *program = parser_parse(out_tokens);
+    if (!program) {
+        token_list_free(out_tokens);
+        diag_clear_source();
+        free(source);
+        return NULL;
+    }
+    *out_source = source;
+    return program;
+}
+
+/* Derive a default output name: foo.myon -> foo.myc (Step 5 / spec §9.2). */
+static char *default_myc_name(const char *src) {
+    size_t n = strlen(src);
+    const char *dot = strrchr(src, '.');
+    char *out;
+    if (dot && strcmp(dot, ".myon") == 0) {
+        size_t base = (size_t)(dot - src);
+        out = (char *)myon_xmalloc(base + 5);
+        memcpy(out, src, base);
+        memcpy(out + base, ".myc", 5);
+    } else {
+        out = (char *)myon_xmalloc(n + 5);
+        memcpy(out, src, n);
+        memcpy(out + n, ".myc", 5);
+    }
+    return out;
+}
+
+static int cmd_compile(const char *src, const char *out) {
+    char *source = NULL;
+    TokenList tokens;
+    Program *program = load_program(src, &source, &tokens);
+    if (!program) return 65;
+
+    Module *m = mvm_compile_program(program, src);
+    int rc = 0;
+    if (!m) {
+        rc = 65;
+    } else {
+        char *outname = out ? myon_strdup(out) : default_myc_name(src);
+        if (mvm_module_write_file(m, outname) != 0) {
+            fprintf(stderr, "myon: failed to write '%s'\n", outname);
+            rc = 74;
+        } else {
+            fprintf(stderr, "myon: wrote %s\n", outname);
+        }
+        free(outname);
+        module_free(m);
+    }
+    program_free(program);
+    token_list_free(&tokens);
+    diag_clear_source();
+    free(source);
+    return rc;
+}
+
+static int cmd_dump_bytecode(const char *src) {
+    /* If it's already a .myc, load and dump it directly. */
+    FILE *probe = fopen(src, "rb");
+    if (probe) {
+        unsigned char magic[4] = {0};
+        size_t got = fread(magic, 1, 4, probe);
+        fclose(probe);
+        if (got == 4 && magic[0] == 'M' && magic[1] == 'Y' &&
+            magic[2] == 'C' && magic[3] == '1') {
+            Module *m = mvm_module_read_file(src);
+            if (!m) { fprintf(stderr, "myon: cannot load '%s'\n", src); return 65; }
+            mvm_module_disassemble(m, stdout);
+            module_free(m);
+            return 0;
+        }
+    }
+
+    char *source = NULL;
+    TokenList tokens;
+    Program *program = load_program(src, &source, &tokens);
+    if (!program) return 65;
+
+    Module *m = mvm_compile_program(program, src);
+    int rc = 0;
+    if (!m) {
+        rc = 65;
+    } else {
+        mvm_module_disassemble(m, stdout);
+        module_free(m);
+    }
+    program_free(program);
+    token_list_free(&tokens);
+    diag_clear_source();
+    free(source);
+    return rc;
 }
 
 /* ------------------------------------------------------------------ */
@@ -192,15 +309,31 @@ static int run_repl(void) {
 int main(int argc, char **argv) {
     int tokens_only = 0;
     const char *path = NULL;
+    /* Step 5 (additive): MVM compile / disassemble subcommands. */
+    const char *compile_src = NULL;
+    const char *compile_out = NULL;
+    const char *dump_src = NULL;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--tokens") == 0) tokens_only = 1;
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage(argv[0]); return 0;
+        } else if (strcmp(argv[i], "--compile") == 0) {
+            if (i + 1 >= argc) { usage(argv[0]); return 64; }
+            compile_src = argv[++i];
+        } else if (strcmp(argv[i], "--dump-bytecode") == 0) {
+            if (i + 1 >= argc) { usage(argv[0]); return 64; }
+            dump_src = argv[++i];
+        } else if (strcmp(argv[i], "-o") == 0) {
+            if (i + 1 >= argc) { usage(argv[0]); return 64; }
+            compile_out = argv[++i];
         } else {
             path = argv[i];
         }
     }
+
+    if (dump_src)    return cmd_dump_bytecode(dump_src);
+    if (compile_src) return cmd_compile(compile_src, compile_out);
 
     /* No file argument and not a token dump: start the interactive REPL. */
     if (!path && !tokens_only) {

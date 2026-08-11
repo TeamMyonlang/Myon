@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+#
+# Copyright 2026 nyan<(nyan4)
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Step 5 unit tests for the AST -> MVM bytecode compiler (docs/mvm_spec.md).
+#
+# This is deliberately separate from tests/run_tests.sh (the .myon/.out
+# tree-walk regression suite) because its goal is different: it verifies the
+# *compiler* mechanically, not program output.  It checks that
+#
+#   1. every tests/cases/*.myon file either compiles+disassembles without
+#      crashing, or fails with a clean (non-signal) compile error — never a
+#      segfault/abort;
+#   2. the MVM-out-of-scope features (async / net / http / ffi / generics,
+#      spec §7) are rejected with the "MVM does not support ..." diagnostic and
+#      no .myc is produced;
+#   3. the hand-written tests/mvm_dump_samples/*.myon compile, disassemble, and
+#      round-trip through a written .myc file (compile -> read back -> dump).
+
+set -u
+cd "$(dirname "$0")/.."
+
+MYON=./myon
+if [ ! -x "$MYON" ]; then
+    echo "error: build the interpreter first (make)"; exit 1
+fi
+
+pass=0
+fail=0
+TMPD="$(mktemp -d)"
+trap 'rm -rf "$TMPD"' EXIT
+
+ok()   { echo "  ok   $1"; pass=$((pass + 1)); }
+bad()  { echo "  FAIL $1"; fail=$((fail + 1)); }
+
+# A process is considered to have "crashed" if it was killed by a signal, i.e.
+# exit status >= 128 (bash reports 128 + signal number).
+crashed() { [ "$1" -ge 128 ]; }
+
+# ------------------------------------------------------------------ #
+# 1. No tree-walk test case may crash the compiler.                  #
+# ------------------------------------------------------------------ #
+echo "== MVM compiler: --dump-bytecode must never crash on tests/cases =="
+for t in tests/cases/*.myon; do
+    name="$(basename "${t%.myon}")"
+    "$MYON" --dump-bytecode "$t" >/dev/null 2>&1
+    rc=$?
+    if crashed "$rc"; then
+        bad "$name (crashed with signal, exit=$rc)"
+    else
+        ok "$name (exit=$rc, no crash)"
+    fi
+done
+
+# ------------------------------------------------------------------ #
+# 2. MVM-out-of-scope features must be rejected cleanly (spec §7).   #
+#    We assert both a non-zero exit AND the diagnostic wording, AND  #
+#    that no stray .myc is produced.                                 #
+# ------------------------------------------------------------------ #
+echo "== MVM compiler: unsupported features error cleanly (spec §7) =="
+
+# expect_unsupported <label> <inline-myon-source>
+expect_unsupported() {
+    local label="$1" src="$2"
+    local f="$TMPD/$label.myon"
+    local out="$TMPD/$label.myc"
+    printf '%s\n' "$src" > "$f"
+    local msg
+    msg="$("$MYON" --compile "$f" -o "$out" 2>&1)"
+    local rc=$?
+    if crashed "$rc"; then
+        bad "$label (crashed, exit=$rc)"
+    elif [ "$rc" -eq 0 ]; then
+        bad "$label (expected a compile error, but exit was 0)"
+    elif ! printf '%s' "$msg" | grep -q "MVM does not support"; then
+        bad "$label (wrong diagnostic: $msg)"
+    elif [ -f "$out" ]; then
+        bad "$label (a .myc was produced despite the error)"
+    else
+        ok "$label"
+    fi
+}
+
+expect_unsupported async  'myon.async myon.func f() ret void { }'
+expect_unsupported await   'x = myon.await foo()'
+expect_unsupported net     'module myon.net
+s = myon.net.tcp_listen("127.0.0.1", 8080)'
+expect_unsupported ffi     'module myon.ffi
+h = myon.ffi.load("libc.so.6")'
+expect_unsupported generic 'myon.func id<T>(x: T) ret T { ret x }'
+
+# ------------------------------------------------------------------ #
+# 3. Hand-written samples compile, disassemble and round-trip.       #
+# ------------------------------------------------------------------ #
+echo "== MVM compiler: dump samples compile + .myc round-trip =="
+for t in tests/mvm_dump_samples/*.myon; do
+    [ -e "$t" ] || continue
+    name="$(basename "${t%.myon}")"
+
+    # 3a. direct disassembly must succeed
+    "$MYON" --dump-bytecode "$t" >/dev/null 2>&1
+    if [ $? -ne 0 ]; then bad "$name (dump failed)"; continue; fi
+
+    # 3b. compile to a .myc, then disassemble the .myc back
+    myc="$TMPD/$name.myc"
+    "$MYON" --compile "$t" -o "$myc" >/dev/null 2>&1
+    if [ $? -ne 0 ] || [ ! -f "$myc" ]; then bad "$name (compile to .myc failed)"; continue; fi
+
+    # magic bytes must be "MYC1"
+    magic="$(head -c 4 "$myc")"
+    if [ "$magic" != "MYC1" ]; then bad "$name (bad .myc magic: '$magic')"; continue; fi
+
+    d_src="$("$MYON" --dump-bytecode "$t"   2>/dev/null | grep -v '^; ')"
+    d_myc="$("$MYON" --dump-bytecode "$myc" 2>/dev/null | grep -v '^; ')"
+    if [ "$d_src" != "$d_myc" ]; then
+        bad "$name (.myc round-trip disassembly differs from source)"
+        diff <(printf '%s' "$d_src") <(printf '%s' "$d_myc") | sed 's/^/      /'
+    else
+        ok "$name (compiled, magic ok, round-trip stable)"
+    fi
+done
+
+echo "== results: $pass passed, $fail failed =="
+[ "$fail" -eq 0 ]

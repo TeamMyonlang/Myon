@@ -66,7 +66,7 @@ endif
 SOURCES  = $(wildcard $(SRC_DIR)/*.c)
 OBJECTS  = $(patsubst $(SRC_DIR)/%.c,$(BUILD)/%.o,$(SOURCES))
 
-.PHONY: all clean test
+.PHONY: all clean test test-mvm
 
 all: $(BIN)
 
@@ -81,6 +81,11 @@ $(BUILD):
 
 test: all
 	./tests/run_tests.sh
+	./tests/mvm_compiler_tests.sh
+
+# Step 5: run only the AST -> MVM bytecode compiler unit tests.
+test-mvm: all
+	./tests/mvm_compiler_tests.sh
 
 clean:
 	rm -rf $(BUILD) $(BIN)
