@@ -19,7 +19,20 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
-#include <sys/select.h>   /* fd_set, FD_ZERO, FD_SET, select() (Phase5.2) */
+
+/*
+ * fd_set / FD_ZERO / FD_SET / select() (Phase5.2).  On POSIX these come from
+ * <sys/select.h>; on Windows (native MSYS2/MinGW-w64 or a MinGW-w64 cross
+ * build) there is no <sys/select.h> -- the same names are declared by
+ * <winsock2.h> instead.  This mirrors the platform split already used in
+ * src/net.c (Step 1-3) so the two socket-touching translation units agree.
+ * The POSIX branch is unchanged, so the existing Linux build is unaffected.
+ */
+#if defined(_WIN32)
+#  include <winsock2.h>
+#else
+#  include <sys/select.h>
+#endif
 
 #include <openssl/ssl.h>
 #include <openssl/err.h>

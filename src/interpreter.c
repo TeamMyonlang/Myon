@@ -66,7 +66,36 @@
  * <windows.h> here (see the TokenType-collision note above). */
 #if defined(_WIN32)
 __declspec(dllimport) void __stdcall Sleep(unsigned long dwMilliseconds);
+/* Windows has no clock_gettime(CLOCK_REALTIME).  GetSystemTimeAsFileTime gives
+ * the wall clock as a FILETIME (100-ns ticks since 1601-01-01 UTC).  We declare
+ * it (and the minimal FILETIME layout) locally with the exact kernel32
+ * prototype so we still avoid pulling in <windows.h> (see the TokenType
+ * collision note above). */
+typedef struct { unsigned long dwLowDateTime; unsigned long dwHighDateTime; } MYON_FILETIME;
+__declspec(dllimport) void __stdcall GetSystemTimeAsFileTime(MYON_FILETIME *lpSystemTimeAsFileTime);
 #endif
+
+/*
+ * Wall-clock time in UNIX-epoch milliseconds, portable across POSIX and
+ * Windows.  POSIX uses clock_gettime(CLOCK_REALTIME); Windows converts the
+ * FILETIME (ticks since 1601) to the UNIX epoch.  Consolidating the three
+ * former inline clock_gettime() sites here fixes the MinGW-w64 link failure
+ * (undefined reference to clock_gettime) without changing Linux behaviour.
+ */
+static long long myon_wallclock_ms(void) {
+#if defined(_WIN32)
+    MYON_FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    /* 100-ns ticks since 1601-01-01 -> ms; 11644473600 s between 1601 and 1970. */
+    unsigned long long ticks =
+        ((unsigned long long)ft.dwHighDateTime << 32) | (unsigned long long)ft.dwLowDateTime;
+    return (long long)(ticks / 10000ULL) - 11644473600000LL;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (long long)ts.tv_sec * 1000 + (long long)ts.tv_nsec / 1000000;
+#endif
+}
 
 /* Some C standard libraries only expose M_PI / M_E under _GNU_SOURCE or
  * similar feature-test macros; provide portable fallbacks (Phase3.5). */
@@ -1569,10 +1598,7 @@ static int call_time(Interp *it, Env *env, const char *name, Expr *call, Value *
 
     /* myon.time.now_ms() ret int — UNIX epoch milliseconds. */
     if (strcmp(name, "myon.time.now_ms") == 0) {
-        struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        long long ms = (long long)ts.tv_sec * 1000 + (long long)ts.tv_nsec / 1000000;
-        *out = value_int(ms);
+        *out = value_int(myon_wallclock_ms());
         return 1;
     }
 
@@ -1615,10 +1641,7 @@ static int call_time(Interp *it, Env *env, const char *name, Expr *call, Value *
      * in milliseconds so that frame_wait() can pace the loop to a target
      * FPS.  Kept as a distinct name purely to make game loops read clearly. */
     if (strcmp(name, "myon.time.frame_start") == 0) {
-        struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        long long ms = (long long)ts.tv_sec * 1000 + (long long)ts.tv_nsec / 1000000;
-        *out = value_int(ms);
+        *out = value_int(myon_wallclock_ms());
         return 1;
     }
 
@@ -1640,9 +1663,7 @@ static int call_time(Interp *it, Env *env, const char *name, Expr *call, Value *
         long long target_fps = b.as.i;
         value_free(&a); value_free(&b);
 
-        struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        long long now_ms = (long long)ts.tv_sec * 1000 + (long long)ts.tv_nsec / 1000000;
+        long long now_ms = myon_wallclock_ms();
         long long elapsed = now_ms - frame_start_ms;
         if (elapsed < 0) elapsed = 0; /* guard against clock going backwards */
 

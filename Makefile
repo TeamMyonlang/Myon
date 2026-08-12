@@ -45,15 +45,18 @@ BIN      = myon.exe
 # (ws2_32.dll -> -lws2_32).  This has no effect on the Linux branch below.
 LDLIBS  += -lws2_32
 # NOTE (OpenSSL on Windows): myon.http links libssl/libcrypto (see LDLIBS
-# above).  Under MinGW-w64 the import/static library names and search paths
-# differ from Linux (e.g. an MSYS2 package may expose -lssl -lcrypto plus a
-# -L<prefix>/lib, while some builds need -lssl-3-x64 / -lcrypto-3-x64 or the
-# *.dll.a import libraries).  Resolving the concrete names/paths is deferred to
-# Step 3 / the integration step; override them here without touching the Linux
-# defaults, e.g.:
-#     make OPENSSL_LDLIBS="-L/mingw64/lib -lssl -lcrypto"
-# For now WIN_OPENSSL_LDLIBS is a placeholder that folds into LDLIBS only on
-# Windows, so the Linux link line is unchanged.
+# above).  The default -lssl -lcrypto names work with the MSYS2
+# `mingw-w64-x86_64-openssl` package and with vcpkg's OpenSSL, provided the
+# corresponding include/ and lib/ (import libraries libssl.dll.a /
+# libcrypto.dll.a) are on the compiler's search path.  A MinGW-w64 cross build
+# (CC=x86_64-w64-mingw32-gcc) links cleanly this way -- verified in Step 7-c.
+#
+# If a particular toolchain uses different names/paths (e.g.
+# -lssl-3-x64 / -lcrypto-3-x64, or a non-default prefix), add them via
+# WIN_OPENSSL_LDLIBS without touching the Linux defaults, e.g.:
+#     make WIN_OPENSSL_LDLIBS="-L/mingw64/lib"
+# WIN_OPENSSL_LDLIBS folds into LDLIBS only on Windows, so the Linux link line
+# is unchanged.
 WIN_OPENSSL_LDLIBS ?=
 LDLIBS  += $(WIN_OPENSSL_LDLIBS)
 else
@@ -66,9 +69,18 @@ endif
 SOURCES  = $(wildcard $(SRC_DIR)/*.c)
 OBJECTS  = $(patsubst $(SRC_DIR)/%.c,$(BUILD)/%.o,$(SOURCES))
 
-.PHONY: all clean test test-mvm
+.PHONY: all clean test test-mvm test-mvm-equality win-cross
 
 all: $(BIN)
+
+# Convenience: MinGW-w64 cross-compile from Linux, producing myon.exe.
+# Requires the x86_64-w64-mingw32 toolchain and Windows OpenSSL headers/import
+# libraries (MSYS2 mingw-w64-x86_64-openssl or vcpkg) on its search path.
+# This only cross-links; it does NOT run the resulting .exe (no Windows here).
+# Extra OpenSSL search paths, if needed, go via WIN_OPENSSL_LDLIBS, e.g.:
+#     make win-cross WIN_OPENSSL_LDLIBS="-L/path/to/openssl/lib"
+win-cross:
+	$(MAKE) OS=Windows_NT CC=x86_64-w64-mingw32-gcc
 
 $(BIN): $(OBJECTS)
 	$(CC) $(CFLAGS) -o $@ $(OBJECTS) $(LDLIBS)
@@ -79,13 +91,21 @@ $(BUILD)/%.o: $(SRC_DIR)/%.c | $(BUILD)
 $(BUILD):
 	mkdir -p $(BUILD)
 
+# Full test suite.  The existing suites (run order and output format) are kept
+# exactly as before; Step 7-c only appends the .myon/.myc equality suite when
+# it is present (tests/run_mvm_tests.sh), so older checkouts still work.
 test: all
 	./tests/run_tests.sh
 	./tests/mvm_compiler_tests.sh
+	@if [ -f ./tests/run_mvm_tests.sh ]; then ./tests/run_mvm_tests.sh; fi
 
 # Step 5: run only the AST -> MVM bytecode compiler unit tests.
 test-mvm: all
 	./tests/mvm_compiler_tests.sh
+
+# Step 7-b: run only the .myon (tree-walk) vs .myc (MVM) equality suite.
+test-mvm-equality: all
+	./tests/run_mvm_tests.sh
 
 clean:
 	rm -rf $(BUILD) $(BIN)

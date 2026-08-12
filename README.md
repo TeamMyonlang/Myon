@@ -375,6 +375,106 @@ make
 > Makefile は常に `-lssl -lcrypto` をリンクします。DNS 名前解決（`getaddrinfo`）
 > は libc に含まれるため追加依存はありません。
 
+### Windows でのビルド
+
+> ⚠️ **重要な前提（未検証である旨の明記）**
+> この環境には実際の Windows マシンが無いため、以下の手順は
+> **MinGW-w64 クロスコンパイラ（`x86_64-w64-mingw32-gcc`）で
+> `myon.exe` のリンク成功までを確認した結果に基づく推測**です。
+> **実際の Windows 環境で `myon.exe` を起動して動作させる実行確認は
+> 行っていません。** 実機での動作は、ユーザー自身での確認が必要です
+> （下記「Windows 実機で確認が必要な項目」を参照）。
+
+#### 前提環境
+
+以下のいずれかを想定します。
+
+- **MSYS2 / MinGW-w64**（推奨・native ビルド）
+  MSYS2 の MINGW64 シェルで GCC ツールチェインと OpenSSL を導入する。
+- **Linux からの MinGW-w64 クロスコンパイル**（本ステップで検証した経路）
+  `x86_64-w64-mingw32-gcc` と Windows 向け OpenSSL のヘッダ／インポート
+  ライブラリを用意する。
+
+Visual Studio + clang-cl 等の MSVC 系ツールチェインは、`_WIN32` 分岐の
+コード自体は MSVC でもコンパイル可能な書き方を心がけていますが、
+本ステップでは検証していません（ビルドシステムは GCC/MinGW 前提の
+`Makefile` のみ提供）。
+
+#### OpenSSL（`libssl-dev` 相当）の入手
+
+`myon.http` の HTTPS/TLS が OpenSSL を必要とするため、Windows でも
+OpenSSL の開発ファイル（ヘッダ ＋ インポートライブラリ）が必須です。
+
+- **MSYS2（native ビルド）**
+  ```sh
+  pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-openssl
+  ```
+  これで `-lssl -lcrypto` がそのままリンクできます（`/mingw64/include`,
+  `/mingw64/lib` が検索パスに入る）。
+- **vcpkg（MSVC/クロス両対応）**
+  ```sh
+  vcpkg install openssl:x64-windows
+  ```
+  インストール先の `include/` と `lib/` を検索パスに追加します。
+- **Linux クロスコンパイル環境（本ステップで用いた方法）**
+  MSYS2 の `mingw-w64-x86_64-openssl` パッケージ（`*.pkg.tar.zst`）を
+  展開し、その `openssl/` ヘッダと `libssl.dll.a` / `libcrypto.dll.a`
+  インポートライブラリを MinGW シスルート（例：
+  `/usr/x86_64-w64-mingw32/{include,lib}`）へ配置しました。
+
+#### ビルドコマンド
+
+- **MSYS2 / MinGW-w64 の native ビルド**
+  MINGW64 シェルでは環境変数 `OS=Windows_NT` が設定済みなので、
+  そのまま `make` が使えます。
+  ```sh
+  make            # myon.exe を生成
+  ```
+- **Linux からのクロスコンパイル**
+  用意した便利ターゲット、または明示的な変数指定を使います。
+  ```sh
+  make win-cross                                   # 便利ターゲット
+  # 同等の明示指定:
+  make OS=Windows_NT CC=x86_64-w64-mingw32-gcc
+  ```
+  OpenSSL の検索パスを追加する必要がある場合は
+  `WIN_OPENSSL_LDLIBS` で補います（Linux のリンク行には影響しません）。
+  ```sh
+  make win-cross WIN_OPENSSL_LDLIBS="-L/path/to/openssl/lib"
+  ```
+
+Windows ビルドでは Makefile が自動的に、出力名を `myon.exe`、
+Winsock2 を `-lws2_32` でリンクします（`src/net.c` / `src/tls.c` の
+`_WIN32` 分岐）。C FFI が使う `LoadLibrary`/`GetProcAddress` は
+`kernel32.dll` に含まれ暗黙リンクされるため、追加フラグは不要です。
+
+#### 既知の制限事項・未検証事項
+
+- **実機での実行は未確認**：本リポジトリで確認したのは
+  クロスコンパイル（`myon.exe` のリンク成功）までです。生成した
+  `.exe` を Windows 上で起動して動かす確認は行っていません。
+- **配布時の DLL 同梱**：OpenSSL を共有（`*.dll.a` インポートライブラリ）で
+  リンクした場合、実行には対応する `libssl-*.dll` / `libcrypto-*.dll`
+  （MSYS2 なら加えて `libgcc_s_*.dll` 等のランタイム DLL）が実行時に
+  必要です。静的リンクを使うか、これらの DLL を `myon.exe` と同じ
+  ディレクトリに置く必要があります。
+- 上記「Visual Studio + clang-cl」経路は未検証です。
+
+#### Windows 実機で確認が必要な項目（ユーザー向けTODO）
+
+以下は Windows 実機が無いため本リポジトリでは未確認です。実際の
+Windows 環境をお持ちの場合は、これらを確認してください。
+
+- `examples/hello.myon` の実行（基本的な `.myon` ツリーウォーク実行）
+- `examples/net_game_echo.myon` の動作（Win32 Fiber によるイベント
+  ループ ＋ Winsock2 ソケットの協調動作）
+- `.myc` 実行（`myon --compile foo.myon` → `myon foo.myc`）と、
+  ツリーウォーク実行との結果一致
+- `myon.http.get("https://...")` の HTTPS/TLS 動作（OpenSSL DLL の
+  同梱・証明書検証を含む）
+- C FFI（`myon.ffi`）が Windows DLL（`LoadLibrary` 経由）に対して
+  動作すること
+
 ## 使い方
 
 ```sh
