@@ -6,7 +6,15 @@
 
 ## 実装状況
 
-`make test` により、下表の各ステップ・項目に対応する回帰テスト（計 30 ケース）がすべてパスします。
+`make test` により、下表の各ステップ・項目に対応する回帰テスト（`tests/cases/`
+以下の `.myon` ケース群。現在 59 ケース）がすべてパスします。加えて Phase 7 で
+`.myon`／`.myc` の等価性検証スイート（`tests/run_mvm_tests.sh`）も `make test` に
+統合されており、ツリーウォーク実行と MVM バイトコード実行の出力一致を確認します。
+
+> **環境依存ケースの扱い**：FFI（`libm`/`libz` 等の共有ライブラリを要する）や
+> ネットワーク（ソケットを開く）を伴う一部ケースは、実行環境によってはテスト
+> ハーネスが自動的に除外（excluded）します。除外されたケースは失敗ではなく、
+> 対応ライブラリ・権限のある環境で実行するとパスします。
 
 ### Step 0〜18（コア実装）
 
@@ -361,6 +369,66 @@ include していなかったため、ヘッダの暗黙依存に頼れないク
   やピンニング等の本格的な強化は設計判断を要するため、引き続きスコープ外
   （信頼できないネットワークでの機密送受信には使用しない、という注意を継続）。
 
+### Phase 6（Windows 対応 — FFI / ネットワーク / イベントループのクロスプラットフォーム化）
+
+Linux 専用だった実行時レイヤ（C FFI・ソケット・協調的イベントループ）を、
+`_WIN32` 分岐によって Windows でも動作するよう移植しました。言語仕様・
+ツリーウォーク実行の挙動は Linux と共通で、プラットフォーム依存部のみを
+差し替える方針です。ビルド手順は下記「Windows でのビルド」節に、実装詳細と
+プラットフォーム抽象化の設計は仕様書 [`docs/myon_spec.md`](docs/myon_spec.md)
+の 10.3（C FFI）・10.7（`myon.net`）・14.9（並行処理・イベントループ）各節に
+まとめてあります。
+
+| ステップ | 内容 | 状態 |
+|---|---|---|
+| Step 1 | C FFI の Windows 実装（`LoadLibraryA`/`GetProcAddress`/`FreeLibrary`、`src/ffi_platform.c` の `_WIN32` 分岐。`myon.ffi.load`/`close`/`call_*` が Windows DLL に対して動作） | ✅ 実装（クロスコンパイルまで検証） |
+| Step 2 | `myon.net` の Windows 実装（Winsock2 = `ws2_32`。`src/net.c` の `_WIN32` 分岐で `SOCKET`／`WSAStartup`/`WSACleanup`／`WSAGetLastError` を扱い、`SOCKET`(64bit) と `int` fd の橋渡しを局所化） | ✅ 実装（クロスコンパイルまで検証） |
+| Step 3 | 協調的イベントループの Windows 実装（`ucontext` の無い Windows では **Win32 Fiber API**＝`CreateFiber`/`SwitchToFiber`/`ConvertThreadToFiber` でコルーチンを実装。`src/event_loop.c` の `#elif defined(_WIN32)` 分岐、`MYON_EVENT_LOOP_FIBER`） | ✅ 実装（クロスコンパイルまで検証） |
+
+> ⚠️ **未検証事項（正直な状態）**：Phase 6 で確認したのは MinGW-w64
+> （`x86_64-w64-mingw32-gcc`）による **`myon.exe` のリンク成功まで**です。
+> **実際の Windows 実機で `myon.exe` を起動して動かす実行確認は行っていません。**
+> 実機での動作確認はユーザー側の TODO として下記「Windows 実機で確認が必要な
+> 項目」に列挙しています。macOS は依然として FFI が「未対応」スタブのままです。
+
+### Phase 7（MVM — Myon Virtual Machine バイトコード VM）
+
+ツリーウォーク型インタプリタに加えて、`.myon` を **MVM（Myon Virtual Machine）
+バイトコード**（`.myc`、マジック `MYC1`）へコンパイルし、スタックマシン型の
+バイトコード VM で実行する経路を追加しました。`.myon`（ツリーウォーク）実行の
+挙動は従来と一切変わりません。バイトコード仕様は
+[`docs/mvm_spec.md`](docs/mvm_spec.md)、CLI と実行モデルは
+[`docs/myon_spec.md`](docs/myon_spec.md) の 12.0 節に記載しています。
+
+| ステップ | 内容 | 状態 |
+|---|---|---|
+| Step 4 | MVM バイトコード仕様策定（[`docs/mvm_spec.md`](docs/mvm_spec.md) を新規作成：スタックマシン・命令セット・`.myc` フォーマット・静的スコープ解決） | ✅ 設計 |
+| Step 5 | AST→バイトコードコンパイラ（`src/mvm_compiler.{h,c}`、`src/mvm_chunk.{h,c}`、`src/mvm_bytecode.h`。`--compile` で `.myc` を書き出す） | ✅ 実装 |
+| Step 6 | バイトコード VM ランタイム（`src/mvm_vm.{h,c}`。`.myc` の読み込み → スタックマシン実行） | ✅ 実装 |
+| Step 7-a | CLI フラグ体系の最終確定（`--compile`/`-o`/`--dump-bytecode`/`--run-mvm`、ファイル引数の MYC1 マジック／拡張子による振り分け。`src/main.c`） | ✅ 実装 |
+| Step 7-b | `.myon`／`.myc` の等価性検証スイート（`tests/run_mvm_tests.sh`：同一ソースをツリーウォークと MVM の両経路で実行し出力一致を検証、対応済み機能のケースを対象） | ✅ 実装 |
+| Step 7-c | Windows ビルドの整備・検証（Makefile の `win-cross` ターゲット、MinGW-w64 クロスコンパイルでの `myon.exe` リンク確認） | ✅ 実装（クロスコンパイルまで検証） |
+| Step 7-d | README・仕様書の総仕上げ（本ステップ。実装状況表への Phase 6/7 追記、`mvm_spec.md` と実装のずれ解消、既知の制限の最終整理） | ✅ ドキュメント |
+
+`./myon foo.myon` は従来どおりツリーウォーク実行、`./myon foo.myc` は MVM VM
+実行、`./myon --compile foo.myon [-o out.myc]` はコンパイルのみ（実行しない）、
+`./myon --dump-bytecode foo.myon` は逆アセンブル表示です。MVM が対応する
+言語機能（M0〜M8：リテラル・算術・比較・論理・変数・スコープ・制御構文・関数・
+複数戻り値・ネイティブ呼び出し・文字列補間・キャスト・配列/マップ・構造体/
+メソッド）の範囲では、ツリーウォークと MVM の出力が一致することを
+`tests/run_mvm_tests.sh` が回帰的に確認します（`make test` に統合済み）。
+async/await・`myon.net`／`myon.http`・FFI・ジェネリクスは MVM 非対応で、
+コンパイル時に明示エラーとなります（`docs/mvm_spec.md` 7 節）。これらの機能を
+使うプログラムは従来どおり `.myon` のツリーウォーク実行で動かします。
+
+> **MVM の既知の制限（`docs/mvm_spec.md` 7 節・下記「既知の制限事項」参照）**
+> - REPL は当面ツリーウォークのみ対応（MVM 版 REPL は将来課題）。
+> - `.myc` の Source Info（`src_mtime`/`src_size`/`src_hash`）は**書き込み済み**
+>   だが、`./myon foo.myc` 実行時に「`.myon` より古い `.myc`」を検出して警告する
+>   **stale チェックの実行時検証と `--strict-stale` フラグは未実装**（設計のみ、
+>   下記「今後の課題」参照）。
+> - async/await・net/http・FFI・ジェネリクス・クロージャは MVM 非対応。
+
 ## ビルド
 
 ```sh
@@ -567,12 +635,25 @@ src/
   interpreter.{h,c}  ツリーウォーク型インタプリタ（Step 4〜17・P4 ファイルI/O）
   common.{h,c}       共通ユーティリティ（メモリ確保・文字列複製）
   diag.{h,c}         診断ヘルパー（P5: ソース抜粋・列番号・トークン名変換）
-  ffi_platform.{h,c} C FFI プラットフォーム抽象化層（dlopen/dlsym, Phase3 Step1）
+  ffi_platform.{h,c} C FFI プラットフォーム抽象化層（dlopen/dlsym ｜ Windows: LoadLibrary/GetProcAddress, Phase3 Step1 / Phase6 Step1）
   ffi.{h,c}          C FFI 型・ハンドル管理レイヤ（Phase3 Step2）
   ffi_call.{h,c}     C FFI 呼び出しディスパッチ（libffi 不使用, Phase3 Step3）
-  main.c             エントリポイント（CLI 解析・.myon/.myc 実行の振り分け / REPL, P3）
+  ffi_callback.{h,c} C FFI コールバック（静的トランポリン, Phase4.1 Step4）
+  event_loop.{h,c}   協調的イベントループ（Linux: ucontext ｜ Windows: Win32 Fiber, Phase5 / Phase6 Step3）
+  net.{h,c}          低水準ソケット myon.net（Linux ｜ Windows: Winsock2, Phase5 / Phase6 Step2）
+  http.{h,c}         簡易 HTTP モジュール myon.http（Phase5）
+  tls.{h,c}          HTTPS/TLS ラッパ（OpenSSL, Phase5.1）
+  mvm_bytecode.h     MVM オペコード定義（Phase7 Step5）
+  mvm_chunk.{h,c}    MVM チャンク・定数プール・`.myc` シリアライズ（Phase7 Step5）
+  mvm_compiler.{h,c} AST→MVM バイトコードコンパイラ（Phase7 Step5）
+  mvm_vm.{h,c}       MVM バイトコード VM ランタイム（Phase7 Step6）
+  main.c             エントリポイント（CLI 解析・.myon/.myc 実行の振り分け / REPL, P3 / Phase7 Step7-a）
 examples/            サンプルプログラム
 tests/               回帰テスト（`make test`）
+  cases/             `.myon`／`.out`／`.err` の回帰ケース
+  run_tests.sh       ケース実行ハーネス
+  run_mvm_tests.sh   `.myon`／`.myc` 等価性検証スイート（Phase7 Step7-b）
+  mvm_compiler_tests.sh / bench_mvm.sh  MVM コンパイラ単体テスト・ベンチ
 ```
 
 ## テスト
