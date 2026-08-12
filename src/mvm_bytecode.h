@@ -114,7 +114,18 @@ typedef enum {
     MOP_MAKE_ERROR = 0x85,
 
     /* 0x90-0x9F : native / module calls (spec §4.14) */
-    MOP_CALL_NATIVE = 0x90   /* u16 native_id, u8 argc */
+    MOP_CALL_NATIVE = 0x90,  /* u16 native_id, u8 argc */
+
+    /* 0xA0-0xAF : misc (Step 7-b) */
+    MOP_UNPACK        = 0xA0, /* u8 n : pop one tuple (array) value, push its n
+                               * elements in order.  Used to spread a native
+                               * call's (value,error) tuple across the N targets
+                               * of a multiple-target assignment (spec §6.2). */
+    MOP_CHECK_NOT_NIL = 0xA1  /* peek stack top; if it is myon.nil, raise the
+                               * spec §2.4 "cannot assign myon.nil to a normal
+                               * variable" error.  Emitted before the STORE of a
+                               * single-target simple assignment so the VM
+                               * mirrors the tree-walk's runtime rule. */
 } OpCode;
 
 /*

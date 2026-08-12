@@ -364,6 +364,16 @@ static int run(VM *vm) {
             /* return values are the top n operands (n is a u8, so <= 255) */
             Value rets[256];
             for (int i = (int)n - 1; i >= 0; i--) rets[i] = vm_pop(vm);
+            /* Step 7-b fix: a call expression must always yield at least one
+             * value, because a call used as a statement is compiled as
+             * `<call> ; POP` (mvm_compiler.c STMT_EXPR).  A `ret void` /
+             * implicit return emits `RET 0`, which previously left nothing on
+             * the stack, so the trailing POP consumed an unrelated slot (e.g. a
+             * global), corrupting the frame.  Normalize a 0-value return of a
+             * *called* function to a single nil; the entry <main> chunk (handled
+             * below when frame_count hits 0) still discards it.  Multi-value
+             * returns (n >= 1, used by `a, b = f()`) are unchanged. */
+            if (n == 0) { rets[0] = value_nil(); n = 1; }
             /* tear down: free locals, then the callee fn value */
             while (vm->sp > f->base) { Value d = vm_pop(vm); value_free(&d); }
             if (f->fn_slot >= 0) {
@@ -548,6 +558,21 @@ static int run(VM *vm) {
             } else {
                 /* built-in method (array/map/str): reuse the tree-walker */
                 Value *args = &vm->stack[vm->sp - argc];
+                /* An MVM closure encodes its chunk index in as.fn.decl (see
+                 * vm_make_closure), NOT a real FuncDecl*.  The tree-walk
+                 * built-ins (.map/.filter/.reduce, ...) would dereference that
+                 * as a pointer and crash.  Passing a VM function value into a
+                 * native higher-order method is therefore unsupported for now;
+                 * detect it and raise a clean error instead of segfaulting.
+                 * (Documented Step 7-b limitation.) */
+                for (int i = 0; i < argc; i++) {
+                    if (args[i].type == TYPE_FUNC) {
+                        vm_error(vm, line,
+                            "MVM does not support passing a function/lambda to the "
+                            "built-in method '%s' (higher-order native methods; "
+                            "run the .myon source instead)", method);
+                    }
+                }
                 Value recv_copy = value_copy(recv);
                 Value out = value_nil();
                 myon_bridge_call_method(vm->bridge, recv_copy, method, args, argc, line, &out);
@@ -583,6 +608,44 @@ static int run(VM *vm) {
             if (nid >= (uint16_t)vm->module->native_count)
                 vm_error(vm, line, "internal: native id %u out of range", nid);
             do_call_native(vm, line, vm->module->natives[nid], argc);
+            break;
+        }
+
+        /* Spread a multi-return tuple across N assignment targets (spec §6.2).
+         * Native stdlib calls represent a `(value, error)` multi-return as a
+         * single untyped tuple array (interpreter.c make_result_pair), whereas
+         * a user function's multi-`ret` already pushes N separate stack values.
+         * The compiler emits MOP_UNPACK only after a native-call RHS in a
+         * multiple-target assignment, so here we pop that one tuple and push
+         * its elements, giving the following STORE_LOCALs the N values they
+         * expect. */
+        /* Reject `x = myon.nil` on a normal single-target variable (spec §2.4).
+         * Peeks (does not consume) the value about to be stored. */
+        case MOP_CHECK_NOT_NIL: {
+            Value *top = vm_peek(vm, 0);
+            if (top->type == TYPE_NIL)
+                vm_error(vm, line,
+                    "cannot assign myon.nil to a normal variable (spec 2.4)");
+            break;
+        }
+
+        case MOP_UNPACK: {
+            uint8_t n = read_u8(f);
+            Value tup = vm_pop(vm);
+            if (tup.type != TYPE_ARRAY || tup.as.obj->as.arr.elem_type != NULL) {
+                value_free(&tup);
+                vm_error(vm, line,
+                    "multiple-target assignment requires a multi-value return (spec 6.2)");
+            }
+            ArrayData *a = &tup.as.obj->as.arr;
+            if (a->count != (int)n) {
+                int got = a->count; value_free(&tup);
+                vm_error(vm, line,
+                    "assignment target count (%d) does not match return count (%d)",
+                    (int)n, got);
+            }
+            for (int i = 0; i < (int)n; i++) vm_push(vm, value_copy(&a->items[i]));
+            value_free(&tup);
             break;
         }
 

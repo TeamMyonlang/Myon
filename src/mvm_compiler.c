@@ -40,9 +40,18 @@ typedef struct {
     int   slot;     /* stack slot */
 } Local;
 
-/* Per-loop backpatch bookkeeping for break/continue (spec §4.7). */
+/* Per-loop backpatch bookkeeping for break/continue (spec §4.7).
+ *
+ * `continue` must land on the loop's *step* (the increment in a `for`, or the
+ * condition re-check in a `while`), NOT on the condition top of a `for`:
+ * jumping to the top of a range/iterable `for` would skip the counter
+ * increment and spin forever.  Because the step is emitted *after* the body,
+ * `continue` sites can't know its offset yet, so — like `break` — they emit a
+ * placeholder forward JUMP whose operand is backpatched once the step label is
+ * known (Step 7-b fix). */
 typedef struct {
-    int  continue_target;      /* code offset for `continue` (loop step/top) */
+    int  continue_jumps[64];   /* operand offsets of pending continue JUMPs */
+    int  continue_count;
     int  break_jumps[64];      /* operand offsets of pending break JUMPs */
     int  break_count;
     int  scope_depth;          /* block depth the loop body opened at */
@@ -215,15 +224,23 @@ static int cur_scope_is_block(Compiler *c) {
     return fn->scope_depth > 0 && fn->depth_is_block[fn->scope_depth];
 }
 
-/* Pop locals that were declared in the scope we are leaving.  Emits POPs so
- * the runtime stack shrinks (spec §5.4). */
+/* Leave the current lexical scope.
+ *
+ * Local slots are NOT stack-allocated at runtime: push_frame() pre-reserves
+ * num_locals (== max_slot) slots for the whole frame lifetime, and
+ * STORE_LOCAL pops its computed value and writes it into that reserved slot.
+ * Therefore leaving a scope must only roll back the *compile-time* slot
+ * bookkeeping (so the slots can be reused by a sibling scope) — it must NOT
+ * emit runtime POPs.  Emitting a POP per block-local (the old behaviour) drove
+ * the operand stack below the reserved-locals region, which surfaced as an
+ * "operand stack underflow" the first time a variable was assigned inside a
+ * loop/if body (Step 7-b fix). */
 static void end_scope(Compiler *c) {
     FnComp *fn = c->fn;
     int depth = fn->scope_depth;
     while (fn->local_count > 0 && fn->locals[fn->local_count - 1].depth == depth) {
         fn->local_count--;
         fn->next_slot--;
-        chunk_emit_op(cur_chunk(c), MOP_POP, 0);
     }
     fn->scope_depth--;
 }
@@ -699,29 +716,86 @@ static void compile_assign(Compiler *c, Stmt *s) {
         /* Evaluate the RHS which must leave N values on the stack (a call). */
         compile_expr(c, s->as.assign.value);
         int total = s->as.assign.extra_count + 1;
+        /* A native stdlib call returns its multi-value result as a single
+         * tuple array (spec §6.2), not as N stack values like a user
+         * function's multi-`ret`.  Detect that RHS shape and spread it with
+         * MOP_UNPACK so the STORE_LOCALs below receive the N values.  User
+         * function / method calls already leave N values, so they need no
+         * unpack. (Step 7-b) */
+        {
+            Expr *rhs = s->as.assign.value;
+            int rhs_is_native_call =
+                rhs && rhs->kind == EXPR_CALL &&
+                rhs->as.call.callee &&
+                rhs->as.call.callee->kind == EXPR_IDENT &&
+                strncmp(rhs->as.call.callee->as.ident, "myon.", 5) == 0;
+            /* A built-in method call (obj.method(...) where obj is an
+             * array/map/str, e.g. `mid, merr = ss.slice(1, 3)`) is executed
+             * by MOP_INVOKE, which reuses the tree-walk built-in and therefore
+             * leaves the multi-return as a single tuple array too (spec §6.2),
+             * exactly like a native call.  We cannot statically tell a built-in
+             * receiver from a user-struct receiver here, but struct methods
+             * returning multiple values into a multi-target assignment are not
+             * part of the MVM-supported surface, so emitting UNPACK for any
+             * method-call RHS is the correct, net-positive choice. (Step 7-b) */
+            int rhs_is_method_call =
+                rhs && rhs->kind == EXPR_CALL &&
+                rhs->as.call.callee &&
+                rhs->as.call.callee->kind == EXPR_MEMBER;
+            if (rhs_is_native_call || rhs_is_method_call)
+                chunk_emit_op_u8(ch, MOP_UNPACK, (uint8_t)total, line);
+        }
         /* Values are on the stack in order; store in reverse (spec §4.9). */
         /* First resolve/declare all target slots left-to-right so slot numbers
-         * are stable, then emit STORE in reverse. */
+         * are stable, then emit STORE in reverse.  Each target is resolved with
+         * the same rule as a single-target assignment (compile_assign_target_name):
+         * an existing local/outer slot is reused, an existing top-level global is
+         * assigned through with MOP_STORE_GLOBAL, otherwise a new local is
+         * declared.  Without the global path, `x, y = pair()` inside a function
+         * would wrongly create shadowing locals instead of updating the outer
+         * x, y (spec §9.2). (Step 7-b fix) */
         char *names[64];
         int   slots[64];
+        int   is_global[64];
         if (total > 64) compile_error(c, line, "too many assignment targets");
         names[0] = s->as.assign.name;
         for (int k = 0; k < s->as.assign.extra_count; k++)
             names[k + 1] = s->as.assign.extra_names[k];
         for (int k = 0; k < total; k++) {
             FnComp *fn = c->fn;
+            is_global[k] = 0;
             int idx = find_in_current_scope(fn, names[k]);
             if (idx < 0) {
                 int jj = find_in_outer_scope(fn, names[k]);
                 if (jj >= 0 && cur_scope_is_block(c))
                     compile_error(c, line,
                         "redefinition of '%s' shadows an outer variable (forbidden, spec 9.2)", names[k]);
-                idx = (jj >= 0) ? jj : declare_local(c, names[k]);
+                if (jj >= 0) {
+                    idx = jj;
+                } else if (fn->enclosing) {
+                    /* not a local of this function: try a top-level global */
+                    int gslot = -1;
+                    NameKind gk = resolve_name(fn, names[k], &gslot);
+                    if (gk == NAME_GLOBAL) {
+                        is_global[k] = 1;
+                        idx = gslot;
+                    } else if (gk == NAME_CAPTURE) {
+                        unsupported(c, line,
+                            "assigning to an outer function's local (closures)",
+                            "Only top-level globals and the function's own locals are visible.");
+                    } else {
+                        idx = declare_local(c, names[k]);
+                    }
+                } else {
+                    idx = declare_local(c, names[k]);
+                }
             }
             slots[k] = idx;
         }
         for (int k = total - 1; k >= 0; k--)
-            chunk_emit_op_u16(ch, MOP_STORE_LOCAL, (uint16_t)slots[k], line);
+            chunk_emit_op_u16(ch,
+                is_global[k] ? MOP_STORE_GLOBAL : MOP_STORE_LOCAL,
+                (uint16_t)slots[k], line);
         return;
     }
 
@@ -740,6 +814,12 @@ static void compile_assign(Compiler *c, Stmt *s) {
     }
 
     compile_expr(c, s->as.assign.value);
+    /* Assigning myon.nil to a normal (single-target) variable is forbidden
+     * (spec §2.4).  The tree-walk enforces this at runtime on the produced
+     * value, so emit a runtime guard here to mirror it exactly — this covers
+     * both the literal `x = myon.nil` and a computed nil RHS.  Error slots of
+     * a multiple-target assignment are exempt and never reach this path. */
+    chunk_emit_op(cur_chunk(c), MOP_CHECK_NOT_NIL, line);
     compile_assign_target_name(c, line, s->as.assign.name);
 }
 
@@ -779,13 +859,22 @@ static void compile_if(Compiler *c, Stmt *s) {
     for (int i = 0; i < end_count; i++) chunk_patch_jump(ch, end_jumps[i]);
 }
 
-static void loop_push(Compiler *c, int continue_target) {
+static void loop_push(Compiler *c) {
     FnComp *fn = c->fn;
     if (fn->loop_count >= MAX_LOOP) compile_error(c, 0, "loops nested too deeply");
     LoopCtx *l = &fn->loops[fn->loop_count++];
-    l->continue_target = continue_target;
+    l->continue_count = 0;
     l->break_count = 0;
     l->scope_depth = fn->scope_depth;
+}
+
+/* Backpatch every pending `continue` JUMP in the current loop so it lands on
+ * the loop's step label (which is `chunk_here` at the call site).  Must be
+ * called after the body and before the step code is emitted. */
+static void loop_patch_continues(Compiler *c) {
+    Chunk *ch = cur_chunk(c);
+    LoopCtx *l = cur_loop(c);
+    for (int i = 0; i < l->continue_count; i++) chunk_patch_jump(ch, l->continue_jumps[i]);
 }
 
 static void loop_pop(Compiler *c) {
@@ -800,8 +889,10 @@ static void compile_while(Compiler *c, Stmt *s) {
     int top = chunk_here(ch);
     compile_expr(c, s->as.while_stmt.cond);
     int exit_jump = chunk_emit_jump(ch, MOP_JUMP_IF_FALSE, s->line);
-    loop_push(c, top);
+    loop_push(c);
     compile_block(c, &s->as.while_stmt.body, 1);
+    /* `continue` in a while loop re-checks the condition: patch it to `top`. */
+    loop_patch_continues(c);
     chunk_emit_loop(ch, MOP_JUMP, top, s->line);
     chunk_patch_jump(ch, exit_jump);
     loop_pop(c);
@@ -830,8 +921,11 @@ static void compile_for(Compiler *c, Stmt *s) {
         chunk_emit_op(ch, MOP_LT, s->line);
         int exit_jump = chunk_emit_jump(ch, MOP_JUMP_IF_FALSE, s->line);
 
-        loop_push(c, top);       /* continue jumps back to top (re-checks) */
+        loop_push(c);
         compile_block(c, &s->as.for_stmt.body, 1);
+        /* `continue` must fall through to the increment, not back to the
+         * condition top (which would skip the increment and spin forever). */
+        loop_patch_continues(c);
         /* increment: x = x + 1 */
         chunk_emit_op_u16(ch, MOP_LOAD_LOCAL, (uint16_t)vslot, s->line);
         int one = module_add_const_int(c->module, 1);
@@ -873,8 +967,10 @@ static void compile_for(Compiler *c, Stmt *s) {
         chunk_emit_op(ch, MOP_INDEX_GET, s->line);
         chunk_emit_op_u16(ch, MOP_STORE_LOCAL, (uint16_t)vslot, s->line);
 
-        loop_push(c, top);
+        loop_push(c);
         compile_block(c, &s->as.for_stmt.body, 1);
+        /* `continue` must fall through to the index increment below. */
+        loop_patch_continues(c);
         /* i = i + 1 */
         chunk_emit_op_u16(ch, MOP_LOAD_LOCAL, (uint16_t)islot, s->line);
         int one = module_add_const_int(c->module, 1);
@@ -928,7 +1024,12 @@ static void compile_stmt(Compiler *c, Stmt *s) {
         case STMT_CONTINUE: {
             LoopCtx *l = cur_loop(c);
             if (!l) compile_error(c, s->line, "myon.continue outside a loop");
-            chunk_emit_loop(ch, MOP_JUMP, l->continue_target, s->line);
+            /* Emit a forward placeholder JUMP; loop_patch_continues() rewrites
+             * it to the loop's step label once that offset is known.  This is
+             * what makes `continue` skip to the increment in a `for` loop
+             * rather than back to the condition (which would loop forever). */
+            int j = chunk_emit_jump(ch, MOP_JUMP, s->line);
+            if (l->continue_count < 64) l->continue_jumps[l->continue_count++] = j;
             break;
         }
         case STMT_BLOCK:
@@ -1103,6 +1204,28 @@ Module *mvm_compile_program(Program *program, const char *source_path) {
     for (int i = 0; i < program->stmts.count; i++)
         if (program->stmts.items[i]->kind == STMT_STRUCT)
             register_struct(&c, program->stmts.items[i]->as.struct_decl);
+
+    /* Resolve parents and validate the inheritance chain, mirroring the
+     * tree-walk interpreter's prescan (spec 14.6): a subclass may not
+     * re-declare a field already present in any ancestor.  Enforcing this in
+     * the compiler makes the .err case fail cleanly (no .myc emitted) exactly
+     * as `.myon` does, keeping the two engines in agreement (Step 7-b). */
+    for (int i = 0; i < c.struct_count; i++) {
+        StructDecl *sd = c.structs[i];
+        if (sd->parent_name && !sd->parent) {
+            sd->parent = find_struct(&c, sd->parent_name);
+            if (!sd->parent)
+                compile_error(&c, 0, "struct '%s' extends unknown struct '%s'",
+                              sd->name, sd->parent_name);
+            for (int a = 0; a < sd->field_count; a++)
+                for (StructDecl *pc = sd->parent; pc; pc = pc->parent)
+                    for (int b = 0; b < pc->field_count; b++)
+                        if (strcmp(sd->fields[a].name, pc->fields[b].name) == 0)
+                            compile_error(&c, 0,
+                                "field '%s' in struct '%s' collides with parent (spec 14.6)",
+                                sd->fields[a].name, sd->name);
+        }
+    }
 
     for (int i = 0; i < program->stmts.count; i++)
         compile_stmt(&c, program->stmts.items[i]);

@@ -72,6 +72,8 @@ const char *mvm_opcode_name(uint8_t op) {
         case MOP_CAST_CHAR:    return "CAST_CHAR";
         case MOP_MAKE_ERROR:   return "MAKE_ERROR";
         case MOP_CALL_NATIVE:  return "CALL_NATIVE";
+        case MOP_UNPACK:       return "UNPACK";
+        case MOP_CHECK_NOT_NIL: return "CHECK_NOT_NIL";
         default:              return "???";
     }
 }
@@ -87,6 +89,7 @@ int mvm_opcode_operand_bytes(uint8_t op) {
         case MOP_ARRAY_PUSH: case MOP_INDEX_GET: case MOP_INDEX_SET:
         case MOP_STR_CONCAT: case MOP_TO_STR:
         case MOP_CAST_STR: case MOP_CAST_INT: case MOP_CAST_CHAR: case MOP_MAKE_ERROR:
+        case MOP_CHECK_NOT_NIL:
             return 0;
         /* one u16 */
         case MOP_PUSH_CONST:
@@ -98,7 +101,7 @@ int mvm_opcode_operand_bytes(uint8_t op) {
         case MOP_NEW_STRUCT: case MOP_GET_FIELD: case MOP_SET_FIELD:
             return 2;
         /* one u8 */
-        case MOP_CALL: case MOP_RET:
+        case MOP_CALL: case MOP_RET: case MOP_UNPACK:
             return 1;
         /* u16 + u8 */
         case MOP_INVOKE:
@@ -428,7 +431,8 @@ void mvm_chunk_disassemble(const Module *m, const Chunk *c, FILE *out) {
                 break;
             }
             case MOP_CALL:
-            case MOP_RET: {
+            case MOP_RET:
+            case MOP_UNPACK: {
                 uint8_t a = p[0];
                 fprintf(out, "%-14s %u\n", name, a);
                 break;
