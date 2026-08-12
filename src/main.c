@@ -57,14 +57,30 @@ static void dump_tokens(const TokenList *tl) {
 static void usage(const char *prog) {
     fprintf(stderr,
         "Myon interpreter\n"
-        "usage: %s [--tokens] <file.myon>\n"
-        "       %s --tokens -   (read source from stdin)\n"
-        "       %s              (no argument: start interactive REPL)\n"
-        "  --tokens               print the token stream and exit (Step 1 check)\n"
-        "  --compile <src> [-o out]  compile a .myon to MVM bytecode (.myc) (Step 5)\n"
-        "  --dump-bytecode <src>  compile a .myon and print its disassembly (Step 5)\n"
-        "  --run-mvm <src>        compile a .myon in memory and run it on the MVM VM (Step 7-b)\n",
-        prog, prog, prog);
+        "\n"
+        "usage:\n"
+        "  %s <file.myon>                 run a source file (tree-walking interpreter)\n"
+        "  %s <file.myc>                  run compiled MVM bytecode (bytecode VM)\n"
+        "  %s --compile <src> [-o out]    compile a .myon to MVM bytecode (.myc); does not run\n"
+        "  %s --dump-bytecode <src>       print the MVM disassembly of a .myon (or .myc) and exit\n"
+        "  %s --tokens <file.myon>        print the token stream and exit\n"
+        "  %s --tokens -                  read source from stdin and print the token stream\n"
+        "  %s                             no argument: start the interactive REPL\n"
+        "\n"
+        "options:\n"
+        "  -o <out>                       output path for --compile (default: <src> with .myc)\n"
+        "  -h, --help                     show this help and exit\n"
+        "\n"
+        "notes:\n"
+        "  * A file argument is dispatched by content/extension: a MYC1 bytecode blob\n"
+        "    (or a .myc name) runs on the MVM VM; anything else runs on the tree-walking\n"
+        "    interpreter.  '-' always means stdin (treated as source).\n"
+        "  * The REPL currently uses the tree-walking interpreter only; an MVM-backed\n"
+        "    REPL is a future item.\n"
+        "  * --run-mvm <src> compiles a .myon in memory and runs it on the MVM VM.\n"
+        "    It is an internal cross-check used by the .myon/.myc equality test suite\n"
+        "    (tests/run_mvm_tests.sh); normal execution does not need it.\n",
+        prog, prog, prog, prog, prog, prog, prog);
 }
 
 /*
@@ -411,6 +427,12 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "-o") == 0) {
             if (i + 1 >= argc) { usage(argv[0]); return 64; }
             compile_out = argv[++i];
+        } else if (argv[i][0] == '-' && strcmp(argv[i], "-") != 0) {
+            /* Unknown option: fail loudly instead of silently treating it as a
+             * file path.  '-' (stdin) is not an option and falls through. */
+            fprintf(stderr, "myon: unknown option '%s'\n", argv[i]);
+            usage(argv[0]);
+            return 64;
         } else {
             path = argv[i];
         }
