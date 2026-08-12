@@ -202,7 +202,7 @@ static int cmd_dump_bytecode(const char *src) {
 
 /*
  * Detect a .myc file: either the name ends in ".myc" or the first four bytes
- * are the MYC1 magic (spec §6.2).  Checking the magic (not just the name)
+ * are the MYC1 magic (mvm_spec §6.2).  Checking the magic (not just the name)
  * lets `myon foo` run a compiled file even if it lacks the extension, and
  * avoids feeding a bytecode blob to the tokenizer.
  */
