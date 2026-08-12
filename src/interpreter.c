@@ -150,6 +150,19 @@ struct Interp {
      * the deep frames never run their decrement, so interp_run/interpret reset
      * this to 0 after catching an error (see those functions). */
     int          call_depth;
+    /*
+     * Step 6 (MVM bridge): when non-NULL, argument expressions are ignored and
+     * the stdlib / method dispatchers take their arguments from this vector of
+     * already-evaluated Values instead.  This lets the bytecode VM reuse the
+     * exact same C stdlib implementations without owning any AST: the VM has
+     * Values on its operand stack, not Exprs.  It is NULL for every tree-walk
+     * (`.myon`) call, so the tree-walking execution path is byte-for-byte
+     * unchanged.  `bridge_args` are borrowed (owned by the VM); eval_arg()
+     * returns value_copy() of the requested slot, matching the ownership the
+     * dispatchers expect from a normally-evaluated argument.
+     */
+    Value       *bridge_args;
+    int          bridge_argc;
 };
 typedef struct Interp Interp;
 
@@ -168,6 +181,7 @@ static void runtime_error(Interp *it, int line, const char *fmt, ...) {
 }
 
 static Value eval_expr(Interp *it, Env *env, Expr *e);
+static Value eval_arg(Interp *it, Env *env, Expr *call, int i);
 static Flow  exec_block(Interp *it, Env *env, StmtList *body);
 static Flow  exec_stmt(Interp *it, Env *env, Stmt *s);
 static Value call_function(Interp *it, int line, Value fn, Value *args, int argc,
@@ -472,10 +486,15 @@ static Value interpolate_string(Interp *it, Env *env, int line, const char *raw)
 /* ------------------------------------------------------------------ */
 
 static Value builtin_print(Interp *it, Env *env, Expr *call) {
-    for (int i = 0; i < call->as.call.arg_count; i++) {
-        if (call->as.call.arg_names[i])
+    /* argc comes from the injected bridge vector when the VM calls us,
+     * otherwise from the AST — see eval_arg() for the same convention. */
+    int argc = it->bridge_args ? it->bridge_argc : call->as.call.arg_count;
+    for (int i = 0; i < argc; i++) {
+        /* Named args (`x=...`) only exist in an AST call; the VM never
+         * produces them, so this check is skipped in bridge mode. */
+        if (!it->bridge_args && call->as.call.arg_names[i])
             runtime_error(it, call->line, "myon.print does not accept named arguments");
-        Value v = eval_expr(it, env, call->as.call.args[i]);
+        Value v = eval_arg(it, env, call, i);
         char *s = value_to_cstr(&v);
         fputs(s, stdout);
         free(s);
@@ -486,8 +505,9 @@ static Value builtin_print(Interp *it, Env *env, Expr *call) {
 }
 
 static Value builtin_input(Interp *it, Env *env, Expr *call) {
-    if (call->as.call.arg_count > 0) {
-        Value prompt = eval_expr(it, env, call->as.call.args[0]);
+    int argc = it->bridge_args ? it->bridge_argc : call->as.call.arg_count;
+    if (argc > 0) {
+        Value prompt = eval_arg(it, env, call, 0);
         char *s = value_to_cstr(&prompt);
         fputs(s, stdout);
         fflush(stdout);
@@ -510,6 +530,16 @@ static Value builtin_input(Interp *it, Env *env, Expr *call) {
 /* ------------------------------------------------------------------ */
 
 static Value eval_arg(Interp *it, Env *env, Expr *call, int i) {
+    /*
+     * Step 6 (MVM bridge): when the VM has injected pre-evaluated arguments,
+     * hand back a copy of the requested slot rather than walking an AST node.
+     * `env`/`call` are unused in that mode.  For the tree-walking interpreter
+     * bridge_args is always NULL, so this is exactly eval_expr(args[i]).
+     */
+    if (it->bridge_args) {
+        if (i < 0 || i >= it->bridge_argc) return value_nil();
+        return value_copy(&it->bridge_args[i]);
+    }
     return eval_expr(it, env, call->as.call.args[i]);
 }
 
@@ -2625,7 +2655,7 @@ static Value call_method(Interp *it, Env *env, Expr *call, Value recv,
         ArrayData *a = &recv.as.obj->as.arr;
         if (strcmp(method, "push") == 0) {
             if (argc != 1) runtime_error(it, line, "push expects 1 argument");
-            Value v = eval_expr(it, env, call->as.call.args[0]);
+            Value v = eval_arg(it, env, call, 0);
             if (a->elem_type && !typespec_matches_value(it, a->elem_type, &v)) {
                 char *want = typespec_to_cstr(a->elem_type);
                 const char *got = value_type_name(&v);
@@ -2678,7 +2708,7 @@ static Value call_method(Interp *it, Env *env, Expr *call, Value recv,
         }
         if (strcmp(method, "contains") == 0) {
             if (argc != 1) runtime_error(it, line, "contains expects 1 argument");
-            Value v = eval_expr(it, env, call->as.call.args[0]);
+            Value v = eval_arg(it, env, call, 0);
             int found = 0;
             for (int i = 0; i < a->count; i++) {
                 if (value_equal(&a->items[i], &v)) { found = 1; break; }
@@ -2688,7 +2718,7 @@ static Value call_method(Interp *it, Env *env, Expr *call, Value recv,
         }
         if (strcmp(method, "index_of") == 0) {
             if (argc != 1) runtime_error(it, line, "index_of expects 1 argument");
-            Value v = eval_expr(it, env, call->as.call.args[0]);
+            Value v = eval_arg(it, env, call, 0);
             long long idx = -1;
             for (int i = 0; i < a->count; i++) {
                 if (value_equal(&a->items[i], &v)) { idx = i; break; }
@@ -2698,8 +2728,8 @@ static Value call_method(Interp *it, Env *env, Expr *call, Value recv,
         }
         if (strcmp(method, "slice") == 0) {
             if (argc != 2) runtime_error(it, line, "slice expects 2 arguments");
-            Value vs = eval_expr(it, env, call->as.call.args[0]);
-            Value vl = eval_expr(it, env, call->as.call.args[1]);
+            Value vs = eval_arg(it, env, call, 0);
+            Value vl = eval_arg(it, env, call, 1);
             if (vs.type != TYPE_INT || vl.type != TYPE_INT) {
                 value_free(&vs); value_free(&vl);
                 runtime_error(it, line, "slice expects (int, int)");
@@ -2720,7 +2750,7 @@ static Value call_method(Interp *it, Env *env, Expr *call, Value recv,
          *      lambda-friendly; reuse call_function) ---- */
         if (strcmp(method, "map") == 0) {
             if (argc != 1) runtime_error(it, line, "map expects 1 argument");
-            Value f = eval_expr(it, env, call->as.call.args[0]);
+            Value f = eval_arg(it, env, call, 0);
             /* Element type of the result is inferred from the first mapped
              * value's runtime type; an empty input yields an untyped array. */
             Value res = value_array(NULL);
@@ -2740,7 +2770,7 @@ static Value call_method(Interp *it, Env *env, Expr *call, Value recv,
         }
         if (strcmp(method, "filter") == 0) {
             if (argc != 1) runtime_error(it, line, "filter expects 1 argument");
-            Value f = eval_expr(it, env, call->as.call.args[0]);
+            Value f = eval_arg(it, env, call, 0);
             Value res = value_array(a->elem_type ? typespec_clone(a->elem_type) : NULL);
             for (int i = 0; i < a->count; i++) {
                 Value elem = value_copy(&a->items[i]);
@@ -2755,8 +2785,8 @@ static Value call_method(Interp *it, Env *env, Expr *call, Value recv,
         }
         if (strcmp(method, "reduce") == 0) {
             if (argc != 2) runtime_error(it, line, "reduce expects 2 arguments");
-            Value f = eval_expr(it, env, call->as.call.args[0]);
-            Value acc = eval_expr(it, env, call->as.call.args[1]);
+            Value f = eval_arg(it, env, call, 0);
+            Value acc = eval_arg(it, env, call, 1);
             for (int i = 0; i < a->count; i++) {
                 Value args2[2];
                 args2[0] = value_copy(&acc);
@@ -2775,26 +2805,26 @@ static Value call_method(Interp *it, Env *env, Expr *call, Value recv,
 
     if (recv.type == TYPE_MAP) {
         if (strcmp(method, "set") == 0) {
-            Value k = eval_expr(it, env, call->as.call.args[0]);
-            Value v = eval_expr(it, env, call->as.call.args[1]);
+            Value k = eval_arg(it, env, call, 0);
+            Value v = eval_arg(it, env, call, 1);
             map_set(&recv, k, v);
             return value_void();
         }
         if (strcmp(method, "get") == 0) {
-            Value k = eval_expr(it, env, call->as.call.args[0]);
+            Value k = eval_arg(it, env, call, 0);
             Value out;
             if (!map_get(&recv, &k, &out)) { value_free(&k); return value_nil(); }
             value_free(&k);
             return out;
         }
         if (strcmp(method, "has") == 0) {
-            Value k = eval_expr(it, env, call->as.call.args[0]);
+            Value k = eval_arg(it, env, call, 0);
             int has = map_has(&recv, &k);
             value_free(&k);
             return value_bool(has);
         }
         if (strcmp(method, "delete") == 0) {
-            Value k = eval_expr(it, env, call->as.call.args[0]);
+            Value k = eval_arg(it, env, call, 0);
             int ok = map_delete(&recv, &k);
             value_free(&k);
             return value_bool(ok);
@@ -4596,6 +4626,114 @@ int interp_run(Interp *it, Program *program) {
         return 1;
     }
     return run_toplevel(it, program);
+}
+
+/* ------------------------------------------------------------------ */
+/* Step 6: myon_bridge_* — shared runtime seam for the MVM bytecode VM. */
+/*                                                                       */
+/* Every wrapper below simply forwards to the very same internal helper  */
+/* the tree-walker uses (eval_binary, cast_to_*, call_stdlib,            */
+/* call_method, ...), so `.myc` execution reuses the standard library    */
+/* verbatim.  Nothing here is reachable from the tree-walking path, and  */
+/* none of these functions alter interpreter state that the tree-walker  */
+/* observes, so `.myon` behaviour is unchanged.                          */
+/* ------------------------------------------------------------------ */
+
+Interp *myon_bridge_interp_new(void)  { return interp_create(); }
+void    myon_bridge_interp_free(Interp *it) { interp_free(it); }
+void   *myon_bridge_error_buf(Interp *it) { return (void *)&it->on_error; }
+
+Value myon_bridge_binary(Interp *it, int line, int op, Value l, Value r) {
+    /* eval_binary consumes l and r (spec §2.2 strict typing). */
+    return eval_binary(it, line, (OpKind)op, l, r);
+}
+
+Value myon_bridge_neg(Interp *it, int line, Value v) {
+    if (v.type == TYPE_INT)   { long long x = v.as.i; value_free(&v); return value_int(-x); }
+    if (v.type == TYPE_FLOAT) { double x = v.as.f;   value_free(&v); return value_float(-x); }
+    Type t = v.type; value_free(&v);
+    runtime_error(it, line, "unary '-' requires int or float, got %s", type_name(t));
+    return value_nil();
+}
+
+Value myon_bridge_not(Interp *it, int line, Value v) {
+    if (v.type != TYPE_BOOL) {
+        Type t = v.type; value_free(&v);
+        runtime_error(it, line, "myon.not requires bool, got %s", type_name(t));
+    }
+    int b = v.as.b; value_free(&v);
+    return value_bool(!b);
+}
+
+Value myon_bridge_cast_str(Interp *it, int line, Value v)  { return cast_to_str(it, line, v); }
+Value myon_bridge_cast_int(Interp *it, int line, Value v)  { return cast_to_int(it, line, v); }
+Value myon_bridge_cast_char(Interp *it, int line, Value v) { return cast_to_char(it, line, v); }
+
+Value myon_bridge_make_error(Interp *it, int line, Value v) {
+    if (v.type != TYPE_STR) {
+        value_free(&v);
+        runtime_error(it, line, "error() expects a str argument");
+    }
+    char *msg = myon_strdup(v.as.obj->as.str);
+    value_free(&v);
+    return value_error(msg);
+}
+
+/*
+ * Build the minimal synthetic call Expr that call_stdlib / call_method read:
+ * they only look at ->line and ->as.call.arg_count (argument *values* come
+ * from the injected bridge vector via eval_arg()).  Everything else is left
+ * zeroed so any stray access is an obvious NULL, not silent misbehaviour.
+ */
+static Expr bridge_make_call_expr(int line, int argc) {
+    Expr e;
+    memset(&e, 0, sizeof(e));
+    e.kind = EXPR_CALL;
+    e.line = line;
+    e.as.call.arg_count = argc;
+    e.as.call.args = NULL;       /* never dereferenced in bridge mode */
+    e.as.call.arg_names = NULL;
+    return e;
+}
+
+int myon_bridge_call_native(Interp *it, const char *name,
+                            Value *args, int argc, int line, Value *out) {
+    Expr call = bridge_make_call_expr(line, argc);
+    Value *saved_args = it->bridge_args;
+    int    saved_argc = it->bridge_argc;
+    it->bridge_args = args;      /* borrowed; eval_arg() hands back copies */
+    it->bridge_argc = argc;
+
+    int handled = 0;
+    /* builtins that are not under call_stdlib (spec §4.14 general native op) */
+    if (strcmp(name, "myon.print") == 0) {
+        *out = builtin_print(it, NULL, &call);
+        handled = 1;
+    } else if (strcmp(name, "myon.input") == 0) {
+        *out = builtin_input(it, NULL, &call);
+        handled = 1;
+    } else if (strncmp(name, "myon.", 5) == 0) {
+        handled = call_stdlib(it, NULL, name, &call, out);
+    }
+
+    it->bridge_args = saved_args;
+    it->bridge_argc = saved_argc;
+    return handled;
+}
+
+void myon_bridge_call_method(Interp *it, Value recv, const char *method,
+                             Value *args, int argc, int line, Value *out) {
+    Expr call = bridge_make_call_expr(line, argc);
+    Value *saved_args = it->bridge_args;
+    int    saved_argc = it->bridge_argc;
+    it->bridge_args = args;
+    it->bridge_argc = argc;
+
+    /* call_method borrows recv (does not free it); it reads args via eval_arg. */
+    *out = call_method(it, NULL, &call, recv, method);
+
+    it->bridge_args = saved_args;
+    it->bridge_argc = saved_argc;
 }
 
 int interpret(Program *program) {
