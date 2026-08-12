@@ -21,6 +21,7 @@
 #include "diag.h"
 #include "mvm_compiler.h"
 #include "mvm_chunk.h"
+#include "mvm_vm.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -175,6 +176,47 @@ static int cmd_dump_bytecode(const char *src) {
     token_list_free(&tokens);
     diag_clear_source();
     free(source);
+    return rc;
+}
+
+/* ------------------------------------------------------------------ */
+/* Step 6: run a compiled .myc through the MVM bytecode VM.            */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Detect a .myc file: either the name ends in ".myc" or the first four bytes
+ * are the MYC1 magic (spec §6.2).  Checking the magic (not just the name)
+ * lets `myon foo` run a compiled file even if it lacks the extension, and
+ * avoids feeding a bytecode blob to the tokenizer.
+ */
+static int looks_like_myc(const char *path) {
+    size_t n = strlen(path);
+    if (n >= 4 && strcmp(path + n - 4, ".myc") == 0) return 1;
+    FILE *probe = fopen(path, "rb");
+    if (!probe) return 0;
+    unsigned char magic[4] = {0};
+    size_t got = fread(magic, 1, 4, probe);
+    fclose(probe);
+    return got == 4 && magic[0] == 'M' && magic[1] == 'Y' &&
+           magic[2] == 'C' && magic[3] == '1';
+}
+
+/*
+ * Load a .myc from disk and execute it on the VM (docs/mvm_spec.md §6, §8).
+ * A reloaded .myc carries no struct/method declarations (those live in the
+ * AST, not the bytecode), so `program` is NULL here and any struct opcode
+ * raises a clear runtime error — matching the limitation documented in
+ * mvm_vm.h / the Step 6 report.  Source snippets are unavailable for a
+ * reloaded module, so runtime errors show the line number only.
+ */
+static int cmd_run_myc(const char *path) {
+    Module *m = mvm_module_read_file(path);
+    if (!m) {
+        fprintf(stderr, "myon: cannot load bytecode '%s'\n", path);
+        return 65;
+    }
+    int rc = mvm_run_module(m, NULL, NULL);
+    module_free(m);
     return rc;
 }
 
@@ -341,6 +383,15 @@ int main(int argc, char **argv) {
     }
 
     if (!path) { usage(argv[0]); return 64; }
+
+    /*
+     * Step 6: a compiled .myc runs on the MVM bytecode VM; a .myon (or any
+     * other source) keeps the unchanged tree-walking path below.  stdin ("-")
+     * is always treated as source.
+     */
+    if (strcmp(path, "-") != 0 && looks_like_myc(path)) {
+        return cmd_run_myc(path);
+    }
 
     char *source = NULL;
     if (strcmp(path, "-") == 0) {
