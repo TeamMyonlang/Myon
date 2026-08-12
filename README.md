@@ -378,11 +378,41 @@ make
 ## 使い方
 
 ```sh
-./myon examples/hello.myon          # プログラムを実行
-./myon --tokens examples/hello.myon # トークン列を出力（Step 1 の確認用）
+# --- 実行 ---
+./myon examples/hello.myon          # .myon をツリーウォークで実行（従来通り）
+./myon examples/hello.myc           # .myc（MVM バイトコード）をバイトコード VM で実行
+
+# --- MVM バイトコードの生成・確認 ---
+./myon --compile examples/hello.myon              # hello.myc を書き出す（実行はしない）
+./myon --compile examples/hello.myon -o out.myc   # 出力先を指定して書き出す
+./myon --dump-bytecode examples/hello.myon        # 逆アセンブル結果を表示して終了（.myc も可）
+
+# --- トークン列の出力（Step 1 の確認用）---
+./myon --tokens examples/hello.myon # トークン列を出力
 ./myon --tokens -                   # 標準入力から読み込む
+
+# --- 対話モード ---
 ./myon                              # 引数なし: 対話式実行（REPL, P3）
+
+# --- ヘルプ ---
+./myon --help                       # 使い方を表示
 ```
+
+ファイル引数は内容と拡張子で振り分けられます。先頭が MYC1 マジックのバイトコード
+（あるいは `.myc` という名前）なら MVM バイトコード VM で、それ以外はツリーウォーク型
+インタプリタで実行されます。`-` は常に標準入力（ソースとして扱う）を意味します。
+
+> **MVM（Myon Virtual Machine）について**
+> `.myon` を `--compile` すると MVM バイトコード（`.myc`, マジック `MYC1`）が
+> 生成され、`./myon foo.myc` で実行できます。`.myon` 実行（ツリーウォーク）の
+> 挙動は従来と一切変わりません。
+>
+> - `--compile` はコンパイルのみ（実行しない）。`-o` を省略すると入力名の拡張子を
+>   `.myc` に置き換えた名前になります。
+> - REPL は当面ツリーウォークのみ対応です。MVM 版 REPL は将来課題です。
+> - 内部確認用として `--run-mvm <src>`（`.myon` をメモリ上でコンパイルして
+>   MVM VM で実行）があります。`.myon`/`.myc` の等価性検証スイート
+>   （`tests/run_mvm_tests.sh`）が利用するもので、通常の実行では不要です。
 
 ### 対話モード（REPL, P3）
 
@@ -440,7 +470,7 @@ src/
   ffi_platform.{h,c} C FFI プラットフォーム抽象化層（dlopen/dlsym, Phase3 Step1）
   ffi.{h,c}          C FFI 型・ハンドル管理レイヤ（Phase3 Step2）
   ffi_call.{h,c}     C FFI 呼び出しディスパッチ（libffi 不使用, Phase3 Step3）
-  main.c             エントリポイント（ファイル実行 / REPL, P3）
+  main.c             エントリポイント（CLI 解析・.myon/.myc 実行の振り分け / REPL, P3）
 examples/            サンプルプログラム
 tests/               回帰テスト（`make test`）
 ```
