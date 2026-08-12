@@ -62,7 +62,8 @@ static void usage(const char *prog) {
         "       %s              (no argument: start interactive REPL)\n"
         "  --tokens               print the token stream and exit (Step 1 check)\n"
         "  --compile <src> [-o out]  compile a .myon to MVM bytecode (.myc) (Step 5)\n"
-        "  --dump-bytecode <src>  compile a .myon and print its disassembly (Step 5)\n",
+        "  --dump-bytecode <src>  compile a .myon and print its disassembly (Step 5)\n"
+        "  --run-mvm <src>        compile a .myon in memory and run it on the MVM VM (Step 7-b)\n",
         prog, prog, prog);
 }
 
@@ -220,6 +221,43 @@ static int cmd_run_myc(const char *path) {
     return rc;
 }
 
+/*
+ * Step 7-b: compile a .myon in memory and immediately execute it on the MVM
+ * bytecode VM, keeping the parsed Program (and thus struct/method
+ * declarations, plus the source text for diagnostics) available to the VM.
+ *
+ * This is the "run compiled-in-memory" path referenced in mvm_vm.h: it is the
+ * apples-to-apples counterpart to running the same .myon through the
+ * tree-walking interpreter, and is what the .myon/.myc equality suite
+ * (tests/run_mvm_tests.sh) uses to verify that both engines agree.  Unlike
+ * `cmd_run_myc` (which reloads a serialized .myc and therefore has no struct
+ * declarations), this path passes `program` to mvm_run_module so struct-using
+ * programs execute identically to the tree-walker.
+ *
+ * This is strictly additive: the tree-walking path (interpret()) and .myon
+ * behaviour are untouched.
+ */
+static int cmd_run_mvm(const char *src) {
+    char *source = NULL;
+    TokenList tokens;
+    Program *program = load_program(src, &source, &tokens);
+    if (!program) return 65;
+
+    Module *m = mvm_compile_program(program, src);
+    int rc;
+    if (!m) {
+        rc = 65;
+    } else {
+        rc = mvm_run_module(m, program, source);
+        module_free(m);
+    }
+    program_free(program);
+    token_list_free(&tokens);
+    diag_clear_source();
+    free(source);
+    return rc;
+}
+
 /* ------------------------------------------------------------------ */
 /* Interactive REPL (spec 12)                                          */
 /* ------------------------------------------------------------------ */
@@ -355,6 +393,7 @@ int main(int argc, char **argv) {
     const char *compile_src = NULL;
     const char *compile_out = NULL;
     const char *dump_src = NULL;
+    const char *run_mvm_src = NULL;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--tokens") == 0) tokens_only = 1;
@@ -366,6 +405,9 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--dump-bytecode") == 0) {
             if (i + 1 >= argc) { usage(argv[0]); return 64; }
             dump_src = argv[++i];
+        } else if (strcmp(argv[i], "--run-mvm") == 0) {
+            if (i + 1 >= argc) { usage(argv[0]); return 64; }
+            run_mvm_src = argv[++i];
         } else if (strcmp(argv[i], "-o") == 0) {
             if (i + 1 >= argc) { usage(argv[0]); return 64; }
             compile_out = argv[++i];
@@ -376,6 +418,7 @@ int main(int argc, char **argv) {
 
     if (dump_src)    return cmd_dump_bytecode(dump_src);
     if (compile_src) return cmd_compile(compile_src, compile_out);
+    if (run_mvm_src) return cmd_run_mvm(run_mvm_src);
 
     /* No file argument and not a token dump: start the interactive REPL. */
     if (!path && !tokens_only) {

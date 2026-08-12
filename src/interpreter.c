@@ -4706,7 +4706,23 @@ int myon_bridge_call_native(Interp *it, const char *name,
 
     int handled = 0;
     /* builtins that are not under call_stdlib (spec §4.14 general native op) */
-    if (strcmp(name, "myon.print") == 0) {
+    if (strcmp(name, "myon.len") == 0) {
+        /* Internal helper synthesized by the MVM compiler for the
+         * `for x in iterable` lowering (mvm_compiler.c): it needs the element
+         * count of the iterable to bound the hidden index.  Mirror the
+         * tree-walker's `for ... in` semantics exactly (interpreter STMT_FOR):
+         * only arrays are iterable, and a non-array is the same runtime error.
+         * This keeps `.myon` and `.myc` iterable-for behaviour identical. */
+        Value a = eval_arg(it, NULL, &call, 0);
+        if (a.type != TYPE_ARRAY) {
+            Type t = a.type; value_free(&a);
+            runtime_error(it, line,
+                "myon.for ... myon.in requires an array, got %s", type_name(t));
+        }
+        *out = value_int((long long)a.as.obj->as.arr.count);
+        value_free(&a);
+        handled = 1;
+    } else if (strcmp(name, "myon.print") == 0) {
         *out = builtin_print(it, NULL, &call);
         handled = 1;
     } else if (strcmp(name, "myon.input") == 0) {
