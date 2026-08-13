@@ -1,0 +1,2 @@
+myon.func square(x: int) ret int { ret x * x }
+myon.func dub(x: int) ret int { ret x + x }

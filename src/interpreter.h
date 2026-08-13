@@ -30,6 +30,18 @@
 int interpret(Program *program);
 
 /*
+ * Set the directory used to resolve external module imports (`module
+ * external.util.math` -> <dir>/util/math.myon).  Pass the path of the script
+ * file being run; the directory portion is extracted internally.  A NULL or
+ * empty path clears it (falling back to the current working directory, e.g.
+ * for stdin/REPL).  Must be called before interpret()/interp_run().
+ *
+ * The one-shot interpret() path reads this module-global; interp_run() callers
+ * use interp_set_script_path() below to set it per-interpreter.
+ */
+void interpret_set_script_path(const char *script_path);
+
+/*
  * Persistent interpreter handle used by the interactive REPL (spec 12).
  *
  * Unlike interpret(), which builds and tears down a fresh interpreter for a
