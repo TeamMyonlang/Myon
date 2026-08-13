@@ -81,6 +81,18 @@ would refcount/track per module and free earlier.
 
 ## Fixed in the current change (for reference)
 
+- 🟡 **`.myc` stale check was unimplemented.** The `.myc` Source Info
+  (`src_mtime`/`src_size`/`src_hash`) was written by the compiler but never
+  verified at runtime, so editing a `.myon` and forgetting to recompile meant
+  the stale `.myc` ran silently (mvm_spec.md §6.5 / §12.1). `src/main.c` now
+  verifies it on the `./myon foo.myc` path: `cmd_run_myc()` calls
+  `check_myc_stale()`, which resolves the source (recorded `src_path`, else a
+  sibling `<name>.myon`), recomputes the same FNV-1a 64bit hash the compiler
+  uses (`fill_source_info()`), and compares mtime/size/hash. If the `.myon` is
+  newer it warns by default and, with the new `--strict-stale` flag, errors out
+  (exit 65). Verification is skipped when no source `.myon` is present
+  (distributed `.myc`). The `.myc` format is unchanged.
+
 - 🔴 **`as` alias was non-functional.** External module symbols were dumped flat
   into the global scope, so `module external.util.math as m` then `m.square()`
   failed and only bare `square()` worked (with silent cross-module override on
