@@ -1,0 +1,10 @@
+system myon.useversion=1
+module myon.stdio
+module external.modlib.math as m
+module external.modlib.geom as g
+
+myon.print(m.square(5))
+myon.print(m.dub(5))
+myon.print(g.square(5))
+f = m.square
+myon.print(f(4))

@@ -474,6 +474,12 @@ int main(int argc, char **argv) {
         if (!source) return 66;
     }
 
+    /* Resolve external module imports relative to the script's own directory
+     * (not the process CWD), so `myon /elsewhere/main.myon` finds its sibling
+     * modules.  stdin ("-") has no directory, so imports fall back to CWD. */
+    if (strcmp(path, "-") != 0)
+        interpret_set_script_path(path);
+
     /* P5: register the source so lexer/parser/interpreter diagnostics can
      * print the offending line with a caret. */
     diag_set_source(source);

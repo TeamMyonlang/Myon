@@ -17,6 +17,9 @@
 #include "mvm_compiler.h"
 #include "common.h"
 #include "diag.h"
+#include "lexer.h"
+#include "parser.h"
+#include "token.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -995,9 +998,26 @@ static void compile_stmt(Compiler *c, Stmt *s) {
     Chunk *ch = cur_chunk(c);
     switch (s->kind) {
         case STMT_SYSTEM:
-        case STMT_MODULE:
             /* compile-time metadata only (spec §4.14 note); no code emitted */
             break;
+        case STMT_MODULE: {
+            /*
+             * Builtin (`myon.*`) modules are compile-time metadata only — no
+             * code is emitted, matching the tree-walker.  *External* modules
+             * (`module external.*`), however, must actually load and inject
+             * their definitions; the MVM backend does not yet implement that
+             * (see docs/known-issues.md).  Previously these were silently
+             * skipped, so any use of an external symbol later compiled to an
+             * "undefined" error or, worse, produced a .myc that behaved
+             * differently from the .myon.  Reject them explicitly instead so
+             * the divergence is loud, not silent (spec §11 / §2 equivalence). */
+            const char *mpath = s->as.module_decl.path;
+            if (mpath && strncmp(mpath, "external.", 9) == 0)
+                unsupported(c, s->line, "external module imports (module external.*)",
+                    "The MVM backend cannot yet load external modules; run it as "
+                    ".myon (tree-walking) instead.");
+            break;
+        }
         case STMT_ASSIGN:
             compile_assign(c, s);
             break;
@@ -1132,9 +1152,6 @@ static int compile_function(Compiler *c, FuncDecl *decl, const char *dbg_name,
 /* ================================================================== */
 /* interpolation sub-expression parsing helper                         */
 /* ================================================================== */
-
-#include "lexer.h"
-#include "parser.h"
 
 static Program *parse_interp_expr(Compiler *c, int line, const char *src) {
     TokenList tl;

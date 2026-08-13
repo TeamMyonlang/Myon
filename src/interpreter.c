@@ -143,6 +143,13 @@ typedef struct ModuleEntry {
     char               *path;    /* dotted path */
     char               *alias;   /* alias or NULL */
     int                 loading; /* in-progress flag for cycle detection */
+    /* Per-module namespace scope.  When a module is imported with an alias
+     * (`module external.util.math as m`), its top-level functions/variables are
+     * executed into `ns` (a child of global) instead of leaking into global, so
+     * they are reached qualified as `m.<name>`.  NULL for builtin modules and
+     * for external modules imported without an alias (which keep the historical
+     * flat "dump into global" namespace model). */
+    Env                *ns;
     struct ModuleEntry *next;
 } ModuleEntry;
 
@@ -192,8 +199,20 @@ struct Interp {
      */
     Value       *bridge_args;
     int          bridge_argc;
+    /*
+     * Directory of the top-level script being run, used to resolve external
+     * module import paths (`module external.util.math`) relative to the script
+     * itself rather than the process's current working directory.  This makes
+     * `myon /some/where/main.myon` work no matter where it is invoked from.
+     * NULL means "resolve relative to the current working directory" (REPL /
+     * stdin, where there is no owning file).
+     */
+    char        *script_dir;
 };
 typedef struct Interp Interp;
+
+/* Look up an aliased external module by its alias name; defined later. */
+static ModuleEntry *find_module_by_alias(Interp *it, const char *alias);
 
 static void runtime_error(Interp *it, int line, const char *fmt, ...) {
     va_list ap;
@@ -3851,6 +3870,47 @@ static Value eval_call(Interp *it, Env *env, Expr *e) {
         runtime_error(it, line, "unknown generic type '%s'", callee->as.generic.name);
     }
 
+    /* module-qualified call via alias: `m.square(args)` where `m` is an
+     * aliased external module.  Only taken when `m` is not shadowed by a real
+     * variable of the same name, so ordinary method calls on values are
+     * unaffected. */
+    if (callee->kind == EXPR_MEMBER &&
+        callee->as.member.target->kind == EXPR_IDENT) {
+        const char *base = callee->as.member.target->as.ident;
+        Value dummy;
+        if (!env_get(env, base, &dummy)) {
+            ModuleEntry *mod = find_module_by_alias(it, base);
+            if (mod) {
+                Value fn;
+                if (!env_get(mod->ns, callee->as.member.name, &fn))
+                    runtime_error(it, line,
+                        "module '%s' (alias '%s') has no member '%s'",
+                        mod->path, base, callee->as.member.name);
+                if (fn.type != TYPE_FUNC) {
+                    value_free(&fn);
+                    runtime_error(it, line,
+                        "module member '%s.%s' is not callable",
+                        base, callee->as.member.name);
+                }
+                int argc = e->as.call.arg_count;
+                Value *args = argc ? (Value *)myon_xmalloc(sizeof(Value) * argc) : NULL;
+                for (int i = 0; i < argc; i++)
+                    args[i] = eval_expr(it, env, e->as.call.args[i]);
+                Value r;
+                if (fn.as.obj->as.fn.decl && fn.as.obj->as.fn.decl->is_async)
+                    r = spawn_async_task(it, fn, args, argc);
+                else
+                    r = call_function(it, line, fn, args, argc, e->as.call.arg_names);
+                for (int i = 0; i < argc; i++) value_free(&args[i]);
+                free(args);
+                value_free(&fn);
+                return r;
+            }
+        } else {
+            value_free(&dummy);
+        }
+    }
+
     /* method call: obj.method(args) */
     if (callee->kind == EXPR_MEMBER) {
         Value recv = eval_expr(it, env, callee->as.member.target);
@@ -4022,6 +4082,26 @@ static Value eval_expr(Interp *it, Env *env, Expr *e) {
         }
 
         case EXPR_MEMBER: {
+            /* module-qualified value access via alias: `m.square` yields the
+             * function value, so it can be stored / passed as a first-class
+             * value.  Only when `m` is not shadowed by a real variable. */
+            if (e->as.member.target->kind == EXPR_IDENT) {
+                const char *base = e->as.member.target->as.ident;
+                Value dummy;
+                if (!env_get(env, base, &dummy)) {
+                    ModuleEntry *mod = find_module_by_alias(it, base);
+                    if (mod) {
+                        Value v;
+                        if (!env_get(mod->ns, e->as.member.name, &v))
+                            runtime_error(it, e->line,
+                                "module '%s' (alias '%s') has no member '%s'",
+                                mod->path, base, e->as.member.name);
+                        return v;
+                    }
+                } else {
+                    value_free(&dummy);
+                }
+            }
             Value target = eval_expr(it, env, e->as.member.target);
             if (target.type == TYPE_STRUCT) {
                 Value *fp = struct_field_ptr(&target, e->as.member.name);
@@ -4432,6 +4512,16 @@ static ModuleEntry *find_module(Interp *it, const char *path) {
     return NULL;
 }
 
+/* Find an aliased module by its alias name (e.g. the `m` in
+ * `module external.util.math as m`).  Only modules that carry a namespace
+ * scope (aliased external modules) are considered. */
+static ModuleEntry *find_module_by_alias(Interp *it, const char *alias) {
+    if (!alias) return NULL;
+    for (ModuleEntry *m = it->modules; m; m = m->next)
+        if (m->ns && m->alias && strcmp(m->alias, alias) == 0) return m;
+    return NULL;
+}
+
 /* register + pre-scan a program's top-level struct/function declarations */
 static void prescan(Interp *it, Env *env, Program *prog);
 
@@ -4445,12 +4535,59 @@ static void handle_module_decl(Interp *it, Stmt *s) {
         m->path = myon_strdup(path);
         m->alias = s->as.module_decl.alias ? myon_strdup(s->as.module_decl.alias) : NULL;
         m->loading = 0;
+        m->ns = NULL;
         m->next = it->modules;
         it->modules = m;
         return;
     }
     /* external module: external.util.math -> ./util/math.myon */
     load_external_module(it, s);
+}
+
+/* Retain a parsed Program for the interpreter's lifetime so its AST stays
+ * valid (function/struct values reference its nodes) and is freed once, at
+ * interp_free() time.  Used for both the top-level program and every loaded
+ * external module. */
+static void interp_retain_program(Interp *it, Program *prog) {
+    it->programs = (Program **)myon_xrealloc(
+        it->programs, sizeof(Program *) * (it->program_count + 1));
+    it->programs[it->program_count++] = prog;
+}
+
+/*
+ * Resolve an external module's dotted path to a filesystem path.
+ *
+ *   external.util.math  ->  <base>/util/math.myon
+ *
+ * <base> is the directory of the importing script (it->script_dir) when known,
+ * so a script runs identically no matter what the process's current working
+ * directory is (fixes: `myon /elsewhere/main.myon` failing to find its own
+ * sibling modules).  When no script directory is known (REPL / stdin) we fall
+ * back to the current working directory ("./"), matching the old behaviour.
+ *
+ * Writes the result into `out` (size `out_sz`).  Returns 0 on overflow.
+ */
+static int resolve_module_file(Interp *it, const char *path,
+                               char *out, size_t out_sz) {
+    const char *p = path;
+    if (strncmp(p, "external.", 9) == 0) p += 9;
+
+    const char *base = (it->script_dir && it->script_dir[0]) ? it->script_dir : ".";
+
+    /* Build "<base>/" + path-with-dots-as-slashes + ".myon", bounds-checked. */
+    int wrote = snprintf(out, out_sz, "%s/", base);
+    if (wrote < 0 || (size_t)wrote >= out_sz) return 0;
+    size_t len = (size_t)wrote;
+
+    for (const char *c = p; *c; c++) {
+        if (len + 1 >= out_sz) return 0;      /* leave room for NUL */
+        out[len++] = (*c == '.') ? '/' : *c;
+    }
+    out[len] = '\0';
+
+    wrote = snprintf(out + len, out_sz - len, ".myon");
+    if (wrote < 0 || (size_t)wrote >= out_sz - len) return 0;
+    return 1;
 }
 
 static int load_external_module(Interp *it, Stmt *decl) {
@@ -4467,20 +4604,19 @@ static int load_external_module(Interp *it, Stmt *decl) {
     m->path = myon_strdup(path);
     m->alias = decl->as.module_decl.alias ? myon_strdup(decl->as.module_decl.alias) : NULL;
     m->loading = 1;
+    /* Aliased imports get their own namespace scope (a child of global so the
+     * module body can still see builtins); unaliased imports keep the flat
+     * "everything lands in global" model for backward compatibility. */
+    m->ns = m->alias ? env_new(it->global) : NULL;
     m->next = it->modules;
     it->modules = m;
 
-    /* build file path: strip leading "external." then dots -> '/' + .myon */
-    const char *p = path;
-    if (strncmp(p, "external.", 9) == 0) p += 9;
-    char file[512];
-    size_t len = 0;
-    file[0] = '\0';
-    len += (size_t)snprintf(file + len, sizeof(file) - len, "./");
-    for (const char *c = p; *c; c++)
-        file[len++] = (*c == '.') ? '/' : *c;
-    file[len] = '\0';
-    snprintf(file + len, sizeof(file) - len, ".myon");
+    /* build file path relative to the importing script's directory */
+    char file[1024];
+    if (!resolve_module_file(it, path, file, sizeof(file)))
+        runtime_error(it, decl->line, "module path too long: '%s'", path);
+
+    Env *target = m->ns ? m->ns : it->global;
 
     FILE *f = fopen(file, "rb");
     if (!f)
@@ -4498,19 +4634,21 @@ static int load_external_module(Interp *it, Stmt *decl) {
     Program *mp = parser_parse(&tl);
     if (!mp) { token_list_free(&tl); free(src); runtime_error(it, decl->line, "parse error in module '%s'", path); }
 
-    /* execute module top-level into the global scope (simple namespace model) */
-    prescan(it, it->global, mp);
+    /* Execute module top-level into the target scope.  Aliased modules use
+     * their own namespace env (`m.<name>` access); unaliased ones flatten into
+     * global (historical simple namespace model). */
+    prescan(it, target, mp);
     for (int i = 0; i < mp->stmts.count; i++) {
         if (mp->stmts.items[i]->kind == STMT_MODULE)
             handle_module_decl(it, mp->stmts.items[i]);
         else
-            exec_stmt(it, it->global, mp->stmts.items[i]);
+            exec_stmt(it, target, mp->stmts.items[i]);
     }
 
-    /* NOTE: module AST is intentionally leaked for the lifetime of the run,
-     * because function/struct values captured from it reference its nodes.
-     * A production implementation would track and free these at shutdown. */
-    (void)mp;
+    /* Retain the module AST for the interpreter's lifetime: function/struct
+     * values captured above reference its nodes, so it must outlive the run and
+     * be freed exactly once at interp_free() rather than leaked. */
+    interp_retain_program(it, mp);
     token_list_free(&tl);
     free(src);
 
@@ -4566,10 +4704,44 @@ static void prescan(Interp *it, Env *env, Program *prog) {
 /* Entry point                                                         */
 /* ------------------------------------------------------------------ */
 
+/*
+ * Script directory used to resolve external module imports.  Set once by
+ * interpret_set_script_path() from main.c before a run; consumed when an
+ * interpreter is created (interp_create / one-shot interpret()).  A module
+ * global keeps the public API tiny and works for both the one-shot and
+ * persistent (REPL) entry points, neither of which changes the running script
+ * mid-execution.
+ */
+static char *g_script_dir = NULL;
+
+/* Return a heap copy of the directory portion of `path`, or NULL when `path`
+ * has no directory component (bare filename) or is NULL/empty. */
+static char *dirname_dup(const char *path) {
+    if (!path || !path[0]) return NULL;
+    const char *slash = strrchr(path, '/');
+#ifdef _WIN32
+    const char *bslash = strrchr(path, '\\');
+    if (bslash && (!slash || bslash > slash)) slash = bslash;
+#endif
+    if (!slash) return NULL;              /* no directory part */
+    if (slash == path) return myon_strdup("/"); /* root: "/foo.myon" */
+    size_t n = (size_t)(slash - path);
+    char *d = (char *)myon_xmalloc(n + 1);
+    memcpy(d, path, n);
+    d[n] = '\0';
+    return d;
+}
+
+void interpret_set_script_path(const char *script_path) {
+    free(g_script_dir);
+    g_script_dir = dirname_dup(script_path);
+}
+
 Interp *interp_create(void) {
     Interp *it = (Interp *)myon_xmalloc(sizeof(Interp));
     memset(it, 0, sizeof(*it));
     it->global = env_new(NULL);
+    it->script_dir = g_script_dir ? myon_strdup(g_script_dir) : NULL;
     return it;
 }
 
@@ -4582,12 +4754,18 @@ void interp_free(Interp *it) {
     free(it->structs.items);
     if (it->ffi) ffi_state_free(it->ffi);
     ModuleEntry *m = it->modules;
-    while (m) { ModuleEntry *n = m->next; free(m->path); free(m->alias); free(m); m = n; }
+    while (m) {
+        ModuleEntry *n = m->next;
+        if (m->ns) env_free(m->ns); /* aliased-module namespace scope */
+        free(m->path); free(m->alias); free(m);
+        m = n;
+    }
     /* free retained program ASTs (structs/functions may reference their nodes,
      * so this only happens once the interpreter itself is torn down). */
     for (int i = 0; i < it->program_count; i++)
         program_free(it->programs[i]);
     free(it->programs);
+    free(it->script_dir);
     free(it);
 }
 
@@ -4634,9 +4812,7 @@ static int run_toplevel(Interp *it, Program *program) {
 
 int interp_run(Interp *it, Program *program) {
     /* retain the AST for the interpreter's lifetime */
-    it->programs = (Program **)myon_xrealloc(
-        it->programs, sizeof(Program *) * (it->program_count + 1));
-    it->programs[it->program_count++] = program;
+    interp_retain_program(it, program);
 
     if (setjmp(it->on_error)) {
         /* a runtime error aborted this program; interpreter stays alive.
@@ -4777,6 +4953,7 @@ int interpret(Program *program) {
     Interp it;
     memset(&it, 0, sizeof(it));
     it.global = env_new(NULL);
+    it.script_dir = g_script_dir ? myon_strdup(g_script_dir) : NULL;
 
     int rc = 0;
     if (setjmp(it.on_error)) {
@@ -4793,9 +4970,19 @@ int interpret(Program *program) {
     free(it.structs.items);
     if (it.ffi) ffi_state_free(it.ffi);
     ModuleEntry *m = it.modules;
-    while (m) { ModuleEntry *n = m->next; free(m->path); free(m->alias); free(m); m = n; }
-    /* NOTE: for the one-shot path the caller (main.c) owns and frees `program`;
-     * we retain no programs here so it->programs stays NULL. */
+    while (m) {
+        ModuleEntry *n = m->next;
+        if (m->ns) env_free(m->ns); /* aliased-module namespace scope */
+        free(m->path); free(m->alias); free(m);
+        m = n;
+    }
+    /* NOTE: for the one-shot path the caller (main.c) owns and frees the
+     * top-level `program`.  Any *external module* programs, however, were
+     * retained via interp_retain_program() and must be freed here (their
+     * function/struct values in it.global have already been released above). */
+    for (int i = 0; i < it.program_count; i++)
+        program_free(it.programs[i]);
     free(it.programs);
+    free(it.script_dir);
     return rc;
 }
