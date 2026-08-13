@@ -3668,11 +3668,25 @@ static Value http_client_request(Interp *it, int line, const char *url,
         if (blen) http_send_all(it, st, sock, body, blen);
     }
 
-    /* read the whole response */
+    /* read the whole response.
+     *
+     * Security (manual review): the response is attacker-controlled -- a
+     * malicious or MITM'd server (TLS verification is only best-effort, see
+     * Phase5.1) can stream data forever.  Cap the buffer we are willing to
+     * hold so an endless response cannot drive myon_xrealloc until
+     * myon_xmalloc aborts the whole interpreter (out-of-memory, exit 70).
+     * This mirrors the server-side Content-Length cap added in Phase 5.2. */
+    #define MYON_HTTP_CLIENT_MAX_RESP (64UL << 20) /* 64 MiB */
     size_t cap = 8192, len = 0;
+    int truncated = 0;
     char *rbuf = (char *)myon_xmalloc(cap);
     for (;;) {
-        if (len == cap) { cap *= 2; rbuf = (char *)myon_xrealloc(rbuf, cap); }
+        if (len == cap) {
+            if (cap >= MYON_HTTP_CLIENT_MAX_RESP) { truncated = 1; break; }
+            cap *= 2;
+            if (cap > MYON_HTTP_CLIENT_MAX_RESP) cap = MYON_HTTP_CLIENT_MAX_RESP;
+            rbuf = (char *)myon_xrealloc(rbuf, cap);
+        }
         char *rerr = NULL;
         long long n;
         if (tls) n = tls_read(tls, rbuf + len, (long long)(cap - len), &rerr);
@@ -3680,6 +3694,17 @@ static Value http_client_request(Interp *it, int line, const char *url,
         if (n == -2) { free(rerr); net_wait_fd(it, fd, 0); continue; }
         if (n <= 0)  { free(rerr); break; } /* 0 == EOF/close */
         len += (size_t)n;
+    }
+    if (truncated) {
+        if (tls) tls_close(tls);
+        net_close(st, sock);
+        free(host); free(path);
+        array_push(&tup, value_str(myon_strdup("")));
+        array_push(&tup, value_int(0));
+        array_push(&tup, value_error(myon_strdup(
+            "HTTP response exceeded 64 MiB limit (possible malicious server)")));
+        free(rbuf);
+        return tup;
     }
     if (tls) tls_close(tls);
     net_close(st, sock);
