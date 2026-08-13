@@ -20,6 +20,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <ctype.h>
+#include <errno.h>
 
 /* ------------------------------------------------------------------ */
 /* small helpers                                                       */
@@ -71,7 +72,15 @@ static long parse_content_length(const char *headers, size_t hlen) {
         if (!match) continue;
         const char *v = headers + i + klen;
         while (*v == ' ' || *v == '\t') v++;
-        return strtol(v, NULL, 10);
+        /* Content-Length is attacker-controlled.  Guard against a negative
+         * value and against strtol() saturating to LONG_MAX/LONG_MIN on an
+         * out-of-range number: in both cases treat the header as absent (0)
+         * so downstream body-size caps see a sane value. */
+        errno = 0;
+        long cl = strtol(v, NULL, 10);
+        if (errno == ERANGE) return 0;
+        if (cl < 0) return 0;
+        return cl;
     }
     return 0;
 }
