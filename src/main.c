@@ -26,6 +26,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
+#include <sys/stat.h>
 
 static char *read_file(const char *path) {
     FILE *f = fopen(path, "rb");
@@ -69,6 +71,8 @@ static void usage(const char *prog) {
         "\n"
         "options:\n"
         "  -o <out>                       output path for --compile (default: <src> with .myc)\n"
+        "  --strict-stale                 when running a .myc, error out (instead of warning)\n"
+        "                                 if the source .myon is newer than the bytecode\n"
         "  -h, --help                     show this help and exit\n"
         "\n"
         "notes:\n"
@@ -226,11 +230,18 @@ static int looks_like_myc(const char *path) {
  * mvm_vm.h / the Step 6 report.  Source snippets are unavailable for a
  * reloaded module, so runtime errors show the line number only.
  */
-static int cmd_run_myc(const char *path) {
+static int cmd_run_myc(const char *path, int strict_stale) {
     Module *m = mvm_module_read_file(path);
     if (!m) {
         fprintf(stderr, "myon: cannot load bytecode '%s'\n", path);
         return 65;
+    }
+    /* mvm_spec.md §6.5: verify the .myc is not older than its source .myon.
+     * Warns by default; aborts under --strict-stale. */
+    int stale_rc = check_myc_stale(m, path, strict_stale);
+    if (stale_rc != 0) {
+        module_free(m);
+        return stale_rc;
     }
     int rc = mvm_run_module(m, NULL, NULL);
     module_free(m);
@@ -402,8 +413,116 @@ static int run_repl(void) {
     return 0;
 }
 
+/* ------------------------------------------------------------------ */
+/* .myc stale check against the adjacent .myon (mvm_spec.md §6.5).      */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Compute the FNV-1a 64-bit hash of a file's bytes.  This mirrors exactly the
+ * algorithm the compiler uses in src/mvm_compiler.c fill_source_info(), so the
+ * value stored in the .myc Source Info (first 8 bytes of src_hash, little
+ * endian) can be reproduced and compared here.  Returns 0 on success and
+ * writes the hash to *out; returns non-zero if the file cannot be read.
+ */
+static int fnv1a_file(const char *path, uint64_t *out) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    uint64_t h = 1469598103934665603ULL;  /* FNV offset basis */
+    int ch;
+    while ((ch = fgetc(f)) != EOF) {
+        h ^= (uint8_t)ch;
+        h *= 1099511628211ULL;             /* FNV prime */
+    }
+    fclose(f);
+    *out = h;
+    return 0;
+}
+
+/*
+ * Verify that a loaded .myc is not older than the .myon it was compiled from
+ * (mvm_spec.md §6.5, §12.1).  The check is best-effort: if the source .myon is
+ * not present (a distributed .myc), verification is skipped and 0 is returned.
+ *
+ * Resolution order for the source: the path recorded in the .myc Source Info
+ * (src_path) if it exists, otherwise a sibling "<myc-basename>.myon".
+ *
+ * If the .myon is present and differs (its mtime is newer, or its size/hash no
+ * longer match the recorded Source Info), a warning is printed.  When `strict`
+ * is set, this is treated as an error and a non-zero value is returned so the
+ * caller aborts execution.
+ */
+static int check_myc_stale(const Module *m, const char *myc_path, int strict) {
+    /* No source info recorded (older .myc) => nothing to compare. */
+    if (m->src_size == 0 && m->src_mtime == 0) return 0;
+
+    /* Resolve the source .myon path. */
+    const char *src = NULL;
+    char *derived = NULL;
+    FILE *probe;
+    if (m->src_path && (probe = fopen(m->src_path, "rb")) != NULL) {
+        fclose(probe);
+        src = m->src_path;
+    } else {
+        derived = default_myc_name(myc_path);  /* <base>.myc */
+        size_t dn = strlen(derived);
+        /* turn "<base>.myc" into "<base>.myon" */
+        if (dn >= 4 && strcmp(derived + dn - 4, ".myc") == 0) {
+            char *cand = (char *)myon_xmalloc(dn + 2);
+            memcpy(cand, derived, dn - 4);
+            memcpy(cand + dn - 4, ".myon", 6);
+            if ((probe = fopen(cand, "rb")) != NULL) { fclose(probe); }
+            else { free(cand); cand = NULL; }
+            free(derived);
+            derived = cand;
+            src = derived;
+        } else {
+            free(derived);
+            derived = NULL;
+        }
+    }
+
+    if (!src) return 0;  /* no source available: skip (distributed .myc) */
+
+    /* Gather the current source's mtime / size / hash. */
+    int stale = 0;
+    struct stat st;
+    uint64_t cur_hash = 0;
+    int have_hash = (fnv1a_file(src, &cur_hash) == 0);
+
+    if (stat(src, &st) == 0) {
+        if ((int64_t)st.st_mtime > m->src_mtime) stale = 1;
+        if ((uint64_t)st.st_size != m->src_size) stale = 1;
+    }
+    if (have_hash) {
+        uint64_t rec = 0;
+        for (int i = 0; i < 8; i++)
+            rec |= (uint64_t)m->src_hash[i] << (8 * i);
+        if (rec != 0 && rec != cur_hash) stale = 1;
+    }
+
+    int rc = 0;
+    if (stale) {
+        if (strict) {
+            fprintf(stderr,
+                "myon: '%s' is stale: source '%s' is newer than the compiled "
+                "bytecode. Recompile with --compile (--strict-stale).\n",
+                myc_path, src);
+            rc = 65;
+        } else {
+            fprintf(stderr,
+                "myon: warning: '%s' may be older than '%s'; recompilation is "
+                "recommended (--compile).\n",
+                myc_path, src);
+        }
+    }
+
+    if (derived) free(derived);
+    return rc;
+}
+
 int main(int argc, char **argv) {
     int tokens_only = 0;
+    int strict_stale = 0;
     const char *path = NULL;
     /* Step 5 (additive): MVM compile / disassemble subcommands. */
     const char *compile_src = NULL;
@@ -413,6 +532,7 @@ int main(int argc, char **argv) {
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--tokens") == 0) tokens_only = 1;
+        else if (strcmp(argv[i], "--strict-stale") == 0) strict_stale = 1;
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage(argv[0]); return 0;
         } else if (strcmp(argv[i], "--compile") == 0) {
@@ -455,7 +575,7 @@ int main(int argc, char **argv) {
      * is always treated as source.
      */
     if (strcmp(path, "-") != 0 && looks_like_myc(path)) {
-        return cmd_run_myc(path);
+        return cmd_run_myc(path, strict_stale);
     }
 
     char *source = NULL;
