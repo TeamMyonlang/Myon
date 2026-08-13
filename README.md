@@ -423,10 +423,9 @@ async/await・`myon.net`／`myon.http`・FFI・ジェネリクスは MVM 非対�
 
 > **MVM の既知の制限（`docs/mvm_spec.md` 7 節・下記「既知の制限事項」参照）**
 > - REPL は当面ツリーウォークのみ対応（MVM 版 REPL は将来課題）。
-> - `.myc` の Source Info（`src_mtime`/`src_size`/`src_hash`）は**書き込み済み**
->   だが、`./myon foo.myc` 実行時に「`.myon` より古い `.myc`」を検出して警告する
->   **stale チェックの実行時検証と `--strict-stale` フラグは未実装**（設計のみ、
->   下記「今後の課題」参照）。
+> - `.myc` の Source Info（`src_mtime`/`src_size`/`src_hash`）は書き込み済みで、
+>   `./myon foo.myc` 実行時に「`.myon` より古い `.myc`」を検出する
+>   **stale チェックも実装済み**（既定は警告、`--strict-stale` でエラー化）。
 > - async/await・net/http・FFI・ジェネリクス・クロージャは MVM 非対応。
 
 ## ビルド
