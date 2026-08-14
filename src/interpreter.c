@@ -59,6 +59,7 @@
  * docs/myon_spec.md 10.7 / 14.9. */
 #if defined(__linux__)
 #include <sys/select.h>
+#include <sys/stat.h>
 #endif
 /* Windows lacks nanosleep; Sleep() (Win32, in kernel32) is the blocking
  * millisecond primitive used by the synchronous myon.time.sleep_ms fallback.
@@ -3358,7 +3359,18 @@ static void http_serve_static_conn(Interp *it, NetState *st, int conn_id,
         resp = http_build_response(403, "Forbidden", "text/plain",
                                    body, strlen(body), &resp_len);
     } else {
-        FILE *f = fopen(fspath, "rb");
+        int is_regular = 1;
+#if defined(__linux__)
+        /* Only serve regular files: fopen("rb") on a directory or special
+         * file makes ftell() indeterminate (known-issue.md #3).  stat() +
+         * S_ISREG() rejects directories/FIFOs/devices up front. */
+        {
+            struct stat sb;
+            if (stat(fspath, &sb) != 0 || !S_ISREG(sb.st_mode))
+                is_regular = 0;
+        }
+#endif
+        FILE *f = is_regular ? fopen(fspath, "rb") : NULL;
         if (!f) {
             const char *body = "404 Not Found";
             resp = http_build_response(404, "Not Found", "text/plain",
@@ -3576,19 +3588,38 @@ static int http_parse_url(const char *url, char **host_out, int *port_out,
     /* host[:port] up to '/' or end */
     const char *slash = strchr(p, '/');
     const char *hostend = slash ? slash : p + strlen(p);
-    const char *colon = memchr(p, ':', (size_t)(hostend - p));
     int port = default_port;
     size_t hlen;
-    if (colon) {
-        hlen = (size_t)(colon - p);
-        port = (int)strtol(colon + 1, NULL, 10);
-        if (port <= 0) port = default_port;
+    const char *host_start = p;
+    if (p < hostend && *p == '[') {
+        /* IPv6 literal: "[::1]" or "[::1]:8080" (known-issue.md #4).  The host
+         * is everything between the brackets; a ':' inside must not be treated
+         * as the port separator. */
+        const char *rb = memchr(p, ']', (size_t)(hostend - p));
+        if (!rb) {
+            if (err_out) *err_out = myon_strdup("invalid URL: unterminated IPv6 literal");
+            return -1;
+        }
+        host_start = p + 1;
+        hlen = (size_t)(rb - host_start);
+        const char *after = rb + 1;
+        if (after < hostend && *after == ':') {
+            port = (int)strtol(after + 1, NULL, 10);
+            if (port <= 0) port = default_port;
+        }
     } else {
-        hlen = (size_t)(hostend - p);
+        const char *colon = memchr(p, ':', (size_t)(hostend - p));
+        if (colon) {
+            hlen = (size_t)(colon - p);
+            port = (int)strtol(colon + 1, NULL, 10);
+            if (port <= 0) port = default_port;
+        } else {
+            hlen = (size_t)(hostend - p);
+        }
     }
     if (hlen == 0) { if (err_out) *err_out = myon_strdup("invalid URL: missing host"); return -1; }
     char *host = (char *)myon_xmalloc(hlen + 1);
-    memcpy(host, p, hlen); host[hlen] = '\0';
+    memcpy(host, host_start, hlen); host[hlen] = '\0';
     char *path = myon_strdup(slash ? slash : "/");
     *host_out = host; *port_out = port; *path_out = path;
     if (is_https_out) *is_https_out = is_https;
