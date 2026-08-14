@@ -1727,6 +1727,26 @@ static void random_ensure_seeded(Interp *it) {
     }
 }
 
+/* Fill `buf` with `n` cryptographically-secure random bytes from the OS CSPRNG.
+ * Returns 0 on success, -1 on failure.  This backs myon.random.secure_int,
+ * which (unlike the srand/rand-based helpers above) is safe for tokens/keys
+ * (addresses known-issue.md "myon.random is not cryptographically safe").
+ * Linux: read from /dev/urandom (portable across kernels without pulling in
+ * <sys/random.h>/getrandom feature-test macros).  Other platforms currently
+ * report failure so callers surface a clear error rather than a weak value. */
+static int random_secure_bytes(unsigned char *buf, size_t n) {
+#if defined(__linux__)
+    FILE *f = fopen("/dev/urandom", "rb");
+    if (!f) return -1;
+    size_t got = fread(buf, 1, n, f);
+    fclose(f);
+    return (got == n) ? 0 : -1;
+#else
+    (void)buf; (void)n;
+    return -1;
+#endif
+}
+
 static int call_random(Interp *it, Env *env, const char *name, Expr *call, Value *out) {
     int line = call->line;
 
@@ -1770,6 +1790,48 @@ static int call_random(Interp *it, Env *env, const char *name, Expr *call, Value
         random_ensure_seeded(it);
         double v = (double)rand() / ((double)RAND_MAX + 1.0);
         *out = value_float(v);
+        return 1;
+    }
+
+    /* myon.random.secure_int(lo, hi) ret int, error — inclusive on both ends.
+     * Crypto-safe (OS CSPRNG) counterpart to myon.random.int; uses unbiased
+     * rejection sampling so every value in [lo, hi] is equiprobable.  Suitable
+     * for tokens/keys/nonces (known-issue.md #6). */
+    if (strcmp(name, "myon.random.secure_int") == 0) {
+        Value lo = eval_arg(it, env, call, 0), hi = eval_arg(it, env, call, 1);
+        if (lo.type != TYPE_INT || hi.type != TYPE_INT) {
+            value_free(&lo); value_free(&hi);
+            runtime_error(it, line, "myon.random.secure_int expects (int, int)");
+        }
+        long long lov = lo.as.i, hiv = hi.as.i;
+        value_free(&lo); value_free(&hi);
+        if (lov > hiv) {
+            *out = make_result_pair(value_nil(),
+                value_error(myon_strdup("myon.random.secure_int: lo must be <= hi")));
+            return 1;
+        }
+        unsigned long long span = (unsigned long long)(hiv - lov) + 1ULL;
+        unsigned long long v;
+        if (span == 0ULL) {
+            /* Full 64-bit range (lo=INT64_MIN, hi=INT64_MAX): any draw is fine. */
+            if (random_secure_bytes((unsigned char *)&v, sizeof(v)) != 0) {
+                *out = make_result_pair(value_nil(),
+                    value_error(myon_strdup("myon.random.secure_int: OS CSPRNG unavailable")));
+                return 1;
+            }
+        } else {
+            /* Reject the top partial bucket to remove modulo bias. */
+            unsigned long long limit = (~0ULL) - ((~0ULL) % span);
+            do {
+                if (random_secure_bytes((unsigned char *)&v, sizeof(v)) != 0) {
+                    *out = make_result_pair(value_nil(),
+                        value_error(myon_strdup("myon.random.secure_int: OS CSPRNG unavailable")));
+                    return 1;
+                }
+            } while (v >= limit);
+            v %= span;
+        }
+        *out = make_result_pair(value_int(lov + (long long)v), value_nil());
         return 1;
     }
 
@@ -3418,6 +3480,17 @@ static void http_conn_task_entry(void *ud) {
     HttpRequest req;
     if (http_read_request(it, c->st, c->conn_id, &req) == 0) {
         char *body_out = NULL;
+        /* Response status/content-type are controllable by the handler
+         * (known-issue.md #2).  A plain str return keeps the historical
+         * 200 OK / text/plain default; returning an array lets the handler
+         * override them:
+         *   [body]                        -> 200, text/plain
+         *   [status, body]                -> status, text/plain
+         *   [status, content_type, body]  -> status, content_type
+         * The trailing element is always the body. */
+        /* volatile: written between setjmp and a possible longjmp (-Wclobbered). */
+        volatile int status_out = 200;
+        char * volatile ctype_out = NULL;   /* NULL => "text/plain" default */
         /* Phase5.2: this handler runs on the connection coroutine's own C
          * stack; give it an independent recursion budget (see async_task_entry). */
         int saved_depth = it->call_depth;
@@ -3428,21 +3501,52 @@ static void http_conn_task_entry(void *ud) {
             args[1] = value_str(myon_strdup(req.path));
             args[2] = value_str(myon_strdup(req.body));
             Value r = call_function(it, 0, c->handler, args, 3, NULL);
-            if (r.type == TYPE_STR && r.as.obj)
+            if (r.type == TYPE_STR && r.as.obj) {
                 body_out = myon_strdup(r.as.obj->as.str);
-            else
+            } else if (r.type == TYPE_ARRAY && r.as.obj) {
+                ArrayData *ad = &r.as.obj->as.arr;
+                int n = ad->count;
+                /* body is the last element */
+                if (n >= 1) {
+                    Value *bv = &ad->items[n - 1];
+                    body_out = myon_strdup((bv->type == TYPE_STR && bv->as.obj)
+                                           ? bv->as.obj->as.str : "");
+                } else {
+                    body_out = myon_strdup("");
+                }
+                if (n >= 2) {
+                    /* status may be an int, or a str (typed arrays are
+                     * homogeneous, so myon.array(str) handlers pass "404"). */
+                    long long s = -1;
+                    if (ad->items[0].type == TYPE_INT) {
+                        s = ad->items[0].as.i;
+                    } else if (ad->items[0].type == TYPE_STR && ad->items[0].as.obj) {
+                        char *end = NULL;
+                        long parsed = strtol(ad->items[0].as.obj->as.str, &end, 10);
+                        if (end && *end == '\0') s = parsed;
+                    }
+                    if (s >= 100 && s <= 599) status_out = (int)s;
+                }
+                if (n >= 3 && ad->items[1].type == TYPE_STR && ad->items[1].as.obj)
+                    ctype_out = myon_strdup(ad->items[1].as.obj->as.str);
+            } else {
                 body_out = myon_strdup("");
+            }
             value_free(&r);
             for (int i = 0; i < 3; i++) value_free(&args[i]);
         } else {
+            status_out = 500;
             body_out = myon_strdup("500 Internal Server Error");
         }
         it->call_depth = saved_depth;
         size_t rlen = 0;
-        char *resp = http_build_response(200, "OK", "text/plain",
+        char *resp = http_build_response(status_out,
+                                         http_status_text(status_out),
+                                         ctype_out ? ctype_out : "text/plain",
                                          body_out, strlen(body_out), &rlen);
         if (resp) { http_send_all(it, c->st, c->conn_id, resp, rlen); free(resp); }
         free(body_out);
+        free(ctype_out);
         http_request_free(&req);
     }
 
@@ -4621,29 +4725,32 @@ static void interp_retain_program(Interp *it, Program *prog) {
  * sibling modules).  When no script directory is known (REPL / stdin) we fall
  * back to the current working directory ("./"), matching the old behaviour.
  *
- * Writes the result into `out` (size `out_sz`).  Returns 0 on overflow.
+ * Returns a freshly heap-allocated path string (caller frees), or NULL on
+ * allocation failure.  The buffer is sized exactly for the input, so there is
+ * no fixed length cap on how deep/long a dotted module path may be
+ * (known-issues.md: "Module path length capped at 1024 bytes").
  */
-static int resolve_module_file(Interp *it, const char *path,
-                               char *out, size_t out_sz) {
+static char *resolve_module_file(Interp *it, const char *path) {
     const char *p = path;
     if (strncmp(p, "external.", 9) == 0) p += 9;
 
     const char *base = (it->script_dir && it->script_dir[0]) ? it->script_dir : ".";
 
-    /* Build "<base>/" + path-with-dots-as-slashes + ".myon", bounds-checked. */
-    int wrote = snprintf(out, out_sz, "%s/", base);
-    if (wrote < 0 || (size_t)wrote >= out_sz) return 0;
-    size_t len = (size_t)wrote;
+    /* Result is: "<base>" + "/" + path-with-dots-as-slashes + ".myon" + NUL. */
+    size_t base_len = strlen(base);
+    size_t path_len = strlen(p);
+    size_t out_sz = base_len + 1 /* '/' */ + path_len + 5 /* ".myon" */ + 1;
+    char *out = (char *)malloc(out_sz);
+    if (!out) return NULL;
 
-    for (const char *c = p; *c; c++) {
-        if (len + 1 >= out_sz) return 0;      /* leave room for NUL */
+    size_t len = 0;
+    memcpy(out + len, base, base_len); len += base_len;
+    out[len++] = '/';
+    for (const char *c = p; *c; c++)
         out[len++] = (*c == '.') ? '/' : *c;
-    }
+    memcpy(out + len, ".myon", 5); len += 5;
     out[len] = '\0';
-
-    wrote = snprintf(out + len, out_sz - len, ".myon");
-    if (wrote < 0 || (size_t)wrote >= out_sz - len) return 0;
-    return 1;
+    return out;
 }
 
 static int load_external_module(Interp *it, Stmt *decl) {
@@ -4668,15 +4775,19 @@ static int load_external_module(Interp *it, Stmt *decl) {
     it->modules = m;
 
     /* build file path relative to the importing script's directory */
-    char file[1024];
-    if (!resolve_module_file(it, path, file, sizeof(file)))
-        runtime_error(it, decl->line, "module path too long: '%s'", path);
+    char *file = resolve_module_file(it, path);
+    if (!file)
+        runtime_error(it, decl->line, "out of memory resolving module path: '%s'", path);
 
     Env *target = m->ns ? m->ns : it->global;
 
     FILE *f = fopen(file, "rb");
-    if (!f)
-        runtime_error(it, decl->line, "cannot open module file '%s' for '%s'", file, path);
+    if (!f) {
+        char *fcopy = myon_strdup(file);
+        free(file);
+        runtime_error(it, decl->line, "cannot open module file '%s' for '%s'", fcopy, path);
+    }
+    free(file);
     fseek(f, 0, SEEK_END);
     long sz = ftell(f);
     fseek(f, 0, SEEK_SET);
