@@ -92,6 +92,11 @@ would refcount/track per module and free earlier.
   newer it warns by default and, with the new `--strict-stale` flag, errors out
   (exit 65). Verification is skipped when no source `.myon` is present
   (distributed `.myc`). The `.myc` format is unchanged.
+  - **Follow-up fix:** `check_myc_stale()` is defined `static` *after*
+    `cmd_run_myc()` but was called from it with no forward declaration, so the
+    tree failed to build (`-Werror`-style implicit-declaration + "static
+    declaration follows non-static declaration"). Added a forward declaration
+    for `check_myc_stale()` above `cmd_run_myc()` in `src/main.c`.
 
 - 🔴 **`as` alias was non-functional.** External module symbols were dumped flat
   into the global scope, so `module external.util.math as m` then `m.square()`

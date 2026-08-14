@@ -230,6 +230,8 @@ static int looks_like_myc(const char *path) {
  * mvm_vm.h / the Step 6 report.  Source snippets are unavailable for a
  * reloaded module, so runtime errors show the line number only.
  */
+static int check_myc_stale(const Module *m, const char *myc_path, int strict);
+
 static int cmd_run_myc(const char *path, int strict_stale) {
     Module *m = mvm_module_read_file(path);
     if (!m) {
