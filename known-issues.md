@@ -41,10 +41,18 @@ divergence (violates the mvm_spec §2 equivalence guarantee).
 `src/interpreter.c` — `prescan()` / `register_struct()`.
 Functions/variables of an aliased module now live in a per-module namespace
 (`m.foo`), but **structs** defined in a module are still registered globally
-(`find_struct` searches `it->structs`). So two modules defining a struct of the
-same name still collide, and a module's struct is reachable unqualified.
-- **TODO:** namespace struct registration per module (qualified `m.Point`), or
-  at least error on cross-module struct-name collisions.
+(`find_struct` searches `it->structs`). So a module's struct is reachable
+unqualified.
+- **Partially addressed:** the cross-module **name-collision** half of this is
+  already guarded — `prescan()` calls `find_struct()` before
+  `register_struct()` and raises `redefinition of struct '<name>'`, so two
+  modules defining a struct of the same name now error cleanly instead of
+  silently overriding (the doc's "at least error on collisions" fallback).
+- **Still deferred:** true per-module *namespacing* (`m.Point`, so same-named
+  structs can coexist and a module's struct is not reachable unqualified). This
+  needs `find_struct`/instantiation/method-dispatch to become module-aware in
+  **both** the tree-walk interpreter and the MVM compiler/VM — a large,
+  cross-backend change, so it is not attempted here.
 
 ### 🟡 Nested aliased imports are not scoped to the importing module
 `src/interpreter.c` — `load_external_module()`.
@@ -61,14 +69,6 @@ diagnostic-quality issue.
 ---
 
 ## Deferred — larger bugs spotted in big files (not yet fixed)
-
-### 🟡 Module path length capped at 1024 bytes
-`src/interpreter.c` — `resolve_module_file()`.
-The new resolver bounds-checks and errors on overflow (previously the old loader
-did `file[len++] = ...` with **no bound check at all** against a fixed 512-byte
-buffer — a latent stack buffer overflow for deep/long dotted paths). The hard
-cap remains at 1024 bytes; deeper trees still error out cleanly. Acceptable for
-now; a fully dynamic buffer would remove the cap.
 
 ### 🟡 Module AST retention is coarse
 `src/interpreter.c`.
@@ -114,6 +114,11 @@ would refcount/track per module and free earlier.
   (full support tracked above).
 - 🟡 **Unchecked path buffer in the old loader** → replaced with a
   bounds-checked `resolve_module_file`.
+- 🟡 **Module path length capped at 1024 bytes** → removed the cap.
+  `resolve_module_file()` no longer writes into a fixed stack buffer; it now
+  allocates a heap string sized exactly for `"<base>/<dotted-as-slashes>.myon"`
+  and returns it (caller frees). Deep/long dotted module paths no longer error
+  out at an arbitrary length, and there is no fixed-buffer overflow surface.
 - 🟢 **Module AST double-handling** → module programs are now retained via
   `interp_retain_program` and freed exactly once (both the persistent and
   one-shot interpreter paths), instead of being leaked ad hoc.

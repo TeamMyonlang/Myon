@@ -60,6 +60,11 @@ size_t http_find_header_end(const char *buf, size_t len);
 /* Guess a Content-Type from a file path's extension.  Never returns NULL. */
 const char *http_content_type_for_path(const char *path);
 
+/* Reason phrase for an HTTP status code (e.g. 404 -> "Not Found").  Returns a
+ * static string; never NULL.  Unrecognised codes fall back to a per-class
+ * phrase. */
+const char *http_status_text(int status);
+
 /* Build a full HTTP/1.0 response into a freshly malloc'd buffer.
  * `*out_len` receives the total byte length (headers + body).  Caller frees
  * the returned pointer.  Returns NULL only on allocation failure. */

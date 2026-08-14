@@ -151,6 +151,45 @@ const char *http_content_type_for_path(const char *path) {
 /* response building                                                   */
 /* ------------------------------------------------------------------ */
 
+/* Map a status code to its reason phrase.  Covers the codes a Myon HTTP
+ * handler is realistically going to return (known-issue.md #2); anything
+ * unrecognised falls back to a generic per-class phrase, then "OK". */
+const char *http_status_text(int status) {
+    switch (status) {
+        case 200: return "OK";
+        case 201: return "Created";
+        case 202: return "Accepted";
+        case 204: return "No Content";
+        case 301: return "Moved Permanently";
+        case 302: return "Found";
+        case 303: return "See Other";
+        case 304: return "Not Modified";
+        case 307: return "Temporary Redirect";
+        case 308: return "Permanent Redirect";
+        case 400: return "Bad Request";
+        case 401: return "Unauthorized";
+        case 403: return "Forbidden";
+        case 404: return "Not Found";
+        case 405: return "Method Not Allowed";
+        case 409: return "Conflict";
+        case 410: return "Gone";
+        case 415: return "Unsupported Media Type";
+        case 422: return "Unprocessable Entity";
+        case 429: return "Too Many Requests";
+        case 500: return "Internal Server Error";
+        case 501: return "Not Implemented";
+        case 502: return "Bad Gateway";
+        case 503: return "Service Unavailable";
+        case 504: return "Gateway Timeout";
+        default: break;
+    }
+    if (status >= 200 && status < 300) return "OK";
+    if (status >= 300 && status < 400) return "Redirect";
+    if (status >= 400 && status < 500) return "Client Error";
+    if (status >= 500 && status < 600) return "Server Error";
+    return "OK";
+}
+
 char *http_build_response(int status, const char *status_text,
                           const char *content_type,
                           const char *body, size_t body_len,
