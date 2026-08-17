@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <setjmp.h>
+#include <errno.h>
 
 typedef struct {
     const Token *toks;
@@ -253,10 +254,16 @@ static Expr *parse_primary(Parser *p) {
         case TOK_INT: {
             advance(p);
             long long v;
+            char *end = NULL;
+            errno = 0;
             if (t->lexeme[0] == '0' && (t->lexeme[1] == 'o' || t->lexeme[1] == 'O'))
-                v = strtoll(t->lexeme + 2, NULL, 8);
+                v = strtoll(t->lexeme + 2, &end, 8);
             else
-                v = strtoll(t->lexeme, NULL, 0);
+                v = strtoll(t->lexeme, &end, 0);
+            /* Reject literals that strtoll saturated at LLONG_MIN/MAX instead of
+             * silently accepting the clamped (wrong) value. */
+            if (errno == ERANGE)
+                perror_at(p, t, "integer literal out of range");
             return expr_int(v, line);
         }
         case TOK_FLOAT:

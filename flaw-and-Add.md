@@ -30,6 +30,9 @@ cc -std=c11 -g -O0 -fsanitize=address,undefined -fno-omit-frame-pointer \
 
 深刻度の凡例: 🔴 重大（メモリ破壊 / クラッシュ） / 🟠 中（誤結果・整合性） / 🟡 低（表示・往復性）
 
+> **修正ステータス（2026-08-17 更新）**: A-1〜A-6 は本 PR で**すべて修正済み**。
+> 各項目末尾に ✅ 修正内容を追記した。B 群（Add）は今回対象外。
+
 ### A-1. 🔴 `myon.string.repeat` の乗算オーバーフローによるヒープバッファオーバーフロー
 
 - **場所**: `src/interpreter.c` `myon.string.repeat`（およそ L2617–2637）
@@ -63,6 +66,9 @@ cc -std=c11 -g -O0 -fsanitize=address,undefined -fno-omit-frame-pointer \
   または `__builtin_mul_overflow` を使い、越えたら `repeat: result too large` の
   `error` 値を返す（既存の tuple/error 慣習に合わせる）。加えて `n` の上限を
   設けるのが安全。
+- **✅ 修正済み**: `__builtin_mul_overflow(unit, n, &total)` で確保前に検査し、
+  越えたら `myon.string.repeat: result too large` の `error` を返すようにした。
+  ASan で heap-buffer-overflow が消滅、クラッシュせずエラー値が返ることを確認。
 
 ---
 
@@ -92,6 +98,9 @@ cc -std=c11 -g -O0 -fsanitize=address,undefined -fno-omit-frame-pointer \
   if (start < 0 || len < 0 || start > nchars || len > nchars - start) { /* out of bounds */ }
   ```
   （`nchars - start` は `start <= nchars` を先に確認していれば安全）
+- **✅ 修正済み**: 上記の各境界を個別に検査する形へ書き換え、`start + len` の
+  符号付きオーバーフロー（UB）を排除。UBSan/ASan ともにクリーン、
+  巨大入力で `range out of bounds` エラーが返ることを確認。
 
 ---
 
@@ -114,6 +123,9 @@ cc -std=c11 -g -O0 -fsanitize=address,undefined -fno-omit-frame-pointer \
   ```
   - UBSan: `runtime error: signed integer overflow`（L2842 / L2848）
 - **修正案**: A-2 と同じく `len > count - start` 形式へ書き換える。
+- **✅ 修正済み**: `count = (long long)a->count` を導入し、境界チェックを
+  `start > count || len > count - start` に、ループ上限を事前計算した `end` に
+  変更。UBSan クリーン、巨大入力で `range out of bounds` を返すようにした。
 
 > 補足: `src/interpreter.c` の算術演算（`int_arith`）は `__builtin_add/sub/mul_overflow`
 > と `LLONG_MIN / -1` まで丁寧に守られています。**にもかかわらず** stdlib の
@@ -138,6 +150,9 @@ cc -std=c11 -g -O0 -fsanitize=address,undefined -fno-omit-frame-pointer \
   ```
 - **修正案**: `errno = 0` を設定して `strtoll` 後に `errno == ERANGE` を検査し、
   越えていたらパースエラー（`integer literal out of range`）にする。
+- **✅ 修正済み**: `parse_primary` で `errno = 0` 設定後に `errno == ERANGE` を検査し、
+  越えていたら `perror_at(..., "integer literal out of range")` で構文エラーに
+  するよう変更（10 進・8 進・16 進すべて対象）。
 
 ---
 
@@ -156,6 +171,9 @@ cc -std=c11 -g -O0 -fsanitize=address,undefined -fno-omit-frame-pointer \
   ```
 - **修正案**: `end`/入力の検証に加えて `errno == ERANGE` を分岐に足し、
   越えたら `to_int: out of range` の `error` を返す（`to_float` も同様、`HUGE_VAL`）。
+- **✅ 修正済み**: 両関数に `errno == ERANGE` 分岐を追加し、越えたら
+  `myon.string.to_int: out of range` / `myon.string.to_float: out of range` の
+  `error` を返すようにした。
 
 ---
 
@@ -177,6 +195,11 @@ cc -std=c11 -g -O0 -fsanitize=address,undefined -fno-omit-frame-pointer \
 - **修正案**: 最短往復表現に切り替える。簡易には `%.17g`、望ましくは
   「`%.15g` → 往復チェック → 必要なら `%.16g`/`%.17g`」のロジック、または
   Grisu/Ryū 系。小数点や指数を含まない場合は `.0` を付ける等の整形も検討。
+- **✅ 修正済み**: `src/value.c` に `format_float()` を追加。`%.15g`→`%.16g`→`%.17g`
+  の順に試し、`strtod` で元の `double` に一致する最短表現を採用。小数点/指数を
+  含まない有限値には `.0` を補い、`nan`/`inf` も明示化。tree-walk と MVM は共通の
+  `value_to_cstr()` を通るため両経路で有効。既存 2 テスト（`step16_stdlib`・
+  `p_ffi_basic`）の期待出力を `4→4.0` / `1024→1024.0` に更新（float の正しい表示）。
 
 ---
 
@@ -228,4 +251,7 @@ cc -std=c11 -g -O0 -fsanitize=address,undefined -fno-omit-frame-pointer \
 - 最優先は **A-1（メモリ破壊）**、次いで **A-2/A-3（UB＋DoS/整合性）**。
 - A-1〜A-3 は「`int_arith` は守っているのに stdlib の境界計算だけ生の演算」という
   **一貫性の欠如**が根本原因で、B-3 の共通ヘルパー導入で面的に解消できます。
-- 本レビューでは方針どおり**修正は行わず**、確認された事実のみを記録しています。
+- **本 PR で A-1〜A-6 をすべて修正済み**。通常ビルドは警告ゼロ・全テスト
+  グリーン（60/68/38 passed）、ASan/UBSan ビルドでも各再現ケースが
+  クラッシュ・UB なくエラー値／構文エラーを返すことを確認しました。
+  B 群（Add）は今回対象外。
