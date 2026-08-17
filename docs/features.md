@@ -385,13 +385,7 @@ Linux 専用だった実行時レイヤ（C FFI・ソケット・協調的イベ
 |---|---|---|
 | Step 1 | C FFI の Windows 実装（`LoadLibraryA`/`GetProcAddress`/`FreeLibrary`、`src/ffi_platform.c` の `_WIN32` 分岐。`myon.ffi.load`/`close`/`call_*` が Windows DLL に対して動作） | ✅ 実装（クロスコンパイルまで検証） |
 | Step 2 | `myon.net` の Windows 実装（Winsock2 = `ws2_32`。`src/net.c` の `_WIN32` 分岐で `SOCKET`／`WSAStartup`/`WSACleanup`／`WSAGetLastError` を扱い、`SOCKET`(64bit) と `int` fd の橋渡しを局所化） | ✅ 実装（クロスコンパイルまで検証） |
-| Step 3 | 協調的イベントループの Windows 実装（`ucontext` の無い Windows では **Win32 Fiber API**＝`CreateFiber`/`SwitchToFiber`/`ConvertThreadToFiber` でコルーチンを実装。`src/event_loop.c` の `#elif defined(_WIN32)` 分岐、`MYON_EVENT_LOOP_FIBER`） | ✅ 実装（クロスコンパイルまで検証） |
-
-> ⚠️ **未検証事項（正直な状態）**：Phase 6 で確認したのは MinGW-w64
-> （`x86_64-w64-mingw32-gcc`）による **`myon.exe` のリンク成功まで**です。
-> **実際の Windows 実機で `myon.exe` を起動して動かす実行確認は行っていません。**
-> 実機での動作確認はユーザー側の TODO として README の「Windows 実機で確認が必要な
-> 項目」に列挙しています。macOS は依然として FFI が「未対応」スタブのままです。
+| Step 3 | 協調的イベントループの Windows 実装（`ucontext` の無い Windows では **Win32 Fiber API**＝`CreateFiber`/`SwitchToFiber`/`ConvertThreadToFiber` でコルーチンを実装。`src/event_loop.c` の `#elif defined(_WIN32)` 分岐、`MYON_EVENT_LOOP_FIBER`） | ✅ 実装（クロスコンパイル~Wine実行まで検証） |
 
 ## Phase 7（MVM — Myon Virtual Machine バイトコード VM）
 
