@@ -21,6 +21,29 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
+
+/* ------------------------------------------------------------------ */
+/* Float formatting                                                    */
+/* ------------------------------------------------------------------ */
+
+/* Render `d` into `buf` using the *shortest* decimal that round-trips back to
+ * the same double.  We try %.15g / %.16g / %.17g in order (17 significant
+ * digits is always enough for IEEE-754 binary64) and keep the first one that
+ * reparses exactly.  A finite value with no '.', 'e' or 'n'/'i' gets a ".0"
+ * suffix so it still reads back as a float rather than an int. */
+static void format_float(char *buf, size_t cap, double d) {
+    if (isnan(d)) { snprintf(buf, cap, "nan"); return; }
+    if (isinf(d)) { snprintf(buf, cap, d < 0 ? "-inf" : "inf"); return; }
+    for (int prec = 15; prec <= 17; prec++) {
+        snprintf(buf, cap, "%.*g", prec, d);
+        if (strtod(buf, NULL) == d) break;
+    }
+    if (!strpbrk(buf, ".eEnN")) {
+        size_t len = strlen(buf);
+        if (len + 2 < cap) { buf[len] = '.'; buf[len + 1] = '0'; buf[len + 2] = '\0'; }
+    }
+}
 
 /* ------------------------------------------------------------------ */
 /* Primitive constructors                                              */
@@ -216,7 +239,7 @@ char *value_to_cstr(const Value *v) {
             snprintf(buf, sizeof(buf), "%lld", v->as.i);
             return myon_strdup(buf);
         case TYPE_FLOAT:
-            snprintf(buf, sizeof(buf), "%g", v->as.f);
+            format_float(buf, sizeof(buf), v->as.f);
             return myon_strdup(buf);
         case TYPE_BOOL:
             return myon_strdup(v->as.b ? "true" : "false");

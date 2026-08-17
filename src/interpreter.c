@@ -45,6 +45,7 @@
 #include <math.h>
 #include <ctype.h>
 #include <errno.h>
+#include <stdint.h>
 #include <time.h>
 
 /* Phase5 myon.net: the synchronous fallback path in net_wait_fd() uses
@@ -2418,7 +2419,10 @@ static int call_stdlib(Interp *it, Env *env, const char *name, Expr *call, Value
         long long start = vs.as.i, len = vl.as.i;
         const char *cs = s.as.obj->as.str;
         long long nchars = utf8_char_count(cs);
-        if (start < 0 || len < 0 || start + len > nchars) {
+        /* Avoid `start + len` (signed overflow / UB) by checking each bound
+         * separately.  With `start <= nchars` established, `nchars - start`
+         * cannot underflow. */
+        if (start < 0 || len < 0 || start > nchars || len > nchars - start) {
             *out = make_result_pair(value_str(myon_strdup("")),
                 value_error(myon_strdup("myon.string.substring: range out of bounds")));
             value_free(&s); value_free(&vs); value_free(&vl); return 1;
@@ -2628,7 +2632,15 @@ static int call_stdlib(Interp *it, Env *env, const char *name, Expr *call, Value
         }
         const char *cs = s.as.obj->as.str;
         size_t unit = strlen(cs);
-        size_t total = unit * (size_t)n;
+        size_t total;
+        /* Guard the size computation against multiplication overflow: a wrapped
+         * `unit * n` would under-allocate and let the memcpy loop write past the
+         * buffer (heap-buffer-overflow).  Refuse before allocating. */
+        if (__builtin_mul_overflow(unit, (size_t)n, &total) || total > SIZE_MAX - 1) {
+            *out = make_result_pair(value_str(myon_strdup("")),
+                value_error(myon_strdup("myon.string.repeat: result too large")));
+            value_free(&s); value_free(&vn); return 1;
+        }
         char *buf = (char *)myon_xmalloc(total + 1);
         for (long long i = 0; i < n; i++) memcpy(buf + (size_t)i * unit, cs, unit);
         buf[total] = '\0';
@@ -2647,6 +2659,11 @@ static int call_stdlib(Interp *it, Env *env, const char *name, Expr *call, Value
         if (cs[0] == '\0' || end == cs || *end != '\0') {
             *out = make_result_pair(value_int(0),
                 value_error(myon_strdup("myon.string.to_int: not an integer")));
+        } else if (errno == ERANGE) {
+            /* strtoll saturated to LLONG_MIN/MAX; report instead of silently
+             * returning a wrong value. */
+            *out = make_result_pair(value_int(0),
+                value_error(myon_strdup("myon.string.to_int: out of range")));
         } else {
             *out = make_result_pair(value_int(v), value_nil());
         }
@@ -2664,6 +2681,11 @@ static int call_stdlib(Interp *it, Env *env, const char *name, Expr *call, Value
         if (cs[0] == '\0' || end == cs || *end != '\0') {
             *out = make_result_pair(value_float(0.0),
                 value_error(myon_strdup("myon.string.to_float: not a number")));
+        } else if (errno == ERANGE) {
+            /* strtod overflowed to +/-HUGE_VAL or underflowed to a subnormal;
+             * report instead of silently returning a wrong value. */
+            *out = make_result_pair(value_float(0.0),
+                value_error(myon_strdup("myon.string.to_float: out of range")));
         } else {
             *out = make_result_pair(value_float(v), value_nil());
         }
@@ -2839,13 +2861,17 @@ static Value call_method(Interp *it, Env *env, Expr *call, Value recv,
             }
             long long start = vs.as.i, len = vl.as.i;
             value_free(&vs); value_free(&vl);
-            if (start < 0 || len < 0 || start + len > (long long)a->count) {
+            long long count = (long long)a->count;
+            /* Avoid `start + len` (signed overflow / UB) by checking each bound
+             * separately, mirroring myon.string.substring. */
+            if (start < 0 || len < 0 || start > count || len > count - start) {
                 return make_result_pair(
                     value_array(a->elem_type ? typespec_clone(a->elem_type) : NULL),
                     value_error(myon_strdup("myon.array.slice: range out of bounds")));
             }
             Value res = value_array(a->elem_type ? typespec_clone(a->elem_type) : NULL);
-            for (long long i = start; i < start + len; i++)
+            long long end = start + len; /* safe: len <= count - start */
+            for (long long i = start; i < end; i++)
                 array_push(&res, value_copy(&a->items[i]));
             return make_result_pair(res, value_nil());
         }
