@@ -690,6 +690,35 @@ static Value make_result_pair(Value ok, Value err) {
 /* caller can inspect it with `myon.if err != myon.nil` (spec 6.2).    */
 /* ------------------------------------------------------------------ */
 
+/*
+ * Portable temp-path resolution for myon.file.*.
+ *
+ * Cross-platform Myon programs (and the test-suite fixtures) naturally reach
+ * for the POSIX convention "/tmp/<file>" for scratch files.  That works on
+ * Linux/macOS/BSD, but a natively-built myon.exe on Windows links the Windows
+ * C runtime, whose fopen() does *not* understand the MSYS2 "/tmp" mount -- so
+ * fopen("/tmp/...") fails with ENOENT and every file op reports an error.  To
+ * keep "/tmp/<file>" meaningful everywhere, on Windows we transparently rewrite
+ * a leading "/tmp/" to the process's real temp directory (%TEMP%/%TMP%, falling
+ * back to the current directory).  The rewrite is written into `buf` and, if it
+ * happened, `buf` is returned; otherwise the original path is returned
+ * untouched.  On POSIX this is a no-op, so "/tmp" stays literally "/tmp".
+ */
+static const char *resolve_fs_path(const char *path, char *buf, size_t bufsz) {
+#if defined(MYON_OS_WINDOWS)
+    if (path && strncmp(path, "/tmp/", 5) == 0) {
+        const char *tmp = getenv("TEMP");
+        if (!tmp || !*tmp) tmp = getenv("TMP");
+        if (!tmp || !*tmp) tmp = ".";
+        snprintf(buf, bufsz, "%s\\%s", tmp, path + 5);
+        return buf;
+    }
+#else
+    (void)buf; (void)bufsz;
+#endif
+    return path;
+}
+
 /* Dispatch a "myon.file.<fn>" call. Returns 1 and sets *out if handled. */
 static int call_file_io(Interp *it, Env *env, const char *name, Expr *call, Value *out) {
     int line = call->line;
@@ -700,7 +729,9 @@ static int call_file_io(Interp *it, Env *env, const char *name, Expr *call, Valu
         if (p.type != TYPE_STR) { value_free(&p); runtime_error(it, line, "myon.file.read expects a str path"); }
         const char *path = p.as.obj->as.str;
         if (!path) { value_free(&p); *out = make_result_pair(value_str(myon_strdup("")), value_error(myon_strdup("null path"))); return 1; }
-        FILE *f = fopen(path, "rb");
+        char pathbuf[1024];
+        const char *ospath = resolve_fs_path(path, pathbuf, sizeof(pathbuf));
+        FILE *f = fopen(ospath, "rb");
         if (!f) {
             char msg[512];
             snprintf(msg, sizeof(msg), "cannot open '%s' for reading", path);
@@ -739,7 +770,9 @@ static int call_file_io(Interp *it, Env *env, const char *name, Expr *call, Valu
             *out = make_result_pair(value_bool(0), value_error(myon_strdup("null path")));
             return 1;
         }
-        FILE *f = fopen(path, append ? "ab" : "wb");
+        char pathbuf[1024];
+        const char *ospath = resolve_fs_path(path, pathbuf, sizeof(pathbuf));
+        FILE *f = fopen(ospath, append ? "ab" : "wb");
         if (!f) {
             char msg[512];
             snprintf(msg, sizeof(msg), "cannot open '%s' for %s", path, append ? "appending" : "writing");
@@ -769,7 +802,9 @@ static int call_file_io(Interp *it, Env *env, const char *name, Expr *call, Valu
         const char *path = p.as.obj->as.str;
         int exists = 0;
         if (path) {
-            FILE *f = fopen(path, "rb");
+            char pathbuf[1024];
+            const char *ospath = resolve_fs_path(path, pathbuf, sizeof(pathbuf));
+            FILE *f = fopen(ospath, "rb");
             if (f) { exists = 1; fclose(f); }
         }
         value_free(&p);
