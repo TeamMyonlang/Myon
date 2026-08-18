@@ -1,0 +1,181 @@
+# Heavy build/check jobs for Myon (TODO section 4).
+#
+# These are the slow checks (AddressSanitizer/UBSan run, MinGW-w64
+# cross-build with a source-built Windows OpenSSL, benchmark, macOS build)
+# that are too expensive to run on every PR commit. They run on push to
+# main and can always be triggered by hand (workflow_dispatch) for
+# verification. The name deliberately avoids "nightly"/cron -- there is no
+# scheduled trigger.
+name: Heavy checks
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: heavy-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Bump this to invalidate the Windows-OpenSSL build cache on purpose.
+  OPENSSL_VERSION: "3.3.2"
+
+jobs:
+  # ------------------------------------------------------------------ #
+  # Job 1: sanitizer (ASan + UBSan) run of the full suite.            #
+  # ------------------------------------------------------------------ #
+  sanitizer:
+    name: sanitizer (ASan/UBSan)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libssl-dev
+
+      - name: Build + run suite under ASan/UBSan
+        # `make test-asan` builds myon_asan (-fsanitize=address,undefined),
+        # temporarily swaps it in as ./myon, runs the whole suite with
+        # ASAN_OPTIONS/UBSAN_OPTIONS set to abort on any finding, then
+        # restores the original binary. A sanitizer finding aborts with a
+        # non-zero exit, turning this step red.
+        run: make test-asan
+
+  # ------------------------------------------------------------------ #
+  # Job 2: MinGW-w64 cross build (produces myon.exe).                 #
+  # ------------------------------------------------------------------ #
+  win-cross:
+    name: win-cross (mingw-w64)
+    runs-on: ubuntu-latest
+    env:
+      # Where the source-built Windows OpenSSL is installed (and cached).
+      WIN_OPENSSL_PREFIX: ${{ github.workspace }}/win-openssl
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install MinGW-w64 toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mingw-w64
+
+      - name: Cache Windows OpenSSL (cross-built)
+        id: cache-openssl
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.WIN_OPENSSL_PREFIX }}
+          # Key includes the OpenSSL version so a version bump misses the
+          # cache and rebuilds; the runner OS keeps ABI assumptions sane.
+          key: win-openssl-${{ runner.os }}-${{ env.OPENSSL_VERSION }}
+
+      - name: Cross-build Windows OpenSSL (cache miss only)
+        if: steps.cache-openssl.outputs.cache-hit != 'true'
+        # aptには Windows 向け OpenSSL が無いため、ソースから MinGW でクロス
+        # ビルドする。重い処理なので上の actions/cache でキャッシュし、2 回目
+        # 以降はこのステップ自体がスキップされる。
+        run: |
+          set -eux
+          git clone --depth 1 --branch "openssl-${OPENSSL_VERSION}" \
+            https://github.com/openssl/openssl.git openssl-src
+          cd openssl-src
+          ./Configure mingw64 no-shared no-tests no-docs no-apps \
+            --cross-compile-prefix=x86_64-w64-mingw32- \
+            --prefix="${WIN_OPENSSL_PREFIX}"
+          make -j"$(nproc)"
+          make install_sw
+
+      - name: Cross-build myon.exe
+        # -lcrypt32 is mandatory: without it the Windows OpenSSL link fails
+        # with undefined references (CertFreeCertificateContext, ...). We
+        # point the compiler at the cross-built OpenSSL include/lib and fold
+        # the extra libs in via WIN_OPENSSL_LDLIBS (Linux link line stays
+        # untouched by the Makefile's Windows branch).
+        run: |
+          set -eux
+          make win-cross \
+            CFLAGS="-std=c11 -Wall -Wextra -Wpedantic -O2 -I${WIN_OPENSSL_PREFIX}/include" \
+            WIN_OPENSSL_LDLIBS="-L${WIN_OPENSSL_PREFIX}/lib -L${WIN_OPENSSL_PREFIX}/lib64 -lcrypt32"
+          file myon.exe
+
+      - name: Upload myon.exe (for inspection)
+        uses: actions/upload-artifact@v4
+        with:
+          name: myon-windows-x86_64
+          path: myon.exe
+          if-no-files-found: error
+
+  # ------------------------------------------------------------------ #
+  # Job 3: benchmark (independent -- must NOT gate anything else).    #
+  # ------------------------------------------------------------------ #
+  benchmark:
+    name: benchmark
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libssl-dev
+
+      - name: Build
+        run: make
+
+      - name: Run benchmark
+        # bench_mvm.sh honours BENCH_FIB / BENCH_LOOP (defaults 30 /
+        # 1000000). Kept modest here so the push-triggered run stays quick;
+        # tune as needed.
+        env:
+          BENCH_FIB: "28"
+          BENCH_LOOP: "500000"
+        run: ./tests/bench_mvm.sh | tee benchmark-results.txt
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: benchmark-results.txt
+          if-no-files-found: error
+
+  # ------------------------------------------------------------------ #
+  # Job 4: macOS build (build-only).                                  #
+  #                                                                    #
+  # Reality check done at implementation time: src/ffi_platform.c has a #
+  # macOS branch that is an explicit Phase3 stub ("FFI is not supported #
+  # on macOS yet"). So FFI test cases would diverge on macOS -- this   #
+  # job therefore verifies the build only and does NOT run `make test`.#
+  # ------------------------------------------------------------------ #
+  macos-build:
+    name: macos-build (build only)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install OpenSSL (Homebrew)
+        # macOS has no system OpenSSL headers; Homebrew provides them.
+        run: brew install openssl@3
+
+      - name: Build
+        # Point CFLAGS/LDLIBS at the Homebrew OpenSSL. macOS is not
+        # Windows_NT and uname is Darwin, so the Makefile takes the
+        # non-Windows / non-Linux branch (no -ldl, dlopen lives in
+        # libSystem) -- exactly what we want for a build check.
+        run: |
+          set -eux
+          OPENSSL_PREFIX="$(brew --prefix openssl@3)"
+          make \
+            CFLAGS="-std=c11 -Wall -Wextra -Wpedantic -O2 -I${OPENSSL_PREFIX}/include" \
+            LDLIBS="-lm -L${OPENSSL_PREFIX}/lib -lssl -lcrypto"
+          # Smoke-run a tiny non-FFI example to prove the binary actually
+          # runs on macOS (build check only; FFI is a stub here so we do not
+          # run the full test suite).
+          ./myon examples/hello.myon
