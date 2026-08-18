@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include "platform.h"
+
 #include "lexer.h"
 #include "parser.h"
 #include "interpreter.h"
@@ -28,6 +30,26 @@
 #include <string.h>
 #include <stdint.h>
 #include <sys/stat.h>
+
+#if defined(MYON_OS_WINDOWS)
+/* On Windows the C runtime opens stdout/stderr in *text* mode by default, so
+ * every '\n' the interpreter writes is silently translated to "\r\n".  Myon's
+ * language semantics (and every golden-output test fixture) use bare LF line
+ * endings, so that translation corrupts program output on Windows: strings
+ * that contain '\n', and the trailing newline of every myon.print(), come out
+ * with a stray carriage return.  Under the test harness this makes otherwise
+ * identical output compare unequal, and it also breaks byte-exact network/HTTP
+ * payloads.  Switch the standard streams to binary mode so a Myon '\n' is
+ * emitted as a single LF byte on every platform. */
+#  include <io.h>
+#  include <fcntl.h>
+static void myon_set_stdio_binary(void) {
+    _setmode(_fileno(stdout), _O_BINARY);
+    _setmode(_fileno(stderr), _O_BINARY);
+}
+#else
+static void myon_set_stdio_binary(void) { /* POSIX streams are already binary */ }
+#endif
 
 /* Myon release version.  Bump on each release; --version prints it. */
 #ifndef MYON_VERSION
@@ -533,6 +555,9 @@ static int check_myc_stale(const Module *m, const char *myc_path, int strict) {
 }
 
 int main(int argc, char **argv) {
+    /* Ensure LF stays LF on Windows (see myon_set_stdio_binary above). */
+    myon_set_stdio_binary();
+
     int tokens_only = 0;
     int strict_stale = 0;
     const char *path = NULL;

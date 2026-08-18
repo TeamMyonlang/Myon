@@ -85,18 +85,27 @@ if [ "$IS_LINUX" -eq 1 ] && [ -f "$CB_SRC" ]; then
         || echo "  (warning: could not build $CB_SO; callback test may skip)"
 fi
 
+# Strip carriage returns so golden comparisons are line-ending agnostic.
+# The interpreter itself now forces LF output on Windows (main.c sets stdout to
+# binary mode), but the .out fixtures are committed with LF and a checkout under
+# a CRLF-normalizing Git config (or a stray tool in the pipeline) could still
+# reintroduce '\r'.  Normalizing both sides here makes the suite robust to that
+# on MSYS2/MINGW without weakening the Linux/macOS comparison (which have no CR).
+strip_cr() { tr -d '\r'; }
+
 # check_output <name> <myon-file> <expected-file>
 check_output() {
     local name="$1" src="$2" expected="$3"
-    local got
-    got=$("$MYON" "$src" 2>/dev/null)
-    if [ "$got" == "$(cat "$expected")" ]; then
+    local got expected_txt
+    got=$("$MYON" "$src" 2>/dev/null | strip_cr)
+    expected_txt=$(strip_cr < "$expected")
+    if [ "$got" == "$expected_txt" ]; then
         echo "  ok   $name"
         pass=$((pass + 1))
     else
         echo "  FAIL $name"
-        echo "    --- expected ---"; sed 's/^/    /' "$expected"
-        echo "    --- got ---";      echo "$got" | sed 's/^/    /'
+        echo "    --- expected ---"; printf '%s\n' "$expected_txt" | sed 's/^/    /'
+        echo "    --- got ---";      printf '%s\n' "$got" | sed 's/^/    /'
         fail=$((fail + 1))
     fi
 }

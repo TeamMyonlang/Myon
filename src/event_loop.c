@@ -321,9 +321,29 @@ static void wake_sleepers(EventLoop *loop, long long now) {
 }
 
 static Task *pick_ready(EventLoop *loop) {
-    for (Task *t = loop->tasks; t; t = t->next)
-        if (t->state == TASK_READY) return t;
-    return NULL;
+    /*
+     * Among all runnable (READY) tasks pick a deterministic one whose choice
+     * does not depend on spawn/list order.  Timer-sleepers that have just come
+     * due still carry their absolute deadline in wake_at_ms (it is only cleared
+     * once the task actually resumes); if several fire in the same loop turn we
+     * must resume the one with the *earliest* deadline first, otherwise a task
+     * that slept longer could print before one that slept less (the p5_async_order
+     * regression seen on macOS, where scheduler jitter lets two timers come due
+     * in a single wake).  Non-timer ready tasks (wake_at_ms == 0: woken by an fd
+     * or by an awaited task completing) keep first-in-list priority, and a timer
+     * task is only preferred over an earlier-listed one when its deadline is
+     * strictly sooner -- so equal/!timer cases stay stable.
+     */
+    Task *best = NULL;
+    for (Task *t = loop->tasks; t; t = t->next) {
+        if (t->state != TASK_READY) continue;
+        if (!best) { best = t; continue; }
+        if (t->wake_at_ms != 0 &&
+            (best->wake_at_ms == 0 || t->wake_at_ms < best->wake_at_ms)) {
+            best = t;
+        }
+    }
+    return best;
 }
 
 int event_loop_run_once(EventLoop *loop) {
@@ -765,9 +785,29 @@ static void wake_sleepers(EventLoop *loop, long long now) {
 }
 
 static Task *pick_ready(EventLoop *loop) {
-    for (Task *t = loop->tasks; t; t = t->next)
-        if (t->state == TASK_READY) return t;
-    return NULL;
+    /*
+     * Among all runnable (READY) tasks pick a deterministic one whose choice
+     * does not depend on spawn/list order.  Timer-sleepers that have just come
+     * due still carry their absolute deadline in wake_at_ms (it is only cleared
+     * once the task actually resumes); if several fire in the same loop turn we
+     * must resume the one with the *earliest* deadline first, otherwise a task
+     * that slept longer could print before one that slept less (the p5_async_order
+     * regression seen on macOS, where scheduler jitter lets two timers come due
+     * in a single wake).  Non-timer ready tasks (wake_at_ms == 0: woken by an fd
+     * or by an awaited task completing) keep first-in-list priority, and a timer
+     * task is only preferred over an earlier-listed one when its deadline is
+     * strictly sooner -- so equal/!timer cases stay stable.
+     */
+    Task *best = NULL;
+    for (Task *t = loop->tasks; t; t = t->next) {
+        if (t->state != TASK_READY) continue;
+        if (!best) { best = t; continue; }
+        if (t->wake_at_ms != 0 &&
+            (best->wake_at_ms == 0 || t->wake_at_ms < best->wake_at_ms)) {
+            best = t;
+        }
+    }
+    return best;
 }
 
 int event_loop_run_once(EventLoop *loop) {
