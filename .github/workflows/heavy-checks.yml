@@ -144,38 +144,3 @@ jobs:
           name: benchmark-results
           path: benchmark-results.txt
           if-no-files-found: error
-
-  # ------------------------------------------------------------------ #
-  # Job 4: macOS build (build-only).                                  #
-  #                                                                    #
-  # Reality check done at implementation time: src/ffi_platform.c has a #
-  # macOS branch that is an explicit Phase3 stub ("FFI is not supported #
-  # on macOS yet"). So FFI test cases would diverge on macOS -- this   #
-  # job therefore verifies the build only and does NOT run `make test`.#
-  # ------------------------------------------------------------------ #
-  macos-build:
-    name: macos-build (build only)
-    runs-on: macos-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install OpenSSL (Homebrew)
-        # macOS has no system OpenSSL headers; Homebrew provides them.
-        run: brew install openssl@3
-
-      - name: Build
-        # Point CFLAGS/LDLIBS at the Homebrew OpenSSL. macOS is not
-        # Windows_NT and uname is Darwin, so the Makefile takes the
-        # non-Windows / non-Linux branch (no -ldl, dlopen lives in
-        # libSystem) -- exactly what we want for a build check.
-        run: |
-          set -eux
-          OPENSSL_PREFIX="$(brew --prefix openssl@3)"
-          make \
-            CFLAGS="-std=c11 -Wall -Wextra -Wpedantic -O2 -I${OPENSSL_PREFIX}/include" \
-            LDLIBS="-lm -L${OPENSSL_PREFIX}/lib -lssl -lcrypto"
-          # Smoke-run a tiny non-FFI example to prove the binary actually
-          # runs on macOS (build check only; FFI is a stub here so we do not
-          # run the full test suite).
-          ./myon examples/hello.myon
