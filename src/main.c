@@ -53,7 +53,7 @@ static void myon_set_stdio_binary(void) { /* POSIX streams are already binary */
 
 /* Myon release version.  Bump on each release; --version prints it. */
 #ifndef MYON_VERSION
-#define MYON_VERSION "0.8.0"
+#define MYON_VERSION "0.8.5"
 #endif
 
 static char *read_file(const char *path) {

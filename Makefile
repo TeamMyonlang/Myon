@@ -87,7 +87,16 @@ endif
 SOURCES  = $(wildcard $(SRC_DIR)/*.c)
 OBJECTS  = $(patsubst $(SRC_DIR)/%.c,$(BUILD)/%.o,$(SOURCES))
 
-.PHONY: all clean test test-mvm test-mvm-equality win-cross asan test-asan
+# Installation paths.  Override PREFIX (or DESTDIR for staged installs) as
+# needed, e.g.  `make install PREFIX=$HOME/.local`  or
+# `make install DESTDIR=/tmp/pkg`.  A system-wide `make install` typically
+# needs root (e.g. `sudo make install`).
+PREFIX  ?= /usr/local
+BINDIR  ?= $(PREFIX)/bin
+DESTDIR ?=
+INSTALL ?= install
+
+.PHONY: all clean test test-mvm test-mvm-equality win-cross asan test-asan install uninstall
 
 all: $(BIN)
 
@@ -187,6 +196,18 @@ test-mvm: all
 # Step 7-b: run only the .myon (tree-walk) vs .myc (MVM) equality suite.
 test-mvm-equality: all
 	./tests/run_mvm_tests.sh
+
+# Install the built interpreter into $(DESTDIR)$(BINDIR) (default
+# /usr/local/bin).  Depends on the binary so `make install` builds first.
+install: $(BIN)
+	$(INSTALL) -d $(DESTDIR)$(BINDIR)
+	$(INSTALL) -m 0755 $(BIN) $(DESTDIR)$(BINDIR)/$(BIN)
+	@echo "installed $(BIN) -> $(DESTDIR)$(BINDIR)/$(BIN)"
+
+# Remove a previously installed binary.
+uninstall:
+	rm -f $(DESTDIR)$(BINDIR)/$(BIN)
+	@echo "removed $(DESTDIR)$(BINDIR)/$(BIN)"
 
 clean:
 	rm -rf $(BUILD) $(BIN) $(ASAN_BIN) myon.asan-backup

@@ -34,6 +34,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <limits.h>
 
 /*
  * BSD-socket implementation is used on every POSIX target (Linux, macOS, the
@@ -309,10 +310,11 @@ int net_connect_check(NetState *st, int sock_id, char **err_msg) {
 
 long long net_send(NetState *st, int sock_id, const char *data, long long len, char **err_msg) {
     if (!valid_id(st, sock_id)) { if (err_msg) *err_msg = dup_msg("invalid socket id"); return -1; }
-    /* MYON-REVIEW CRITICAL: len is a signed VM value.  If a caller passes a
-     * negative length, this cast turns it into a huge size_t and send() may read
-     * far past `data`.  Reject len < 0 (and preferably clamp to SSIZE_MAX)
-     * before this syscall. */
+    /* C-1 fix: len is a signed VM value.  A negative length would cast into a
+     * huge size_t and let send() read far past `data`.  Reject len < 0 and clamp
+     * to SSIZE_MAX so the size_t cast can never wrap. */
+    if (len < 0) { if (err_msg) *err_msg = dup_msg("send: negative length"); return -1; }
+    if (len > (long long)SSIZE_MAX) len = (long long)SSIZE_MAX;
     /* MYON_SEND_FLAGS is MSG_NOSIGNAL on Linux and 0 on macOS/BSD (where the
      * SO_NOSIGPIPE option set at socket creation suppresses SIGPIPE instead). */
     ssize_t n = send(st->fds[sock_id], data, (size_t)len, MYON_SEND_FLAGS);
@@ -326,9 +328,10 @@ long long net_send(NetState *st, int sock_id, const char *data, long long len, c
 
 long long net_recv(NetState *st, int sock_id, char *buf, long long buf_len, char **err_msg) {
     if (!valid_id(st, sock_id)) { if (err_msg) *err_msg = dup_msg("invalid socket id"); return -1; }
-    /* MYON-REVIEW CRITICAL: buf_len < 0 becomes a huge size_t here, allowing
-     * recv() to write past the interpreter-owned buffer.  Validate buf_len >= 0
-     * before calling into the kernel. */
+    /* C-1 fix: buf_len < 0 would become a huge size_t here, letting recv() write
+     * past the interpreter-owned buffer.  Reject negatives and clamp to SSIZE_MAX. */
+    if (buf_len < 0) { if (err_msg) *err_msg = dup_msg("recv: negative length"); return -1; }
+    if (buf_len > (long long)SSIZE_MAX) buf_len = (long long)SSIZE_MAX;
     ssize_t n = recv(st->fds[sock_id], buf, (size_t)buf_len, 0);
     if (n < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) return -2;
@@ -343,8 +346,10 @@ long long net_sendto(NetState *st, int sock_id, const char *data, long long len,
     if (!valid_id(st, sock_id)) { if (err_msg) *err_msg = dup_msg("invalid socket id"); return -1; }
     struct sockaddr_in sa;
     if (fill_addr(&sa, host, port, st->kinds[sock_id], err_msg) < 0) return -1;
-    /* MYON-REVIEW CRITICAL: same signed-to-size_t bug as net_send(); a negative
-     * len can make sendto() read an attacker-sized region from `data`. */
+    /* C-1 fix: same signed-to-size_t bug as net_send(); reject negative len and
+     * clamp to SSIZE_MAX before the cast. */
+    if (len < 0) { if (err_msg) *err_msg = dup_msg("sendto: negative length"); return -1; }
+    if (len > (long long)SSIZE_MAX) len = (long long)SSIZE_MAX;
     ssize_t n = sendto(st->fds[sock_id], data, (size_t)len, 0,
                        (struct sockaddr *)&sa, sizeof(sa));
     if (n < 0) {
@@ -360,8 +365,10 @@ long long net_recvfrom(NetState *st, int sock_id, char *buf, long long buf_len,
     if (!valid_id(st, sock_id)) { if (err_msg) *err_msg = dup_msg("invalid socket id"); return -1; }
     struct sockaddr_in from;
     socklen_t flen = sizeof(from);
-    /* MYON-REVIEW CRITICAL: same signed-to-size_t bug as net_recv(); a negative
-     * buf_len can turn into an oversized kernel write into `buf`. */
+    /* C-1 fix: same signed-to-size_t bug as net_recv(); reject negative buf_len
+     * and clamp to SSIZE_MAX before the cast. */
+    if (buf_len < 0) { if (err_msg) *err_msg = dup_msg("recvfrom: negative length"); return -1; }
+    if (buf_len > (long long)SSIZE_MAX) buf_len = (long long)SSIZE_MAX;
     ssize_t n = recvfrom(st->fds[sock_id], buf, (size_t)buf_len, 0,
                          (struct sockaddr *)&from, &flen);
     if (n < 0) {

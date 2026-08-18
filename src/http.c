@@ -205,11 +205,11 @@ char *http_build_response(int status, const char *status_text,
         content_type ? content_type : "text/plain",
         body_len);
     if (hn < 0) return NULL;
-    /* MYON-REVIEW CRITICAL: snprintf() returns the would-have-written length.
+    /* C-2 fix: snprintf() returns the would-have-written length, not what fit.
      * If status_text/content_type are long enough to truncate this 512-byte
-     * stack buffer, hn can be >= sizeof(header), and the memcpy below reads
-     * past `header`.  Treat hn >= sizeof(header) as an error or allocate the
-     * header using the reported size. */
+     * stack buffer, hn becomes >= sizeof(header) and copying `hn` bytes would
+     * read past `header`.  Treat truncation as an error. */
+    if (hn >= (int)sizeof(header)) return NULL;
     size_t total = (size_t)hn + body_len;
     char *buf = (char *)malloc(total + 1);
     if (!buf) return NULL;
