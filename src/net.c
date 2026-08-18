@@ -265,6 +265,10 @@ int net_connect_check(NetState *st, int sock_id, char **err_msg) {
 
 long long net_send(NetState *st, int sock_id, const char *data, long long len, char **err_msg) {
     if (!valid_id(st, sock_id)) { if (err_msg) *err_msg = dup_msg("invalid socket id"); return -1; }
+    /* MYON-REVIEW CRITICAL: len is a signed VM value.  If a caller passes a
+     * negative length, this cast turns it into a huge size_t and send() may read
+     * far past `data`.  Reject len < 0 (and preferably clamp to SSIZE_MAX)
+     * before this syscall. */
     ssize_t n = send(st->fds[sock_id], data, (size_t)len, MSG_NOSIGNAL);
     if (n < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) return -2;
@@ -276,6 +280,9 @@ long long net_send(NetState *st, int sock_id, const char *data, long long len, c
 
 long long net_recv(NetState *st, int sock_id, char *buf, long long buf_len, char **err_msg) {
     if (!valid_id(st, sock_id)) { if (err_msg) *err_msg = dup_msg("invalid socket id"); return -1; }
+    /* MYON-REVIEW CRITICAL: buf_len < 0 becomes a huge size_t here, allowing
+     * recv() to write past the interpreter-owned buffer.  Validate buf_len >= 0
+     * before calling into the kernel. */
     ssize_t n = recv(st->fds[sock_id], buf, (size_t)buf_len, 0);
     if (n < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) return -2;
@@ -290,6 +297,8 @@ long long net_sendto(NetState *st, int sock_id, const char *data, long long len,
     if (!valid_id(st, sock_id)) { if (err_msg) *err_msg = dup_msg("invalid socket id"); return -1; }
     struct sockaddr_in sa;
     if (fill_addr(&sa, host, port, st->kinds[sock_id], err_msg) < 0) return -1;
+    /* MYON-REVIEW CRITICAL: same signed-to-size_t bug as net_send(); a negative
+     * len can make sendto() read an attacker-sized region from `data`. */
     ssize_t n = sendto(st->fds[sock_id], data, (size_t)len, 0,
                        (struct sockaddr *)&sa, sizeof(sa));
     if (n < 0) {
@@ -305,6 +314,8 @@ long long net_recvfrom(NetState *st, int sock_id, char *buf, long long buf_len,
     if (!valid_id(st, sock_id)) { if (err_msg) *err_msg = dup_msg("invalid socket id"); return -1; }
     struct sockaddr_in from;
     socklen_t flen = sizeof(from);
+    /* MYON-REVIEW CRITICAL: same signed-to-size_t bug as net_recv(); a negative
+     * buf_len can turn into an oversized kernel write into `buf`. */
     ssize_t n = recvfrom(st->fds[sock_id], buf, (size_t)buf_len, 0,
                          (struct sockaddr *)&from, &flen);
     if (n < 0) {

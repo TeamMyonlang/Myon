@@ -285,3 +285,27 @@ cc -std=c11 -g -O0 -fsanitize=address,undefined -fno-omit-frame-pointer \
   B-5（float 出力仕様のドキュメント化）を本追記で実施。あわせて
   インタプリタ／VM 実行系に `--version`（`-v`）オプションを追加し、
   現在のバージョンを **0.8.0** とした。
+
+---
+
+## C. 2026-08-18 追加コードレビューでマーキングした重大箇所
+
+今回は修正ではなく、後続修正で見落とさないためにコード上へ `MYON-REVIEW CRITICAL` コメントを入れてマーキングした。
+
+### C-1. 🔴 `src/net.c` の signed-to-size_t 変換による過大 read/write
+
+- **場所**: `net_send`, `net_recv`, `net_sendto`, `net_recvfrom`
+- **内容**: VM 由来の `long long len` / `buf_len` を負値チェックなしで `(size_t)` にキャストしている。
+  負値が入ると巨大な `size_t` に変換され、`send`/`sendto` は `data` の範囲外 read、
+  `recv`/`recvfrom` は `buf` の範囲外 write をカーネルに依頼し得る。
+- **推奨修正**: syscall 前に `len < 0` / `buf_len < 0` を拒否し、必要に応じて `SSIZE_MAX` / `INT_MAX`
+  相当に上限をクランプまたはエラー化する。
+
+### C-2. 🔴 `src/http.c` の `snprintf` 切り詰め時スタック範囲外 read
+
+- **場所**: `http_build_response`
+- **内容**: `snprintf(header, sizeof(header), ...)` の戻り値 `hn` は「実際に書けた長さ」ではなく
+  「書きたかった長さ」。`status_text` / `content_type` が長くて 512 byte の `header` が切り詰められると、
+  `hn >= sizeof(header)` になり、その後の `memcpy(buf, header, (size_t)hn)` がスタックバッファ外を読む。
+- **推奨修正**: `hn >= (int)sizeof(header)` をエラーとして扱うか、`snprintf(NULL, 0, ...)` / 動的確保で
+  報告サイズ分のヘッダーを作ってからコピーする。
