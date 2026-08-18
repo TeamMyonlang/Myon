@@ -62,7 +62,25 @@ LDLIBS  += $(WIN_OPENSSL_LDLIBS)
 else
 BIN      = myon
 ifeq ($(UNAME_S),Linux)
+# Linux: the C FFI dynamic loader (dlopen/dlsym/dlclose) lives in libdl.
 LDLIBS  += -ldl
+endif
+ifeq ($(UNAME_S),Darwin)
+# macOS build.
+#   * dlopen/dlsym/dlclose live in libSystem, so NO -ldl is needed (adding it
+#     would fail: there is no standalone libdl on macOS).
+#   * Homebrew keeps OpenSSL "keg-only" (not on the default compiler search
+#     path).  Rather than hard-code a prefix, ask brew where it is and fold the
+#     include/lib paths in automatically when brew + openssl are present.  This
+#     works for both Apple Silicon (/opt/homebrew) and Intel (/usr/local)
+#     without the caller having to set anything.  If brew/openssl is absent the
+#     variables are simply empty and the default -lssl/-lcrypto search is used
+#     (e.g. a MacPorts / system OpenSSL already on the path).
+BREW_OPENSSL := $(shell brew --prefix openssl@3 2>/dev/null)
+ifneq ($(BREW_OPENSSL),)
+CFLAGS  += -I$(BREW_OPENSSL)/include
+LDLIBS  += -L$(BREW_OPENSSL)/lib
+endif
 endif
 endif
 
@@ -94,15 +112,28 @@ $(BIN): $(OBJECTS)
 # stack traces stay readable, and it always produces a binary named
 # `myon_asan` so it never clobbers the real `myon` binary.
 #
-# NOTE on link libraries: the sanitizer build is Linux/native only (it is
-# meant for the sanitizer CI job).  It uses the Linux link line explicitly
-# (-lm -lssl -lcrypto -ldl) rather than $(LDLIBS) so a stray OS=Windows_NT or
-# a WIN_OPENSSL_LDLIBS override in the environment cannot leak in.
+# NOTE on link libraries: the sanitizer build is native-only (it is meant for
+# the sanitizer CI job, which runs on Linux/macOS -- never Windows).  It uses an
+# explicit POSIX link line rather than $(LDLIBS) so a stray OS=Windows_NT or a
+# WIN_OPENSSL_LDLIBS override in the environment cannot leak in.  -ldl is added
+# only on Linux (macOS has dlopen in libSystem and has no standalone libdl, so
+# linking -ldl there would fail); OpenSSL include/lib paths from Homebrew are
+# folded in on macOS via the same brew --prefix probe as the normal build.
 ASAN_BIN    = myon_asan
 ASAN_CC    ?= $(CC)
 ASAN_CFLAGS = -std=c11 -g -O0 -fsanitize=address,undefined \
               -fno-omit-frame-pointer
-ASAN_LDLIBS = -lm -lssl -lcrypto -ldl
+ASAN_LDLIBS = -lm -lssl -lcrypto
+ifeq ($(UNAME_S),Linux)
+ASAN_LDLIBS += -ldl
+endif
+ifeq ($(UNAME_S),Darwin)
+ASAN_BREW_OPENSSL := $(shell brew --prefix openssl@3 2>/dev/null)
+ifneq ($(ASAN_BREW_OPENSSL),)
+ASAN_CFLAGS += -I$(ASAN_BREW_OPENSSL)/include
+ASAN_LDLIBS += -L$(ASAN_BREW_OPENSSL)/lib
+endif
+endif
 
 asan: $(ASAN_BIN)
 

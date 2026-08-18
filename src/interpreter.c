@@ -19,7 +19,13 @@
 #ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 199309L
 #endif
+/* macOS: re-expose the BSD/POSIX extras (stat, select, arc4random) that the
+ * strict _POSIX_C_SOURCE selection would otherwise hide on Darwin. */
+#if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)
+#define _DARWIN_C_SOURCE 1
+#endif
 
+#include "platform.h"
 #include "interpreter.h"
 #include "value.h"
 #include "env.h"
@@ -58,7 +64,7 @@
  * the Windows synchronous single-fd wait is delegated to net.c via
  * net_sync_wait_fd(), which owns the Winsock headers cleanly.  See
  * docs/myon_spec.md 10.7 / 14.9. */
-#if defined(__linux__)
+#if defined(MYON_OS_POSIX)
 #include <sys/select.h>
 #include <sys/stat.h>
 #endif
@@ -1732,17 +1738,30 @@ static void random_ensure_seeded(Interp *it) {
  * Returns 0 on success, -1 on failure.  This backs myon.random.secure_int,
  * which (unlike the srand/rand-based helpers above) is safe for tokens/keys
  * (addresses known-issue.md "myon.random is not cryptographically safe").
- * Linux: read from /dev/urandom (portable across kernels without pulling in
- * <sys/random.h>/getrandom feature-test macros).  Other platforms currently
- * report failure so callers surface a clear error rather than a weak value. */
+ * macOS/BSD: arc4random_buf() (the OS CSPRNG; cannot fail, no fd needed).
+ * Linux and other POSIX targets: read from /dev/urandom (portable across
+ * kernels without pulling in <sys/random.h>/getrandom feature-test macros).
+ * Platforms with no OS CSPRNG report failure so callers surface a clear error
+ * rather than a weak value.  See platform.h (MYON_HAVE_ARC4RANDOM /
+ * MYON_HAVE_DEV_URANDOM). */
 static int random_secure_bytes(unsigned char *buf, size_t n) {
-#if defined(__linux__)
+#if defined(MYON_HAVE_ARC4RANDOM)
+    /* macOS/BSD: arc4random_buf() is the OS CSPRNG.  It cannot fail and needs
+     * no file descriptor, so it is preferred over /dev/urandom there. */
+    arc4random_buf(buf, n);
+    return 0;
+#elif defined(MYON_HAVE_DEV_URANDOM)
+    /* Linux (and any other POSIX target without arc4random): read the OS
+     * CSPRNG from /dev/urandom.  Portable across kernels without pulling in
+     * <sys/random.h>/getrandom feature-test macros. */
     FILE *f = fopen("/dev/urandom", "rb");
     if (!f) return -1;
     size_t got = fread(buf, 1, n, f);
     fclose(f);
     return (got == n) ? 0 : -1;
 #else
+    /* No OS CSPRNG on this platform: report failure so callers surface a clear
+     * error rather than handing back a weak (srand/rand) value. */
     (void)buf; (void)n;
     return -1;
 #endif
@@ -1862,7 +1881,7 @@ static void net_wait_fd(Interp *it, int fd, int for_write) {
         return;
     }
     /* synchronous fallback: block on just this fd */
-#if defined(__linux__)
+#if defined(MYON_OS_POSIX)
     fd_set fds; FD_ZERO(&fds); FD_SET(fd, &fds);
     if (for_write) select(fd + 1, NULL, &fds, NULL, NULL);
     else           select(fd + 1, &fds, NULL, NULL, NULL);
@@ -3459,7 +3478,7 @@ static void http_serve_static_conn(Interp *it, NetState *st, int conn_id,
                                    body, strlen(body), &resp_len);
     } else {
         int is_regular = 1;
-#if defined(__linux__)
+#if defined(MYON_OS_POSIX)
         /* Only serve regular files: fopen("rb") on a directory or special
          * file makes ftell() indeterminate (known-issue.md #3).  stat() +
          * S_ISREG() rejects directories/FIFOs/devices up front. */
