@@ -81,5 +81,21 @@ for t in tests/cases/*.myon; do
     fi
 done
 
+# CLI smoke test: --version / -v must print "myon <X.Y.Z>" and exit 0.
+check_version_flag() {
+    local flag="$1"
+    local got rc
+    got=$("$MYON" "$flag" 2>/dev/null); rc=$?
+    if [ "$rc" -eq 0 ] && [[ "$got" =~ ^myon\ [0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        echo "  ok   cli_version ($flag -> '$got')"
+        pass=$((pass + 1))
+    else
+        echo "  FAIL cli_version ($flag: exit $rc, got '$got')"
+        fail=$((fail + 1))
+    fi
+}
+check_version_flag --version
+check_version_flag -v
+
 echo "== results: $pass passed, $fail failed =="
 [ "$fail" -eq 0 ]

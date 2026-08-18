@@ -113,6 +113,7 @@ Windows ビルドでは Makefile が自動的に出力名を `myon.exe` とし�
 ./myon --tokens examples/hello.myon # トークン列を出力
 ./myon --tokens -                   # 標準入力から読み込む
 ./myon --help                       # 使い方を表示
+./myon --version                    # バージョンを表示（-v も可）
 ```
 
 ファイル引数は内容と拡張子で振り分けられます。先頭が `MYC1` マジックのバイトコード

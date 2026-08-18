@@ -2489,14 +2489,23 @@ static int call_stdlib(Interp *it, Env *env, const char *name, Expr *call, Value
         const char *csep = sep.as.obj->as.str;
         size_t seplen = strlen(csep);
         ArrayData *a = &parts.as.obj->as.arr;
-        size_t total = 1;
+        /* Accumulate the buffer size through the checked helpers (B-3) so a huge
+         * array of strings cannot wrap `total` and under-allocate `buf`. */
+        size_t total = 1; /* trailing NUL */
+        int overflow = 0;
         for (int i = 0; i < a->count; i++) {
             if (a->items[i].type != TYPE_STR) {
                 value_free(&parts); value_free(&sep);
                 runtime_error(it, line, "myon.string.join: array elements must be str");
             }
-            total += strlen(a->items[i].as.obj->as.str);
-            if (i) total += seplen;
+            if (!checked_add_size(total, strlen(a->items[i].as.obj->as.str), &total))
+                { overflow = 1; break; }
+            if (i && !checked_add_size(total, seplen, &total))
+                { overflow = 1; break; }
+        }
+        if (overflow) {
+            value_free(&parts); value_free(&sep);
+            runtime_error(it, line, "myon.string.join: result too large");
         }
         char *buf = (char *)myon_xmalloc(total);
         buf[0] = '\0';
@@ -2632,16 +2641,18 @@ static int call_stdlib(Interp *it, Env *env, const char *name, Expr *call, Value
         }
         const char *cs = s.as.obj->as.str;
         size_t unit = strlen(cs);
-        size_t total;
+        size_t total, alloc;
         /* Guard the size computation against multiplication overflow: a wrapped
          * `unit * n` would under-allocate and let the memcpy loop write past the
-         * buffer (heap-buffer-overflow).  Refuse before allocating. */
-        if (__builtin_mul_overflow(unit, (size_t)n, &total) || total > SIZE_MAX - 1) {
+         * buffer (heap-buffer-overflow).  Route it through the shared checked
+         * helpers (B-3) so the `* n` and the `+ 1` NUL byte are both verified. */
+        if (!checked_mul_size(unit, (size_t)n, &total) ||
+            !checked_add_size(total, 1, &alloc)) {
             *out = make_result_pair(value_str(myon_strdup("")),
                 value_error(myon_strdup("myon.string.repeat: result too large")));
             value_free(&s); value_free(&vn); return 1;
         }
-        char *buf = (char *)myon_xmalloc(total + 1);
+        char *buf = (char *)myon_xmalloc(alloc);
         for (long long i = 0; i < n; i++) memcpy(buf + (size_t)i * unit, cs, unit);
         buf[total] = '\0';
         *out = make_result_pair(value_str(buf), value_nil());

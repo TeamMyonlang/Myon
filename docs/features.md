@@ -408,7 +408,9 @@ Linux 専用だった実行時レイヤ（C FFI・ソケット・協調的イベ
 
 `./myon foo.myon` は従来どおりツリーウォーク実行、`./myon foo.myc` は MVM VM
 実行、`./myon --compile foo.myon [-o out.myc]` はコンパイルのみ（実行しない）、
-`./myon --dump-bytecode foo.myon` は逆アセンブル表示です。MVM が対応する
+`./myon --dump-bytecode foo.myon` は逆アセンブル表示です。`./myon --help`
+（`-h`）で使い方、`./myon --version`（`-v`）でバージョン（現在 0.8.0）を
+表示します。MVM が対応する
 言語機能（M0〜M8：リテラル・算術・比較・論理・変数・スコープ・制御構文・関数・
 複数戻り値・ネイティブ呼び出し・文字列補間・キャスト・配列/マップ・構造体/
 メソッド）の範囲では、ツリーウォークと MVM の出力が一致することを

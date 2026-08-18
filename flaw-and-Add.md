@@ -31,7 +31,11 @@ cc -std=c11 -g -O0 -fsanitize=address,undefined -fno-omit-frame-pointer \
 深刻度の凡例: 🔴 重大（メモリ破壊 / クラッシュ） / 🟠 中（誤結果・整合性） / 🟡 低（表示・往復性）
 
 > **修正ステータス（2026-08-17 更新）**: A-1〜A-6 は本 PR で**すべて修正済み**。
-> 各項目末尾に ✅ 修正内容を追記した。B 群（Add）は今回対象外。
+> 各項目末尾に ✅ 修正内容を追記した。
+>
+> **追記（2026-08-18）**: B 群（Add）も対応を進め、B-1〜B-5 をすべて ✅ 済みに
+> した（B-3 の共通オーバーフローヘルパー導入、B-5 の float 出力仕様ドキュメント化）。
+> あわせてインタプリタに `--version`（`-v`）オプションを追加（バージョン 0.8.0）。
 
 ### A-1. 🔴 `myon.string.repeat` の乗算オーバーフローによるヒープバッファオーバーフロー
 
@@ -230,6 +234,12 @@ cc -std=c11 -g -O0 -fsanitize=address,undefined -fno-omit-frame-pointer \
 - **提案**: `checked_add_size` / `checked_mul_size`（`__builtin_*_overflow` ラッパ）を
   用意し、確保サイズ計算・範囲チェックを全部それ経由にする。`substring`/`slice`/
   `repeat`/`join` を一巡して置換。
+- **✅ 対応済み**: `src/common.h` に `checked_add_size` / `checked_mul_size`
+  （`__builtin_*_overflow` ラッパ、成功で `true`）を追加。`myon.string.repeat`
+  のサイズ計算（`unit * n` と `+1`）と `myon.string.join` の累積サイズ計算を
+  これ経由に置換し、`join` にも `result too large` エラーを追加した。`substring`/
+  `slice` の境界チェックは A-2/A-3 で既に個別比較（`len > n - start`）へ書き換え
+  済みで UB は無い。`make` 警告ゼロ・全テスト緑、`make test-asan` でも検出なし。
 
 ### B-4. 境界値・オーバーフローの回帰テストケース
 - 現状 121 ケースありますが、上記のような**極端な整数入力**のケースが不足。
@@ -245,6 +255,11 @@ cc -std=c11 -g -O0 -fsanitize=address,undefined -fno-omit-frame-pointer \
 ### B-5. float 出力仕様のドキュメント化 + テスト
 - A-6 の修正に合わせ、「float の文字列化は最短往復表現」を仕様書
   （`docs/myon_spec.md`）に明記し、往復テスト（print→to_float で一致）を追加。
+- **✅ 対応済み**: `docs/myon_spec.md` 10.4 節に「float の文字列化仕様（最短往復
+  表現）」小節を追加し、`%.15g`→`%.16g`→`%.17g` 選択・整数値への `.0` 付与・
+  `nan`/`inf`/`-inf` 表記・両実行経路共通であることを明記。`from_float` の表の
+  説明も更新。往復テストは `tests/cases/p_float_roundtrip`（print→to_float 一致）
+  として既に存在する。
 
 ---
 
@@ -263,6 +278,10 @@ cc -std=c11 -g -O0 -fsanitize=address,undefined -fno-omit-frame-pointer \
 - A-1〜A-3 は「`int_arith` は守っているのに stdlib の境界計算だけ生の演算」という
   **一貫性の欠如**が根本原因で、B-3 の共通ヘルパー導入で面的に解消できます。
 - **本 PR で A-1〜A-6 をすべて修正済み**。通常ビルドは警告ゼロ・全テスト
-  グリーン（60/68/38 passed）、ASan/UBSan ビルドでも各再現ケースが
+  グリーン、ASan/UBSan ビルドでも各再現ケースが
   クラッシュ・UB なくエラー値／構文エラーを返すことを確認しました。
-  B 群（Add）は今回対象外。
+- **B 群（Add）も B-1〜B-5 をすべて対応済み**。B-3（共通オーバーフロー安全
+  ヘルパー `checked_add_size`/`checked_mul_size` の導入と stdlib への適用）と
+  B-5（float 出力仕様のドキュメント化）を本追記で実施。あわせて
+  インタプリタ／VM 実行系に `--version`（`-v`）オプションを追加し、
+  現在のバージョンを **0.8.0** とした。
