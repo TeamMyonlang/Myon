@@ -1,0 +1,10 @@
+# Regression for flaw-and-Add.md A-5: myon.string.to_int set errno=0 but
+# never checked errno==ERANGE, so an out-of-range string saturated to
+# LLONG_MAX and was reported as a success (error=nil).  After the fix an
+# overflowing input must return an "out of range" error value.
+module myon.stdio
+module myon.string
+
+v, e = myon.string.to_int(str("99999999999999999999"))
+myon.print(e)
+myon.print(v)

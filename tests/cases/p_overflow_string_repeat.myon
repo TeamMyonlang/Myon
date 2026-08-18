@@ -1,0 +1,12 @@
+# Regression for flaw-and-Add.md A-1: myon.string.repeat multiplication
+# overflow used to allocate a far-too-small buffer and memcpy past it
+# (heap-buffer-overflow / SIGSEGV).  After the fix a huge `n` must return a
+# clean `error` value ("result too large") instead of crashing.
+#   unit=16, n=2^60 -> 16 * 2^60 = 2^64 wraps to 0 in size_t.
+system myon.useversion=1
+module myon.stdio
+module myon.string
+
+r, e = myon.string.repeat(str("0123456789ABCDEF"), 1152921504606846976)
+myon.print(e)
+myon.print(myon.string.length(r))

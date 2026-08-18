@@ -211,12 +211,18 @@ cc -std=c11 -g -O0 -fsanitize=address,undefined -fno-omit-frame-pointer \
 - `.github/workflows/` が無く、`make test` の自動実行がありません。
 - **提案**: push/PR で `make && make test` を回す最小 CI を追加。可能なら
   複数コンパイラ（gcc/clang）でのマトリクスも。
+- **✅ 対応済み**: `.github/workflows/ci.yml` を追加。push(main)/PR で gcc・clang
+  の 2 系統について `make` + `make test` を実行する。重いチェック（sanitizer・
+  Windows クロス・ベンチ・macOS）は `.github/workflows/heavy-checks.yml` に分離。
 
 ### B-2. Sanitizer ビルドターゲット / Sanitizer 走行の CI ジョブ
 - 今回の A-1〜A-3 は ASan/UBSan で**確定的に**再現できました。
 - **提案**: `Makefile` に `make asan`（`-fsanitize=address,undefined`）ターゲットを
   追加し、CI で「ASan/UBSan つきで `make test`」を1本走らせる。UB や
   ヒープオーバーフローの再発を自動検出できます。
+- **✅ 対応済み**: `Makefile` に `make asan` / `make test-asan` を追加
+  （`-fsanitize=address,undefined`）。`heavy-checks.yml` の sanitizer ジョブが
+  `make test-asan` を実行し、ASan/UBSan の検出をジョブ失敗として表面化させる。
 
 ### B-3. stdlib の数値/サイズ計算に共通のオーバーフロー安全ヘルパー
 - A-1〜A-3 は「境界チェックの生の `+` / `*`」が原因。`int_arith` は守られているのに
@@ -230,6 +236,11 @@ cc -std=c11 -g -O0 -fsanitize=address,undefined -fno-omit-frame-pointer \
 - **提案**: `repeat`/`substring`/`slice`/`to_int`/整数リテラルについて、
   「巨大値を渡したら（クラッシュせず）明示エラーが返る」ことを検証する
   `.myon` + `.expected`（もしくは `.err`）ケースを追加。
+- **✅ 対応済み**: `tests/cases/p_overflow_*`（repeat / substring / slice /
+  to_int / to_float / 整数リテラル dec・hex・oct）と `p_float_roundtrip` を追加。
+  巨大値で明示エラーが返る系は `.out` で値まで固定し、整数リテラル桁あふれは
+  構文エラー（非ゼロ終了）を `.err` で固定。ツリーウォークと MVM の両経路で
+  緑、`make test-asan` でも検出なしを確認済み。
 
 ### B-5. float 出力仕様のドキュメント化 + テスト
 - A-6 の修正に合わせ、「float の文字列化は最短往復表現」を仕様書

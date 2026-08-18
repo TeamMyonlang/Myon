@@ -1,0 +1,3 @@
+# Expect a non-zero exit: a decimal integer literal beyond the 64-bit
+# range is a syntax error ("integer literal out of range"). Only the
+# non-zero exit is pinned, not the exact message text.

@@ -1,0 +1,7 @@
+# Regression for flaw-and-Add.md A-4: a decimal integer literal that exceeds
+# the 64-bit range used to be silently clamped to LLONG_MAX by strtoll (ERANGE
+# ignored).  After the fix it must be a syntax error ("integer literal out of
+# range"), i.e. a non-zero exit.
+module myon.stdio
+a = 99999999999999999999999999
+myon.print(a)

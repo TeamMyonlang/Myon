@@ -2,6 +2,8 @@
 /build/
 /myon
 /myon.exe
+/myon_asan
+/myon.asan-backup
 *.o
 tests/fixtures/libffi_callback_test.so
 

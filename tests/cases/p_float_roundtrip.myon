@@ -1,0 +1,18 @@
+# Regression for flaw-and-Add.md A-6: float stringification used "%g" (6
+# significant digits) and lost precision, so print -> re-parse did not round
+# trip.  After the fix the shortest round-tripping representation is used and
+# integer-valued finite floats get a trailing ".0".
+module myon.stdio
+module myon.string
+
+# Direct print of a few doubles that %g used to mangle.
+myon.print(123456789.0)
+myon.print(3.141592653589793)
+myon.print(1024.0)
+
+# print -> to_float round-trip must recover the same value.
+s = myon.string.from_float(3.141592653589793)
+myon.print(s)
+v, e = myon.string.to_float(s)
+myon.print(e)
+myon.print(v == 3.141592653589793)
