@@ -1,0 +1,55 @@
+# Lightweight PR / push CI for Myon (TODO section 3).
+#
+# Runs on every push to main and on every pull request, building the
+# interpreter with two compilers (gcc and clang) and running the full
+# `make test` suite. This is the fast per-commit gate; the heavier
+# sanitizer / cross / benchmark / macOS checks live in heavy-checks.yml.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs on the same ref to save CI minutes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: build & test (${{ matrix.cc }})
+    runs-on: ubuntu-latest
+    strategy:
+      # Don't cancel the clang job just because gcc failed (or vice versa);
+      # we want to see both results.
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        # OpenSSL dev headers are required (Makefile LDLIBS uses -lssl
+        # -lcrypto for myon.http). ubuntu-latest ships gcc; clang is pulled
+        # in explicitly so the matrix's clang leg has a compiler.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libssl-dev clang
+
+      - name: Compiler version
+        run: ${{ matrix.cc }} --version
+
+      - name: Build
+        # The Makefile honours the CC variable, so the matrix compiler flows
+        # straight through with no Makefile changes.
+        run: make CC=${{ matrix.cc }}
+
+      - name: Run test suite
+        # `make test` runs run_tests.sh (which also cc-builds the FFI
+        # callback .so), mvm_compiler_tests.sh and run_mvm_tests.sh.
+        run: make CC=${{ matrix.cc }} test
