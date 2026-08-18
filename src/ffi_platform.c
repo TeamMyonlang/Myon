@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "platform.h"
 #include "ffi_platform.h"
 
 #include <stdint.h>
@@ -30,7 +31,14 @@ static char *ffi_dup(const char *s) {
     return p;
 }
 
-#if defined(__linux__)
+/*
+ * POSIX (Linux, macOS, the BSDs): the C FFI dynamic loader is the standard
+ * dlopen/dlsym/dlclose family from <dlfcn.h>.  macOS ships exactly this API in
+ * libSystem (no extra link flag), so it shares the Linux implementation rather
+ * than the old "not supported on macOS yet" stub that used to sit here.  See
+ * platform.h (MYON_HAVE_DLOPEN).
+ */
+#if defined(MYON_HAVE_DLOPEN)
 
 #include <dlfcn.h>
 
@@ -70,31 +78,6 @@ void ffi_platform_close(FFILib *lib) {
 
 int ffi_platform_supported(void) {
     return 1;
-}
-
-#elif defined(__APPLE__)
-
-/* Phase3 stub.  macOS ships the same dlopen family, so a real implementation
- * can be added here later; for now FFI is intentionally unavailable. */
-struct FFILib { int unused; };
-
-FFILib *ffi_platform_load(const char *path, char **err_msg) {
-    (void)path;
-    if (err_msg) *err_msg = ffi_dup("FFI is not supported on macOS yet (Phase3 stub)");
-    return NULL;
-}
-
-void *ffi_platform_sym(FFILib *lib, const char *name) {
-    (void)lib; (void)name;
-    return NULL;
-}
-
-void ffi_platform_close(FFILib *lib) {
-    (void)lib;
-}
-
-int ffi_platform_supported(void) {
-    return 0;
 }
 
 #elif defined(_WIN32)

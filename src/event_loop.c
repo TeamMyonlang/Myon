@@ -15,14 +15,23 @@
  */
 
 /* Feature-test macros must precede every system header: glibc gates
- * makecontext/swapcontext, clock_gettime and CLOCK_MONOTONIC behind these. */
+ * makecontext/swapcontext, clock_gettime and CLOCK_MONOTONIC behind these,
+ * and macOS gates the ucontext family behind _XOPEN_SOURCE as well (without it
+ * <ucontext.h> is an empty header on Darwin). */
 #ifndef _XOPEN_SOURCE
 #  define _XOPEN_SOURCE 700
 #endif
 #ifndef _DEFAULT_SOURCE
 #  define _DEFAULT_SOURCE 1
 #endif
+/* macOS: _XOPEN_SOURCE alone hides makecontext() from <ucontext.h>; the Darwin
+ * headers additionally require _DARWIN_C_SOURCE to re-expose the ucontext
+ * family (and the BSD socket extras used elsewhere). */
+#if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)
+#  define _DARWIN_C_SOURCE 1
+#endif
 
+#include "platform.h"
 #include "event_loop.h"
 
 #include <stdlib.h>
@@ -30,20 +39,31 @@
 #include <stdio.h>
 
 /*
- * ucontext availability.  Linux glibc provides <ucontext.h>; other platforms
- * fall back to an unsupported stub (mirrors ffi_platform.c's policy).
+ * Cooperative-coroutine backend selection.
+ *
+ *   * POSIX (Linux, macOS, the BSDs) use the ucontext family
+ *     (getcontext/makecontext/swapcontext).  macOS/BSD are full POSIX targets
+ *     here -- the previous `#if defined(__linux__)` guard wrongly excluded them
+ *     and sent macOS to the unsupported stub, silently disabling the whole
+ *     async event loop.  See platform.h (MYON_HAVE_UCONTEXT).
+ *   * Windows lacks ucontext; the loop is built on the Win32 Fiber API
+ *     (ConvertThreadToFiber/CreateFiber/SwitchToFiber/DeleteFiber).  See the
+ *     #elif defined(_WIN32) block far below and docs/myon_spec.md 14.9.
  */
-#if defined(__linux__)
+#if defined(MYON_HAVE_UCONTEXT)
 #  define MYON_EVENT_LOOP_UCONTEXT 1
-#elif defined(_WIN32)
-/* Windows lacks ucontext; the cooperative event loop is instead built on the
- * Win32 Fiber API (ConvertThreadToFiber/CreateFiber/SwitchToFiber/DeleteFiber).
- * See the #elif defined(_WIN32) block far below and docs/myon_spec.md 14.9. */
+#elif defined(MYON_OS_WINDOWS)
 #  define MYON_EVENT_LOOP_FIBER 1
 #endif
 
 #ifdef MYON_EVENT_LOOP_UCONTEXT
 
+/* macOS marks the ucontext routines "deprecated"; <sys/ucontext.h> is the
+ * documented way to pull them in without the deprecation attribute, and works
+ * identically on Linux/BSD where it simply forwards to <ucontext.h>. */
+#if defined(__APPLE__)
+#  include <sys/ucontext.h>
+#endif
 #include <ucontext.h>
 #include <sys/select.h>
 #include <sys/time.h>

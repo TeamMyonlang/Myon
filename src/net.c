@@ -22,14 +22,27 @@
 #ifndef _DEFAULT_SOURCE
 #  define _DEFAULT_SOURCE 1
 #endif
+/* macOS: SO_NOSIGPIPE and the BSD socket extras live behind _DARWIN_C_SOURCE.
+ * Must be set before <sys/socket.h> is pulled in. */
+#if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)
+#  define _DARWIN_C_SOURCE 1
+#endif
 
+#include "platform.h"
 #include "net.h"
 
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 
-#if defined(__linux__)
+/*
+ * BSD-socket implementation is used on every POSIX target (Linux, macOS, the
+ * BSDs).  The previous `#if defined(__linux__)` guard sent macOS/BSD to the
+ * unsupported stub even though they share the exact same socket API, which
+ * disabled myon.net entirely on those platforms.  See platform.h
+ * (MYON_HAVE_POSIX_SOCKETS).
+ */
+#if defined(MYON_HAVE_POSIX_SOCKETS)
 #  define MYON_NET_POSIX 1
 #endif
 
@@ -73,6 +86,35 @@ static int set_nonblocking(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags < 0) return -1;
     return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+/*
+ * SIGPIPE suppression.
+ *
+ * Writing to a socket whose peer has closed raises SIGPIPE, which kills the
+ * process by default.  There are two portable ways to avoid this:
+ *
+ *   Linux : pass MSG_NOSIGNAL to each send()          (per-call flag)
+ *   macOS/: set the SO_NOSIGPIPE socket option once   (per-socket)
+ *   BSD     at socket-creation time; MSG_NOSIGNAL does not exist there.
+ *
+ * MYON_SEND_FLAGS is the flag to OR into send(); net_suppress_sigpipe() sets
+ * the socket option on the platforms that need it (a no-op elsewhere).  Between
+ * the two, no send() on any supported platform can take the process down with
+ * SIGPIPE. */
+#if defined(MYON_HAVE_MSG_NOSIGNAL)
+#  define MYON_SEND_FLAGS MSG_NOSIGNAL
+#else
+#  define MYON_SEND_FLAGS 0
+#endif
+
+static void net_suppress_sigpipe(int fd) {
+#if defined(MYON_HAVE_SO_NOSIGPIPE)
+    int on = 1;
+    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof(on));
+#else
+    (void)fd;
+#endif
 }
 
 static int valid_id(NetState *st, int id) {
@@ -173,6 +215,7 @@ int net_socket_create(NetState *st, int kind, char **err_msg) {
     if (fd < 0) { if (err_msg) *err_msg = dup_errno("socket"); return -1; }
     int one = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    net_suppress_sigpipe(fd); /* macOS/BSD: block SIGPIPE on writes (no-op on Linux) */
     if (set_nonblocking(fd) < 0) {
         if (err_msg) *err_msg = dup_errno("fcntl(O_NONBLOCK)");
         close(fd);
@@ -226,6 +269,7 @@ int net_try_accept(NetState *st, int listen_sock_id, char **peer_addr_out,
         if (err_msg) *err_msg = dup_errno("accept");
         return -1;
     }
+    net_suppress_sigpipe(cfd); /* macOS/BSD: accepted fd also needs SO_NOSIGPIPE */
     if (set_nonblocking(cfd) < 0) {
         if (err_msg) *err_msg = dup_errno("fcntl(O_NONBLOCK)");
         close(cfd);
@@ -269,7 +313,9 @@ long long net_send(NetState *st, int sock_id, const char *data, long long len, c
      * negative length, this cast turns it into a huge size_t and send() may read
      * far past `data`.  Reject len < 0 (and preferably clamp to SSIZE_MAX)
      * before this syscall. */
-    ssize_t n = send(st->fds[sock_id], data, (size_t)len, MSG_NOSIGNAL);
+    /* MYON_SEND_FLAGS is MSG_NOSIGNAL on Linux and 0 on macOS/BSD (where the
+     * SO_NOSIGPIPE option set at socket creation suppresses SIGPIPE instead). */
+    ssize_t n = send(st->fds[sock_id], data, (size_t)len, MYON_SEND_FLAGS);
     if (n < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) return -2;
         if (err_msg) *err_msg = dup_errno("send");
