@@ -1,11 +1,12 @@
 # Release workflow for Myon (TODO section 4.5).
 #
 # Manual-only (workflow_dispatch). The operator chooses pre vs stable and
-# types a version; the tag string is derived from those inputs. Both the
-# Linux `myon` and the Windows `myon.exe` are built first, and the GitHub
-# Release is only created if BOTH builds succeed (no half-a-release). Tags
-# are always newly created, never overwritten -- pre tags carry a
-# date+sequence suffix so repeated runs stack up as distinct tags.
+# types a version; the tag string is derived from those inputs. The Linux
+# `myon`, the Windows `myon.exe` and the macOS Apple Silicon `myon` (arm64,
+# built natively on macos-15) are all built first, and the GitHub Release is
+# only created if ALL builds succeed (no half-a-release). Tags are always
+# newly created, never overwritten -- pre tags carry a date+sequence suffix
+# so repeated runs stack up as distinct tags.
 name: Release
 
 on:
@@ -177,11 +178,53 @@ jobs:
           if-no-files-found: error
 
   # ------------------------------------------------------------------ #
-  # 3. Publish the release -- only if BOTH builds succeeded.          #
+  # 2b. Build the macOS Apple Silicon binary (myon, arm64) natively.  #
+  #                                                                    #
+  # Built on a real Apple Silicon runner (macos-15) so the shipped    #
+  # binary is a genuine arm64 macOS build, not a cross-compile. The    #
+  # Makefile's Darwin branch folds in Homebrew OpenSSL automatically.  #
+  # ------------------------------------------------------------------ #
+  build-macos:
+    name: build macos (arm64 native)
+    needs: prepare
+    runs-on: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install OpenSSL (Homebrew)
+        run: |
+          set -eux
+          brew install openssl@3 || brew upgrade openssl@3 || true
+          brew --prefix openssl@3
+
+      - name: Build
+        run: |
+          set -eux
+          make
+          file myon
+
+      - name: Run test suite (sanity)
+        # Sanity-run the suite on the release binary so we never ship a macOS
+        # build that fails its own tests.
+        run: make test
+
+      - name: Rename asset (OS-identifiable name)
+        run: cp myon myon-macos-arm64
+
+      - name: Upload macOS binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: myon-macos-arm64
+          path: myon-macos-arm64
+          if-no-files-found: error
+
+  # ------------------------------------------------------------------ #
+  # 3. Publish the release -- only if ALL builds succeeded.           #
   # ------------------------------------------------------------------ #
   release:
     name: publish release
-    needs: [prepare, build-linux, build-windows]
+    needs: [prepare, build-linux, build-windows, build-macos]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -197,6 +240,12 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: myon-windows-x86_64
+          path: dist
+
+      - name: Download macOS artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: myon-macos-arm64
           path: dist
 
       - name: Create release notes
@@ -220,6 +269,7 @@ jobs:
             echo "## Assets"
             echo "- \`myon-linux-x86_64\` — Linux x86_64 binary"
             echo "- \`myon-windows-x86_64.exe\` — Windows x86_64 binary"
+            echo "- \`myon-macos-arm64\` — macOS Apple Silicon (arm64) binary"
           } > release-notes.md
           cat release-notes.md
 
@@ -238,6 +288,7 @@ jobs:
           gh release create "${TAG}" \
             dist/myon-linux-x86_64 \
             dist/myon-windows-x86_64.exe \
+            dist/myon-macos-arm64 \
             --title "${TAG}" \
             --notes-file release-notes.md \
             --target "${GITHUB_SHA}" \

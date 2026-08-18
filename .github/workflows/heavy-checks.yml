@@ -1,11 +1,28 @@
 # Heavy build/check jobs for Myon (TODO section 4).
 #
-# These are the slow checks (AddressSanitizer/UBSan run, MinGW-w64
-# cross-build with a source-built Windows OpenSSL, benchmark, macOS build)
-# that are too expensive to run on every PR commit. They run on push to
-# main and can always be triggered by hand (workflow_dispatch) for
-# verification. The name deliberately avoids "nightly"/cron -- there is no
-# scheduled trigger.
+# These are the slow checks that are too expensive to run on every PR
+# commit. They run on push to main and can always be triggered by hand
+# (workflow_dispatch) for verification. The name deliberately avoids
+# "nightly"/cron -- there is no scheduled trigger.
+#
+# Jobs:
+#   1. sanitizer   - AddressSanitizer/UBSan run of the full suite (Linux).
+#   2. win-cross   - MinGW-w64 cross-build of myon.exe on Linux, using a
+#                    source-built Windows OpenSSL. This proves the Windows
+#                    code paths *compile*, but runs no tests.
+#   3. benchmark   - MVM micro-benchmark (Linux).
+#   4. win-native  - REAL Windows runner (windows-latest, MSYS2/MINGW64):
+#                    native `make` build of myon.exe with the packaged MinGW
+#                    OpenSSL, then the full `make test` suite is executed on
+#                    the actual machine. Artifact: myon-windows-x86_64-native.
+#   5. macos-native - REAL Apple Silicon runner (macos-15, arm64): native
+#                    `make` build of myon with Homebrew OpenSSL, then the full
+#                    `make test` suite on the actual hardware. Artifact:
+#                    myon-macos-arm64.
+#
+# win-native and macos-native are the "実機 build & test" jobs: unlike the
+# cross-build, they build *and run the tests* on the target OS itself, which
+# is what actually validates the macOS/Windows platform split in platform.h.
 name: Heavy checks
 
 on:
@@ -109,6 +126,140 @@ jobs:
         with:
           name: myon-windows-x86_64
           path: myon.exe
+          if-no-files-found: error
+
+  # ------------------------------------------------------------------ #
+  # Job 4: win-native -- REAL Windows runner build + full test suite.  #
+  #                                                                    #
+  # Unlike win-cross (which cross-builds on Linux and never runs the   #
+  # tests), this job runs on an actual Windows machine and executes    #
+  # `make test` there, so it validates the _WIN32 code paths at        #
+  # run time, not just at compile time.                                #
+  # ------------------------------------------------------------------ #
+  win-native:
+    name: win-native (windows-latest / MSYS2 MINGW64)
+    runs-on: windows-latest
+    # All run: steps use the MSYS2 MINGW64 login shell so `make`, `gcc`,
+    # bash and the packaged OpenSSL are all on PATH and the Makefile's
+    # OS=Windows_NT MinGW branch is taken (BIN=myon.exe, -lws2_32, default
+    # -lssl/-lcrypto against mingw-w64-x86_64-openssl).
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - name: Disable git autocrlf
+        # Keep LF endings so the bash test scripts and *.out golden fixtures
+        # are not corrupted by CRLF (which would break output comparisons).
+        # Must run before checkout, in the default Windows PowerShell.
+        run: git config --global core.autocrlf false
+        shell: pwsh
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSYS2 (MINGW64)
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          # make + a native MinGW GCC toolchain + OpenSSL dev package. The
+          # mingw-w64-x86_64-openssl package ships libssl/libcrypto and their
+          # import libraries where the default -lssl -lcrypto search finds
+          # them, so no WIN_OPENSSL_LDLIBS override is needed on real Windows.
+          install: >-
+            make
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-openssl
+
+      - name: Toolchain versions
+        run: |
+          set -eux
+          uname -a
+          gcc --version
+          make --version
+          openssl version || true
+
+      - name: Build (native Windows / MinGW)
+        # No Makefile overrides: the OS=Windows_NT branch already sets
+        # BIN=myon.exe and links -lws2_32 + -lssl -lcrypto.
+        run: |
+          set -eux
+          make
+          file myon.exe
+
+      - name: Run test suite (native Windows)
+        # MSYS2 bash resolves `./myon` to `./myon.exe`, so the existing bash
+        # test scripts run unmodified. FFI/net/async cases are already in the
+        # scripts' excluded set, so no Windows-specific skips are needed.
+        run: |
+          set -eux
+          make test
+
+      - name: Rename asset (OS-identifiable name)
+        run: cp myon.exe myon-windows-x86_64-native.exe
+
+      - name: Upload native Windows binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: myon-windows-x86_64-native
+          path: myon-windows-x86_64-native.exe
+          if-no-files-found: error
+
+  # ------------------------------------------------------------------ #
+  # Job 5: macos-native -- REAL Apple Silicon runner build + tests.    #
+  #                                                                    #
+  # Runs on macos-15 (arm64 / Apple Silicon). This is the job that     #
+  # actually exercises the macOS platform split added in platform.h    #
+  # (arc4random_buf, SO_NOSIGPIPE, ucontext via _DARWIN_C_SOURCE,      #
+  # dlopen in libSystem) on real hardware.                             #
+  # ------------------------------------------------------------------ #
+  macos-native:
+    name: macos-native (macos-15 / Apple Silicon arm64)
+    # macos-15 is Apple Silicon (arm64). macos-latest currently also maps to
+    # an Apple Silicon image, but we pin macos-15 so an image rotation cannot
+    # silently move this job onto Intel or a deprecated macOS 13/14.
+    runs-on: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install OpenSSL (Homebrew)
+        # openssl@3 is keg-only on macOS; the Makefile's Darwin branch runs
+        # `brew --prefix openssl@3` and folds the include/lib paths in
+        # automatically, so just make sure the keg is present.
+        run: |
+          set -eux
+          brew install openssl@3 || brew upgrade openssl@3 || true
+          brew --prefix openssl@3
+
+      - name: Toolchain versions
+        run: |
+          set -eux
+          uname -a
+          cc --version
+          make --version
+
+      - name: Build (native macOS / Apple Silicon)
+        # The Darwin branch adds the Homebrew OpenSSL -I/-L automatically and
+        # omits -ldl (dlopen lives in libSystem). No overrides needed.
+        run: |
+          set -eux
+          make
+          file myon
+
+      - name: Run test suite (native macOS)
+        run: |
+          set -eux
+          make test
+
+      - name: Rename asset (OS-identifiable name)
+        run: cp myon myon-macos-arm64
+
+      - name: Upload native macOS binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: myon-macos-arm64
+          path: myon-macos-arm64
           if-no-files-found: error
 
   # ------------------------------------------------------------------ #
