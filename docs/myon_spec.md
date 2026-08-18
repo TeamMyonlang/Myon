@@ -1141,7 +1141,7 @@ Unicodeコードポイント数（文字数）が必要な場合は `length_char
 | `to_int` | `(s: str) ret int, error` | 整数へパース（`strtoll`）。失敗時は`error` |
 | `to_float` | `(s: str) ret float, error` | 浮動小数点数へパース（`strtod`）。失敗時は`error` |
 | `from_int` | `(n: int) ret str` | 整数を文字列化 |
-| `from_float` | `(f: float) ret str` | 浮動小数点数を文字列化 |
+| `from_float` | `(f: float) ret str` | 浮動小数点数を文字列化（**最短往復表現**、下記参照） |
 
 ```myon
 myon.print(myon.string.length_chars(str("あ")))  // 1（文字数）
@@ -1151,6 +1151,31 @@ myon.print(myon.string.index_of(str("こんにちは"), str("にち")))  // 2（
 parts = myon.string.split(str("a,b,c"), str(","))          // ["a", "b", "c"]
 myon.print(myon.string.join(parts, str(",")))              // "a,b,c"
 ```
+
+#### float の文字列化仕様（最短往復表現）
+
+`myon.print(float)`・`str(float)`・`myon.string.from_float` による `float`
+（IEEE 754 倍精度 `double`）の文字列化は、**その値へ正確に復元できる最短の
+10進表現**（shortest round-trip representation）を用いる。具体的には
+`%.15g` → `%.16g` → `%.17g` の順に試し、`strtod` で元の `double` に戻る最初の
+桁数を採用する。これにより **表示 → 再パース（`myon.string.to_float`）の往復で
+同じ値が得られる**ことが保証される。
+
+- 小数点も指数も含まない有限値には末尾に `.0` を付け、`int` の文字列化と
+  区別できるようにする（例: `1024.0`, `123456789.0`）。
+- 特別な値は `nan` / `inf` / `-inf` と表記する。
+
+```myon
+myon.print(3.141592653589793)   // 3.141592653589793（%g の 6 桁丸めではない）
+myon.print(1024.0)              // 1024.0（.0 付き）
+s = myon.string.from_float(3.141592653589793)
+v, e = myon.string.to_float(s)
+myon.print(v == 3.141592653589793)   // true（往復一致）
+```
+
+> この挙動はツリーウォーク実行と MVM 実行のどちらでも共通（両経路が同じ
+> `value_to_cstr()` を通る）。往復性の回帰テストは
+> `tests/cases/p_float_roundtrip` にある。
 
 ### 10.5 myon.time（Phase4）
 

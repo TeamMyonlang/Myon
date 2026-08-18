@@ -29,6 +29,11 @@
 #include <stdint.h>
 #include <sys/stat.h>
 
+/* Myon release version.  Bump on each release; --version prints it. */
+#ifndef MYON_VERSION
+#define MYON_VERSION "0.8.0"
+#endif
+
 static char *read_file(const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) {
@@ -56,6 +61,10 @@ static void dump_tokens(const TokenList *tl) {
     }
 }
 
+static void version(void) {
+    printf("myon %s\n", MYON_VERSION);
+}
+
 static void usage(const char *prog) {
     fprintf(stderr,
         "Myon interpreter\n"
@@ -74,6 +83,7 @@ static void usage(const char *prog) {
         "  --strict-stale                 when running a .myc, error out (instead of warning)\n"
         "                                 if the source .myon is newer than the bytecode\n"
         "  -h, --help                     show this help and exit\n"
+        "  -v, --version                  show the version and exit\n"
         "\n"
         "notes:\n"
         "  * A file argument is dispatched by content/extension: a MYC1 bytecode blob\n"
@@ -537,6 +547,8 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--strict-stale") == 0) strict_stale = 1;
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage(argv[0]); return 0;
+        } else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--version") == 0) {
+            version(); return 0;
         } else if (strcmp(argv[i], "--compile") == 0) {
             if (i + 1 >= argc) { usage(argv[0]); return 64; }
             compile_src = argv[++i];
