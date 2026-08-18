@@ -1,0 +1,7 @@
+# Regression for flaw-and-Add.md A-4 (hex): a hexadecimal integer literal
+# that exceeds the 64-bit range used to be silently clamped to LLONG_MAX.
+# After the fix it must be a syntax error ("integer literal out of range"),
+# i.e. a non-zero exit.
+module myon.stdio
+c = 0xFFFFFFFFFFFFFFFFFF
+myon.print(c)

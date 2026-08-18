@@ -1,0 +1,16 @@
+# Regression for flaw-and-Add.md A-3: myon.array.slice range check used
+# `start + len` (signed integer overflow UB) and silently treated an
+# out-of-range request as a "successful" empty slice with error=nil.  After
+# the fix a huge start/len must return an explicit "range out of bounds"
+# error (verified via .out so the correct behaviour is pinned, not just
+# "did not crash").
+module myon.stdio
+
+a = myon.array(int)
+a.push(1)
+a.push(2)
+a.push(3)
+
+r, e = a.slice(4611686018427387904, 4611686018427387904)
+myon.print(e)
+myon.print(r)

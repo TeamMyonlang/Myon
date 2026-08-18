@@ -69,7 +69,7 @@ endif
 SOURCES  = $(wildcard $(SRC_DIR)/*.c)
 OBJECTS  = $(patsubst $(SRC_DIR)/%.c,$(BUILD)/%.o,$(SOURCES))
 
-.PHONY: all clean test test-mvm test-mvm-equality win-cross
+.PHONY: all clean test test-mvm test-mvm-equality win-cross asan test-asan
 
 all: $(BIN)
 
@@ -84,6 +84,56 @@ win-cross:
 
 $(BIN): $(OBJECTS)
 	$(CC) $(CFLAGS) -o $@ $(OBJECTS) $(LDLIBS)
+
+# ------------------------------------------------------------------------- #
+# Sanitizer build (AddressSanitizer + UndefinedBehaviorSanitizer).
+#
+# This mirrors the ASan/UBSan build documented in flaw-and-Add.md
+# ("検証方法（再現手順）") that was used to find A-1..A-6.  It is a single
+# self-contained link of all sources (no build/ objects reuse) at -O0 -g so
+# stack traces stay readable, and it always produces a binary named
+# `myon_asan` so it never clobbers the real `myon` binary.
+#
+# NOTE on link libraries: the sanitizer build is Linux/native only (it is
+# meant for the sanitizer CI job).  It uses the Linux link line explicitly
+# (-lm -lssl -lcrypto -ldl) rather than $(LDLIBS) so a stray OS=Windows_NT or
+# a WIN_OPENSSL_LDLIBS override in the environment cannot leak in.
+ASAN_BIN    = myon_asan
+ASAN_CC    ?= $(CC)
+ASAN_CFLAGS = -std=c11 -g -O0 -fsanitize=address,undefined \
+              -fno-omit-frame-pointer
+ASAN_LDLIBS = -lm -lssl -lcrypto -ldl
+
+asan: $(ASAN_BIN)
+
+$(ASAN_BIN): $(SOURCES)
+	$(ASAN_CC) $(ASAN_CFLAGS) -I$(SRC_DIR) $(SOURCES) -o $@ $(ASAN_LDLIBS)
+
+# Run the full regression suite against the sanitizer binary.
+#
+# The four test scripts (run_tests.sh / mvm_compiler_tests.sh /
+# run_mvm_tests.sh / bench_mvm.sh) hardcode `MYON=./myon`, so rather than
+# patch all of them we temporarily swap the sanitizer binary in as `./myon`,
+# run the suite, then restore the original.  The swap is done with a trap so
+# the original `myon` is always put back even if a test fails (approach B in
+# the CI TODO).  ASAN_OPTIONS/UBSAN_OPTIONS make any sanitizer finding abort
+# with a non-zero exit so the failure surfaces as a red CI step.
+test-asan: $(ASAN_BIN)
+	@echo "== Myon sanitizer (ASan/UBSan) test run =="
+	@set -e; \
+	restore() { \
+	  if [ -f myon.asan-backup ]; then mv -f myon.asan-backup myon; \
+	  else rm -f myon; fi; \
+	  rm -f myon.asan-backup; \
+	}; \
+	trap restore EXIT INT TERM; \
+	if [ -e myon ]; then cp -f myon myon.asan-backup; fi; \
+	cp -f $(ASAN_BIN) myon; \
+	export ASAN_OPTIONS="abort_on_error=1:halt_on_error=1:detect_leaks=0"; \
+	export UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=1:abort_on_error=1"; \
+	./tests/run_tests.sh; \
+	./tests/mvm_compiler_tests.sh; \
+	if [ -f ./tests/run_mvm_tests.sh ]; then ./tests/run_mvm_tests.sh; fi
 
 $(BUILD)/%.o: $(SRC_DIR)/%.c | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -108,4 +158,4 @@ test-mvm-equality: all
 	./tests/run_mvm_tests.sh
 
 clean:
-	rm -rf $(BUILD) $(BIN)
+	rm -rf $(BUILD) $(BIN) $(ASAN_BIN) myon.asan-backup

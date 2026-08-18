@@ -1,0 +1,10 @@
+# Regression for flaw-and-Add.md A-2: myon.string.substring range check used
+# `start + len` which overflowed (signed integer UB) and wrapped negative,
+# slipping past the bounds check and driving an OOM exit(70).  After the fix a
+# huge start/len must return a clean "range out of bounds" error value.
+module myon.stdio
+module myon.string
+
+r, e = myon.string.substring(str("hello"), 4611686018427387904, 4611686018427387904)
+myon.print(e)
+myon.print(myon.string.length(r))

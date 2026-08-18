@@ -191,6 +191,54 @@ make test
 > 実行環境によってはテストハーネスが自動的に除外します。除外は失敗ではなく、対応
 > ライブラリ・権限のある環境ではパスします。
 
+### Sanitizer（ASan/UBSan）テスト
+
+メモリ破壊・未定義動作の再発を検出するため、AddressSanitizer と
+UndefinedBehaviorSanitizer 付きでテストスイートを走らせるターゲットがあります。
+
+```sh
+make test-asan     # myon_asan をビルドし、ASan/UBSan 下で全テストを実行
+make asan          # myon_asan バイナリだけをビルド
+```
+
+`make test-asan` は `-fsanitize=address,undefined` でビルドした `myon_asan` を
+一時的に `./myon` として差し替えてスイートを実行し、終了時に元のバイナリへ戻します
+（テストスクリプトは無改修）。Sanitizer が問題を検出するとステップは異常終了します。
+`tests/cases/p_overflow_*` と `p_float_roundtrip` は、過去に踏んだオーバーフロー／
+未定義動作（境界計算・整数リテラル・数値変換・float 往復）の回帰ケースです。
+
+## CI・リリース
+
+GitHub Actions で以下のワークフローを用意しています（`.github/workflows/`）。
+
+| ワークフロー | トリガー | 内容 |
+|---|---|---|
+| `ci.yml` | push(main) / PR | gcc・clang の 2 系統で `make` + `make test`（軽量な毎コミットチェック） |
+| `heavy-checks.yml` | push(main) / 手動 | sanitizer（`make test-asan`）、Windows クロスビルド、ベンチマーク、macOS ビルド確認 |
+| `release.yml` | 手動のみ | Linux `myon` と Windows `myon.exe` を配布リリースとして公開 |
+
+- **heavy-checks** は重いジョブ群です。Windows クロスビルドは MinGW-w64 で
+  Windows 版 OpenSSL をソースからクロスビルド（`actions/cache` でキャッシュ）し、
+  `-lcrypt32` を含めてリンクします。macOS ジョブは、現状 `src/ffi_platform.c` の
+  macOS 分岐が FFI 未対応スタブのため**ビルド確認のみ**です。
+- **benchmark** ジョブはリリース公開に依存しない独立ジョブで、計測結果を
+  artifact として保存します。
+
+### ダウンロード（リリース）
+
+ビルド済みバイナリは [Releases](../../releases) ページから入手できます。
+
+- **正式版**（タグに `-dev.` を**含まない** 例: `v1.3.0`）は安定版です。
+- **開発版**（タグに `-dev.` を含む 例: `v1.3.0-dev.20260818.1`）は
+  開発中のスナップショットで、既知バグを含む・不安定な可能性があります。
+
+各リリースには Linux 版 `myon-linux-x86_64` と Windows 版
+`myon-windows-x86_64.exe` の両方が添付され、ログイン不要でダウンロードできます。
+
+リリースはメンテナが `release.yml` を手動実行し、`pre`／`stable` とバージョン番号
+（`X.Y.Z`）を指定して発行します。`pre` はタグに日付＋連番が付与され、
+GitHub 上で pre-release バッジが付きます。
+
 ## プロジェクト構成
 
 ```
@@ -227,6 +275,11 @@ tests/               回帰テスト（`make test`）
   cases/             `.myon`／`.out`／`.err` の回帰ケース
   run_tests.sh       ケース実行ハーネス
   run_mvm_tests.sh   `.myon`／`.myc` 等価性検証スイート
+  bench_mvm.sh       ベンチマーク（`BENCH_FIB` / `BENCH_LOOP` で負荷調整）
+.github/workflows/   GitHub Actions
+  ci.yml             push(main)/PR の gcc・clang ビルド＋テスト
+  heavy-checks.yml   sanitizer／Windows クロス／ベンチ／macOS ビルド
+  release.yml        手動リリース（Linux/Windows バイナリを Releases に公開）
 ```
 
 ## ドキュメント

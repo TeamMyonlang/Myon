@@ -1,0 +1,9 @@
+# Regression for flaw-and-Add.md A-5 (to_float half): myon.string.to_float
+# set errno=0 but never checked errno==ERANGE, so an out-of-range string
+# saturated to HUGE_VAL and was reported as a success.  After the fix an
+# overflowing input must return an "out of range" error value.
+module myon.stdio
+module myon.string
+
+v, e = myon.string.to_float(str("1e400"))
+myon.print(e)
