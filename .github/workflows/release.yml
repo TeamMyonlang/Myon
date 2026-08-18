@@ -1,0 +1,244 @@
+# Release workflow for Myon (TODO section 4.5).
+#
+# Manual-only (workflow_dispatch). The operator chooses pre vs stable and
+# types a version; the tag string is derived from those inputs. Both the
+# Linux `myon` and the Windows `myon.exe` are built first, and the GitHub
+# Release is only created if BOTH builds succeed (no half-a-release). Tags
+# are always newly created, never overwritten -- pre tags carry a
+# date+sequence suffix so repeated runs stack up as distinct tags.
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_type:
+        description: "Release channel"
+        required: true
+        type: choice
+        options: [pre, stable]
+        default: pre
+      version:
+        description: "Version X.Y.Z (no leading v)"
+        required: true
+        type: string
+
+concurrency:
+  # Serialise releases so the pre-release sequence-number computation cannot
+  # race against a second concurrent run.
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write  # needed to create tags/releases and upload assets
+
+env:
+  OPENSSL_VERSION: "3.3.2"
+
+jobs:
+  # ------------------------------------------------------------------ #
+  # 0. Validate inputs and compute the tag string.                    #
+  # ------------------------------------------------------------------ #
+  prepare:
+    name: prepare (validate + tag)
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      prerelease: ${{ steps.tag.outputs.prerelease }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # need all tags to compute the pre sequence number
+
+      - name: Validate version and compute tag
+        id: tag
+        env:
+          RELEASE_TYPE: ${{ inputs.release_type }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+
+          # Version must be X.Y.Z, no leading 'v' (we always add the v).
+          if [[ ! "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::version must be X.Y.Z (digits only, no leading v). Got '${VERSION}'."
+            exit 1
+          fi
+
+          if [[ "${RELEASE_TYPE}" == "stable" ]]; then
+            TAG="v${VERSION}"
+            PRERELEASE="false"
+            # A stable tag must not already exist (never overwrite).
+            if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+              echo "::error::tag ${TAG} already exists; bump the version."
+              exit 1
+            fi
+          else
+            # pre: v{version}-dev.{YYYYMMDD}.{seq}, seq = (max same-day seq)+1
+            DATE="$(date -u +%Y%m%d)"
+            PREFIX="v${VERSION}-dev.${DATE}."
+            MAX=0
+            # Look at existing tags with the same date prefix and take the
+            # highest trailing sequence number.
+            while read -r t; do
+              [[ -z "${t}" ]] && continue
+              n="${t##*.}"
+              if [[ "${n}" =~ ^[0-9]+$ ]] && (( n > MAX )); then MAX="${n}"; fi
+            done < <(git tag -l "${PREFIX}*")
+            SEQ=$(( MAX + 1 ))
+            TAG="${PREFIX}${SEQ}"
+            PRERELEASE="true"
+          fi
+
+          echo "Computed tag: ${TAG} (prerelease=${PRERELEASE})"
+          echo "tag=${TAG}"               >> "${GITHUB_OUTPUT}"
+          echo "prerelease=${PRERELEASE}" >> "${GITHUB_OUTPUT}"
+
+  # ------------------------------------------------------------------ #
+  # 1. Build the Linux binary (myon).                                 #
+  # ------------------------------------------------------------------ #
+  build-linux:
+    name: build linux
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libssl-dev
+
+      - name: Build
+        run: make
+
+      - name: Rename asset (OS-identifiable name)
+        run: cp myon myon-linux-x86_64
+
+      - name: Upload Linux binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: myon-linux-x86_64
+          path: myon-linux-x86_64
+          if-no-files-found: error
+
+  # ------------------------------------------------------------------ #
+  # 2. Cross-build the Windows binary (myon.exe).                     #
+  # ------------------------------------------------------------------ #
+  build-windows:
+    name: build windows (cross)
+    needs: prepare
+    runs-on: ubuntu-latest
+    env:
+      WIN_OPENSSL_PREFIX: ${{ github.workspace }}/win-openssl
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install MinGW-w64 toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mingw-w64
+
+      - name: Cache Windows OpenSSL (cross-built)
+        id: cache-openssl
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.WIN_OPENSSL_PREFIX }}
+          key: win-openssl-${{ runner.os }}-${{ env.OPENSSL_VERSION }}
+
+      - name: Cross-build Windows OpenSSL (cache miss only)
+        if: steps.cache-openssl.outputs.cache-hit != 'true'
+        run: |
+          set -eux
+          git clone --depth 1 --branch "openssl-${OPENSSL_VERSION}" \
+            https://github.com/openssl/openssl.git openssl-src
+          cd openssl-src
+          ./Configure mingw64 no-shared no-tests no-docs no-apps \
+            --cross-compile-prefix=x86_64-w64-mingw32- \
+            --prefix="${WIN_OPENSSL_PREFIX}"
+          make -j"$(nproc)"
+          make install_sw
+
+      - name: Cross-build myon.exe
+        run: |
+          set -eux
+          make win-cross \
+            CFLAGS="-std=c11 -Wall -Wextra -Wpedantic -O2 -I${WIN_OPENSSL_PREFIX}/include" \
+            WIN_OPENSSL_LDLIBS="-L${WIN_OPENSSL_PREFIX}/lib -L${WIN_OPENSSL_PREFIX}/lib64 -lcrypt32"
+          cp myon.exe myon-windows-x86_64.exe
+          file myon-windows-x86_64.exe
+
+      - name: Upload Windows binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: myon-windows-x86_64
+          path: myon-windows-x86_64.exe
+          if-no-files-found: error
+
+  # ------------------------------------------------------------------ #
+  # 3. Publish the release -- only if BOTH builds succeeded.          #
+  # ------------------------------------------------------------------ #
+  release:
+    name: publish release
+    needs: [prepare, build-linux, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download Linux artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: myon-linux-x86_64
+          path: dist
+
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: myon-windows-x86_64
+          path: dist
+
+      - name: Create release notes
+        run: |
+          set -eux
+          {
+            echo "Myon ${{ needs.prepare.outputs.tag }}"
+            echo
+            echo "- release_type: ${{ inputs.release_type }}"
+            echo "- commit: ${GITHUB_SHA}"
+            echo "- built (UTC): $(date -u +'%Y-%m-%d %H:%M:%S')"
+            echo
+            if [[ "${{ needs.prepare.outputs.prerelease }}" == "true" ]]; then
+              echo "> This is a **pre-release** (development snapshot). It may be"
+              echo "> unstable and can contain known bugs. Use a stable release"
+              echo "> (a tag without \`-dev.\`) for production."
+            else
+              echo "This is a **stable** release."
+            fi
+            echo
+            echo "## Assets"
+            echo "- \`myon-linux-x86_64\` — Linux x86_64 binary"
+            echo "- \`myon-windows-x86_64.exe\` — Windows x86_64 binary"
+          } > release-notes.md
+          cat release-notes.md
+
+      - name: Create GitHub Release and upload assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          PRE_FLAG=""
+          if [[ "${PRERELEASE}" == "true" ]]; then PRE_FLAG="--prerelease"; fi
+          # `gh release create <tag>` creates the tag on the current commit
+          # (GITHUB_SHA). Tags are always new; the prepare job already
+          # guarded against re-using an existing stable tag.
+          gh release create "${TAG}" \
+            dist/myon-linux-x86_64 \
+            dist/myon-windows-x86_64.exe \
+            --title "${TAG}" \
+            --notes-file release-notes.md \
+            --target "${GITHUB_SHA}" \
+            ${PRE_FLAG}
