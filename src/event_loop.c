@@ -82,7 +82,7 @@ struct Task {
     void       *ud;
 
     TaskState   state;
-    int         waiting_fd;        /* WAITING_IO fd being watched      */
+    myon_fd_t   waiting_fd;        /* WAITING_IO fd being watched (known-issue #5) */
     int         waiting_for_write; /* 0=read, 1=write                  */
     long long   wake_at_ms;        /* absolute wake time, 0 if unused  */
     Task       *waiting_on;        /* WAITING_TASK target              */
@@ -188,7 +188,7 @@ static void task_yield_to_core(Task *t) {
     swapcontext(&t->ctx, t->return_ctx);
 }
 
-int event_loop_wait_readable(EventLoop *loop, int fd) {
+int event_loop_wait_readable(EventLoop *loop, myon_fd_t fd) {
     Task *t = loop->current;
     if (!t) return -1;
     t->waiting_fd = fd;
@@ -198,7 +198,7 @@ int event_loop_wait_readable(EventLoop *loop, int fd) {
     return 0;
 }
 
-int event_loop_wait_writable(EventLoop *loop, int fd) {
+int event_loop_wait_writable(EventLoop *loop, myon_fd_t fd) {
     Task *t = loop->current;
     if (!t) return -1;
     t->waiting_fd = fd;
@@ -370,9 +370,12 @@ int event_loop_run_once(EventLoop *loop) {
     for (Task *t = loop->tasks; t; t = t->next) {
         if (t->state != TASK_WAITING_IO) continue;
         if (t->waiting_fd >= 0) {
-            if (t->waiting_for_write) FD_SET(t->waiting_fd, &wfds);
-            else                       FD_SET(t->waiting_fd, &rfds);
-            if (t->waiting_fd > maxfd) maxfd = t->waiting_fd;
+            /* known-issue #5: waiting_fd is myon_fd_t; a POSIX fd fits in int,
+             * which is what FD_SET/select() require. */
+            int wfd = (int)t->waiting_fd;
+            if (t->waiting_for_write) FD_SET(wfd, &wfds);
+            else                       FD_SET(wfd, &rfds);
+            if (wfd > maxfd) maxfd = wfd;
             have_fd = 1;
         } else if (t->wake_at_ms != 0) {
             if (soonest_wake < 0 || t->wake_at_ms < soonest_wake)
@@ -412,8 +415,9 @@ int event_loop_run_once(EventLoop *loop) {
     /* Mark tasks whose fd is ready as READY. */
     for (Task *t = loop->tasks; t; t = t->next) {
         if (t->state != TASK_WAITING_IO || t->waiting_fd < 0) continue;
-        int ready_now = t->waiting_for_write ? FD_ISSET(t->waiting_fd, &wfds)
-                                             : FD_ISSET(t->waiting_fd, &rfds);
+        int rfd = (int)t->waiting_fd; /* known-issue #5: POSIX fd fits in int */
+        int ready_now = t->waiting_for_write ? FD_ISSET(rfd, &wfds)
+                                             : FD_ISSET(rfd, &rfds);
         if (ready_now) t->state = TASK_READY;
     }
     /* Also wake any sleepers whose timeout elapsed during select(). */
@@ -507,7 +511,7 @@ struct Task {
     void       *ud;
 
     TaskState   state;
-    int         waiting_fd;        /* WAITING_IO fd being watched      */
+    myon_fd_t   waiting_fd;        /* WAITING_IO fd being watched (known-issue #5) */
     int         waiting_for_write; /* 0=read, 1=write                  */
     long long   wake_at_ms;        /* absolute wake time, 0 if unused  */
     Task       *waiting_on;        /* WAITING_TASK target              */
@@ -545,8 +549,10 @@ struct EventLoop {
  * localise the SOCKET reconstruction to the two spots in this file that hand an
  * fd to Winsock (FD_SET and FD_ISSET).
  */
-static SOCKET fd_to_socket(int fd) {
-    return (SOCKET)(UINT_PTR)(unsigned int)fd;
+static SOCKET fd_to_socket(myon_fd_t fd) {
+    /* known-issue #5: fd is now intptr_t-wide, so the full SOCKET value is
+     * present -- no zero-extension-from-int reconstruction is needed. */
+    return (SOCKET)(UINT_PTR)fd;
 }
 
 /* ------------------------------------------------------------------ */
@@ -650,7 +656,7 @@ static void task_yield_to_core(Task *t) {
     SwitchToFiber(t->loop->main_fiber);
 }
 
-int event_loop_wait_readable(EventLoop *loop, int fd) {
+int event_loop_wait_readable(EventLoop *loop, myon_fd_t fd) {
     Task *t = loop->current;
     if (!t) return -1;
     t->waiting_fd = fd;
@@ -660,7 +666,7 @@ int event_loop_wait_readable(EventLoop *loop, int fd) {
     return 0;
 }
 
-int event_loop_wait_writable(EventLoop *loop, int fd) {
+int event_loop_wait_writable(EventLoop *loop, myon_fd_t fd) {
     Task *t = loop->current;
     if (!t) return -1;
     t->waiting_fd = fd;
@@ -913,8 +919,8 @@ int        event_loop_supported(void) { return 0; }
 Task *event_loop_spawn(EventLoop *loop, void (*entry)(void *ud), void *ud) {
     (void)loop; (void)entry; (void)ud; return NULL;
 }
-int  event_loop_wait_readable(EventLoop *loop, int fd) { (void)loop; (void)fd; return -1; }
-int  event_loop_wait_writable(EventLoop *loop, int fd) { (void)loop; (void)fd; return -1; }
+int  event_loop_wait_readable(EventLoop *loop, myon_fd_t fd) { (void)loop; (void)fd; return -1; }
+int  event_loop_wait_writable(EventLoop *loop, myon_fd_t fd) { (void)loop; (void)fd; return -1; }
 void event_loop_sleep_ms(EventLoop *loop, long long ms) { (void)loop; (void)ms; }
 void event_loop_wait_task(EventLoop *loop, Task *target) { (void)loop; (void)target; }
 int  event_loop_task_done(Task *target) { (void)target; return 1; }

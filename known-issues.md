@@ -26,7 +26,7 @@
 
 ## 非セキュリティのバグ・改善点（未修正・記録のみ）
 
-### 1. `longjmp` によるスタック巻き戻しで解放されないメモリ
+### 1. `longjmp` によるスタック巻き戻しで解放されないメモリ ✅ 修正済み
 
 - **場所**: `src/interpreter.c`（`runtime_error()` → トップレベル `setjmp`）
 - **内容**: 実行時エラーは `longjmp` でトップレベルまで一気に巻き戻るため、
@@ -34,11 +34,20 @@
   （valgrind 上は `definitely/indirectly lost`）。
 - **影響**: プロセス終了時に OS が回収するため実害はないが、
   `*.err` テストや深い再帰のリミット到達時にリークとして計上される。
-- **状態**: 未対応（設計上の性質）。README「Phase 5.2 / 既知の課題」に記載済み。
-  恒久対策は登録ベースのクリーンアップ／アリーナアロケータへの移行が必要で、
-  インタプリタ全体の所有権モデルに触れる大規模リファクタになる。実害が
-  プロセス終了時の未回収に限られる（OS が回収）ため、本変更では着手しない。
-  他の低リスク項目を優先して修正した。
+- **修正**: 所有権モデル全体には手を入れず、**登録ベースのクリーンアップ
+  スタック**を局所的に導入した（`Interp.cleanup_stack`）。
+  - `call_function()` は各呼び出しの `call_env` を入口で `cleanup_push()`
+    し、正常終了（return/void）で `cleanup_pop()` してから `env_free()` する。
+  - 各 `setjmp` バリア（`interpret` / `interp_run` / `async_task_entry` /
+    `http_conn_task_entry` / `myon_ffi_callback_dispatch`）は入場時の深さを
+    `cleanup_mark()` で記録し、`longjmp` を捕捉したら `cleanup_unwind()` で
+    その深さまで巻き戻し、飛び越された各 `call_env` を `env_free()` する。
+  - 引数型不一致の早期エラー経路は、二重解放を避けるため `env_free()` の直前に
+    `cleanup_pop()` してからエラーを送出する。
+  - `interp_free()` / `interpret()` の終了処理では、正常終了なら空・エラー時は
+    巻き戻し済みのため、残った backing 配列を `free()` するだけでよい。
+  - これにより `*.err` テストや再帰リミット到達時の途中フレームのリークが
+    解消される。所有権モデルの大規模リファクタやアリーナアロケータ化は不要。
 
 ### 2. HTTP レスポンスのステータス行が常に 200 固定（`myon.http.serve`） ✅ 修正済み
 
@@ -82,7 +91,7 @@
   `:` のみをポート区切りとして解釈するようにした。括弧が閉じない場合は
   明示エラーを返す。
 
-### 5. `net_raw_fd()` の Windows における `SOCKET`→`int` 切り詰め
+### 5. `net_raw_fd()` の Windows における `SOCKET`→`int` 切り詰め ✅ 修正済み
 
 - **場所**: `src/net.c`（`_WIN32` 分岐）
 - **内容**: Windows の `SOCKET`（`UINT_PTR`, 64bit）を `int` へ切り詰めている。
@@ -90,12 +99,28 @@
   「実運用上は安全」だが、型としては不正確でコメントにも hand-off 注記が残る。
 - **影響**: Linux では無関係（`SOCKET` == `int` 相当で切り詰めが起きない）。
   Windows 実機は未検証（README 記載）。
-- **状態**: 未対応。恒久対策は `net_raw_fd()` と呼び出し側
-  （`event_loop.c` の `select()` 多重化 / `interpreter.c`）の fd 型を
-  `intptr_t` 相当へ一斉に広げる必要がある。この変更は Windows パスでしか
-  効果を検証できず、当リポジトリの CI（Linux）ではリグレッションを確認
-  できないため、Windows 実機での検証とセットで行うべきと判断し本変更では
-  見送った（Linux の挙動は現状で正しい）。
+- **修正**: 恒久対策として、raw fd/socket を運ぶ型を `intptr_t` 相当の
+  新しい型 **`myon_fd_t`**（`src/net.h`、無効値は `MYON_INVALID_FD`）に一斉に
+  広げた。
+  - `net_raw_fd()` の戻り値、`net_sync_wait_fd()` の引数（`net.c`）、
+    `event_loop_wait_readable/writable()` と `Task.waiting_fd`
+    （`event_loop.h`/`event_loop.c`）、および `interpreter.c` 内で fd を
+    持ち回るローカル変数（`net_wait_fd()` の引数含む）をすべて `myon_fd_t`
+    に統一した。
+  - Windows 分岐では `(int)`／`(unsigned int)` によるゼロ拡張の再構成トリックが
+    不要になり、`SOCKET` の完全な幅がそのまま往復する
+    （`fd_to_socket()` は `(SOCKET)(UINT_PTR)fd` のみ）。
+  - Linux では `myon_fd_t` は実質 `int` の値域であり、`FD_SET`/`select()` に
+    渡す直前に `(int)` へ戻す（切り詰めは起きない）。挙動は従来どおり。
+- **検証（CI）**: `src/net.c` の `_WIN32` 分岐に
+  `static_assert(sizeof(myon_fd_t) >= sizeof(SOCKET), ...)` を追加し、
+  型が再び狭くなった場合に **Windows ビルド（`win-cross` / `win-native`）を
+  コンパイル時に失敗させる**ようにした。さらに `.github/workflows/
+  heavy-checks.yml` の `win-cross` ジョブに検証ステップを追加し、
+  (1) `net.c` が Windows 向けにコンパイルできること（正）と、
+  (2) `myon_fd_t` を `int` に狭めた対照テスト用 TU が **この static_assert で
+  失敗すること**（負の対照）を確認する。これにより「ガードが空虚に真ではない」
+  ことを CI 上で能動的に示す。
 
 ### 6. `myon.random` は暗号学的に安全でない ✅ 対応済み（別 API を追加）
 
@@ -113,12 +138,13 @@
 
 ## メモ
 
-- 上記のうち **1・5・6** は README に既述の既知の性質・制限です
-  （重複記録ですが、レビューの網羅性のため再掲）。
+- 上記のうち **1・5・6** はもともと README に既述の既知の性質・制限でした
+  （重複記録ですが、レビューの網羅性のため再掲）。**1・5** は本変更で修正済み。
 - **2・3・4** は今回のレビューで新たに整理した非セキュリティの改善点です。
 - 対応状況:
-  - **✅ 修正済み**: **2**（HTTP ステータス/ヘッダ指定）、**3**（通常ファイル
-    判定）、**4**（IPv6 リテラル）、**6**（暗号用途向け `secure_int` を追加）。
-  - **未対応（大規模／検証不可のため見送り）**: **1**（`longjmp` リーク＝
-    所有権モデルの大規模リファクタ）、**5**（`net_raw_fd` の型拡張＝Windows
-    実機でしか検証できない）。各項目の「状態」を参照。
+  - **✅ 修正済み**: **1**（`longjmp` リーク＝登録ベースのクリーンアップ
+    スタックを局所導入）、**2**（HTTP ステータス/ヘッダ指定）、**3**（通常
+    ファイル判定）、**4**（IPv6 リテラル）、**5**（`net_raw_fd` の型を
+    `myon_fd_t`＝`intptr_t` 相当へ拡張し、Windows CI に静的アサート検証を追加）、
+    **6**（暗号用途向け `secure_int` を追加）。
+  - **未対応**: なし（本ファイルに記録した非セキュリティ項目はすべて対応済み）。

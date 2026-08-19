@@ -195,6 +195,24 @@ struct Interp {
      * this to 0 after catching an error (see those functions). */
     int          call_depth;
     /*
+     * Known-issue #1 fix: registration-based cleanup for call frames.
+     *
+     * A runtime_error() longjmps straight back to the nearest setjmp barrier,
+     * skipping the env_free(call_env) at the bottom of every intermediate
+     * call_function() frame.  Those per-frame `call_env` scopes (and the Values
+     * bound into them) used to leak until process exit.
+     *
+     * cleanup_stack is a LIFO of the still-live `call_env` scopes, pushed on
+     * entry to call_function() and popped on its normal exit.  Each setjmp
+     * barrier records the stack depth it was entered at (like it->call_depth)
+     * and, on catching an error, unwinds the stack back down to that mark,
+     * env_free()-ing every frame the longjmp jumped over.  This is a localised
+     * fix that does not touch the interpreter's wider ownership model.
+     */
+    Env        **cleanup_stack;
+    int          cleanup_count;
+    int          cleanup_cap;
+    /*
      * Step 6 (MVM bridge): when non-NULL, argument expressions are ignored and
      * the stdlib / method dispatchers take their arguments from this vector of
      * already-evaluated Values instead.  This lets the bytecode VM reuse the
@@ -221,6 +239,60 @@ typedef struct Interp Interp;
 
 /* Look up an aliased external module by its alias name; defined later. */
 static ModuleEntry *find_module_by_alias(Interp *it, const char *alias);
+
+/* ------------------------------------------------------------------ */
+/* Known-issue #1: longjmp-safe cleanup stack for call frames.         */
+/* ------------------------------------------------------------------ */
+/*
+ * call_function() registers its per-call `call_env` here on entry and
+ * unregisters it on its normal (return/void) exit.  A runtime_error()
+ * longjmps past those normal exits, so each setjmp barrier records the
+ * stack depth it was entered at with cleanup_mark() and, on catching an
+ * error, calls cleanup_unwind() to env_free() every frame the jump skipped.
+ * Without this, those intermediate `call_env` scopes leaked until the
+ * process exited (valgrind "definitely/indirectly lost").
+ */
+static void cleanup_push(Interp *it, Env *env) {
+    if (it->cleanup_count == it->cleanup_cap) {
+        int ncap = it->cleanup_cap ? it->cleanup_cap * 2 : 16;
+        it->cleanup_stack =
+            (Env **)myon_xrealloc(it->cleanup_stack, (size_t)ncap * sizeof(Env *));
+        it->cleanup_cap = ncap;
+    }
+    it->cleanup_stack[it->cleanup_count++] = env;
+}
+
+/* Pop the most recently pushed frame after a *successful* env_free by the
+ * caller.  `env` is the value the caller expects on top, asserted for safety
+ * (the stack is strictly LIFO because calls nest). */
+static void cleanup_pop(Interp *it, Env *env) {
+    if (it->cleanup_count > 0 && it->cleanup_stack[it->cleanup_count - 1] == env)
+        it->cleanup_count--;
+    else {
+        /* Defensive: locate and remove `env` even if something unexpected sits
+         * on top.  Should not happen given strict nesting, but never underflow. */
+        for (int i = it->cleanup_count - 1; i >= 0; i--) {
+            if (it->cleanup_stack[i] == env) {
+                for (int j = i; j < it->cleanup_count - 1; j++)
+                    it->cleanup_stack[j] = it->cleanup_stack[j + 1];
+                it->cleanup_count--;
+                break;
+            }
+        }
+    }
+}
+
+/* Snapshot the current stack depth before installing a setjmp barrier. */
+static int cleanup_mark(Interp *it) { return it->cleanup_count; }
+
+/* After a longjmp is caught, free every call_env registered above `mark`
+ * (the frames the jump unwound past without running their own env_free). */
+static void cleanup_unwind(Interp *it, int mark) {
+    while (it->cleanup_count > mark) {
+        Env *e = it->cleanup_stack[--it->cleanup_count];
+        if (e) env_free(e);
+    }
+}
 
 static void runtime_error(Interp *it, int line, const char *fmt, ...) {
     va_list ap;
@@ -1909,7 +1981,7 @@ static NetState *ensure_net(Interp *it) {
 
 /* Wait until `fd` is readable/writable.  Inside a coroutine this suspends
  * cooperatively; outside one it drives the loop / blocks on the single fd. */
-static void net_wait_fd(Interp *it, int fd, int for_write) {
+static void net_wait_fd(Interp *it, myon_fd_t fd, int for_write) {
     if (it->current_task && it->loop) {
         if (for_write) event_loop_wait_writable(it->loop, fd);
         else           event_loop_wait_readable(it->loop, fd);
@@ -1917,9 +1989,12 @@ static void net_wait_fd(Interp *it, int fd, int for_write) {
     }
     /* synchronous fallback: block on just this fd */
 #if defined(MYON_OS_POSIX)
-    fd_set fds; FD_ZERO(&fds); FD_SET(fd, &fds);
-    if (for_write) select(fd + 1, NULL, &fds, NULL, NULL);
-    else           select(fd + 1, &fds, NULL, NULL, NULL);
+    /* known-issue #5: fd is myon_fd_t; a POSIX fd fits back into int for
+     * FD_SET/select() (widening was lossless, so this narrowing is safe). */
+    int ifd = (int)fd;
+    fd_set fds; FD_ZERO(&fds); FD_SET(ifd, &fds);
+    if (for_write) select(ifd + 1, NULL, &fds, NULL, NULL);
+    else           select(ifd + 1, &fds, NULL, NULL, NULL);
 #elif defined(_WIN32)
     /* Delegate to net.c, which owns the Winsock select()/fd_set surface (see
      * the header-collision note at the top of this file). */
@@ -1983,7 +2058,7 @@ static int call_net(Interp *it, Env *env, const char *name, Expr *call, Value *o
     if (strcmp(name, "myon.net.accept") == 0) {
         Value a = eval_arg(it, env, call, 0);
         int lid = (int)a.as.i; value_free(&a);
-        int lfd = net_raw_fd(st, lid);
+        myon_fd_t lfd = net_raw_fd(st, lid); /* known-issue #5 */
         for (;;) {
             char *peer = NULL, *err = NULL;
             int cid = net_try_accept(st, lid, &peer, &err);
@@ -1998,7 +2073,7 @@ static int call_net(Interp *it, Env *env, const char *name, Expr *call, Value *o
     if (strcmp(name, "myon.net.connect") == 0) {
         Value a = eval_arg(it, env, call, 0), b = eval_arg(it, env, call, 1), c = eval_arg(it, env, call, 2);
         int sid = (int)a.as.i; const char *host = b.as.obj ? b.as.obj->as.str : ""; int port = (int)c.as.i;
-        int fd = net_raw_fd(st, sid);
+        myon_fd_t fd = net_raw_fd(st, sid); /* known-issue #5 */
         char *err = NULL;
         int rc = net_connect(st, sid, host, port, &err);
         while (rc == -2) {
@@ -2014,7 +2089,7 @@ static int call_net(Interp *it, Env *env, const char *name, Expr *call, Value *o
     if (strcmp(name, "myon.net.send") == 0) {
         Value a = eval_arg(it, env, call, 0), b = eval_arg(it, env, call, 1);
         int sid = (int)a.as.i; const char *data = b.as.obj ? b.as.obj->as.str : "";
-        long long len = (long long)strlen(data); int fd = net_raw_fd(st, sid);
+        long long len = (long long)strlen(data); myon_fd_t fd = net_raw_fd(st, sid); /* known-issue #5 */
         char *err = NULL; long long n;
         for (;;) {
             n = net_send(st, sid, data, len, &err);
@@ -2029,7 +2104,7 @@ static int call_net(Interp *it, Env *env, const char *name, Expr *call, Value *o
 
     if (strcmp(name, "myon.net.recv") == 0) {
         Value a = eval_arg(it, env, call, 0), b = eval_arg(it, env, call, 1);
-        int sid = (int)a.as.i; long long maxlen = b.as.i; int fd = net_raw_fd(st, sid);
+        int sid = (int)a.as.i; long long maxlen = b.as.i; myon_fd_t fd = net_raw_fd(st, sid); /* known-issue #5 */
         value_free(&a); value_free(&b);
         if (maxlen <= 0) maxlen = 4096;
         char *buf = (char *)myon_xmalloc((size_t)maxlen + 1);
@@ -2053,7 +2128,7 @@ static int call_net(Interp *it, Env *env, const char *name, Expr *call, Value *o
         int sid = (int)a.as.i; const char *data = b.as.obj ? b.as.obj->as.str : "";
         long long len = (long long)strlen(data);
         const char *host = c.as.obj ? c.as.obj->as.str : ""; int port = (int)d.as.i;
-        int fd = net_raw_fd(st, sid);
+        myon_fd_t fd = net_raw_fd(st, sid); /* known-issue #5 */
         char *err = NULL; long long n;
         for (;;) { n = net_sendto(st, sid, data, len, host, port, &err); if (n == -2) { net_wait_fd(it, fd, 1); continue; } break; }
         value_free(&a); value_free(&b); value_free(&c); value_free(&d);
@@ -2064,7 +2139,7 @@ static int call_net(Interp *it, Env *env, const char *name, Expr *call, Value *o
 
     if (strcmp(name, "myon.net.recv_from") == 0) {
         Value a = eval_arg(it, env, call, 0), b = eval_arg(it, env, call, 1);
-        int sid = (int)a.as.i; long long maxlen = b.as.i; int fd = net_raw_fd(st, sid);
+        int sid = (int)a.as.i; long long maxlen = b.as.i; myon_fd_t fd = net_raw_fd(st, sid); /* known-issue #5 */
         value_free(&a); value_free(&b);
         if (maxlen <= 0) maxlen = 4096;
         char *buf = (char *)myon_xmalloc((size_t)maxlen + 1);
@@ -3205,6 +3280,9 @@ static Value call_function(Interp *it, int line, Value fn, Value *args, int argc
     it->call_depth++;
 
     Env *call_env = env_new(fn.as.obj->as.fn.closure);
+    /* Known-issue #1: register this frame so a runtime_error() longjmp from any
+     * nested call still frees it (via cleanup_unwind at the setjmp barrier). */
+    cleanup_push(it, call_env);
 
     /* bind self for methods */
     if (fn.as.obj->as.fn.is_bound && fn.as.obj->as.fn.bound_self) {
@@ -3216,6 +3294,7 @@ static Value call_function(Interp *it, int line, Value fn, Value *args, int argc
         if (!typespec_matches_value(it, fd->params[i].type, &args[i])) {
             char *want = typespec_to_cstr(fd->params[i].type);
             const char *got = value_type_name(&args[i]);
+            cleanup_pop(it, call_env);   /* remove before freeing, avoids double-free at unwind */
             env_free(call_env);
             runtime_error(it, line,
                 "argument %d of '%s' expects %s, got %s",
@@ -3255,6 +3334,7 @@ static Value call_function(Interp *it, int line, Value fn, Value *args, int argc
     it->ret_values = saved_ret;
     it->ret_count = saved_cnt;
 
+    cleanup_pop(it, call_env);   /* normal exit: unregister before freeing */
     env_free(call_env);
     /* Phase5.2: pop this frame's depth on the normal (return/void) exit path.
      * The runtime_error paths above intentionally skip this because they
@@ -3306,11 +3386,16 @@ static void async_task_entry(void *ud) {
      * barrier below without unwinding the coroutine's frames). */
     int saved_depth = it->call_depth;
     it->call_depth = 0;
+    /* Known-issue #1: mark the cleanup stack so an error inside the body frees
+     * the call frames it longjmps over (see cleanup_unwind). */
+    int cleanup_at = cleanup_mark(it);
 
     if (setjmp(it->on_error) == 0) {
         *res = call_function(it, 0, ctx->fn, ctx->args, ctx->argc, NULL);
     } else {
-        /* body raised: represent as an error value */
+        /* body raised: free the frames the longjmp skipped, then represent the
+         * failure as an error value. */
+        cleanup_unwind(it, cleanup_at);
         *res = value_error(myon_strdup("async task failed"));
         has_error = 1;
     }
@@ -3407,7 +3492,7 @@ static Value await_task(Interp *it, int line, Value taskv) {
  * Returns 0 and fills *req on success; -1 on error/EOF (req untouched). */
 static int http_read_request(Interp *it, NetState *st, int sock_id,
                              HttpRequest *req) {
-    int fd = net_raw_fd(st, sock_id);
+    myon_fd_t fd = net_raw_fd(st, sock_id); /* known-issue #5 */
     size_t cap = 4096, len = 0;
     char *buf = (char *)myon_xmalloc(cap);
     size_t header_end = 0;
@@ -3471,7 +3556,7 @@ static int http_read_request(Interp *it, NetState *st, int sock_id,
 /* Send all `len` bytes on a socket, yielding on EWOULDBLOCK. */
 static void http_send_all(Interp *it, NetState *st, int sock_id,
                           const char *data, size_t len) {
-    int fd = net_raw_fd(st, sock_id);
+    myon_fd_t fd = net_raw_fd(st, sock_id); /* known-issue #5 */
     size_t off = 0;
     while (off < len) {
         char *err = NULL;
@@ -3486,7 +3571,7 @@ static void http_send_all(Interp *it, NetState *st, int sock_id,
 /* Like http_send_all, but over a TLS session.  `fd` is the underlying raw
  * socket fd, used only to wait for writability when the TLS layer would
  * block. */
-static void tls_send_all(Interp *it, TlsConn *tls, int fd,
+static void tls_send_all(Interp *it, TlsConn *tls, myon_fd_t fd, /* known-issue #5 */
                          const char *data, size_t len) {
     size_t off = 0;
     while (off < len) {
@@ -3586,6 +3671,8 @@ static void http_conn_task_entry(void *ud) {
          * stack; give it an independent recursion budget (see async_task_entry). */
         int saved_depth = it->call_depth;
         it->call_depth = 0;
+        /* Known-issue #1: free any call frames a handler error longjmps over. */
+        int cleanup_at = cleanup_mark(it);
         if (setjmp(it->on_error) == 0) {
             Value args[3];
             args[0] = value_str(myon_strdup(req.method));
@@ -3626,6 +3713,7 @@ static void http_conn_task_entry(void *ud) {
             value_free(&r);
             for (int i = 0; i < 3; i++) value_free(&args[i]);
         } else {
+            cleanup_unwind(it, cleanup_at);
             status_out = 500;
             body_out = myon_strdup("500 Internal Server Error");
         }
@@ -3673,7 +3761,7 @@ static void http_accept_loop_entry(void *ud) {
     Task *prev = it->current_task;
     it->current_task = sc->task;
 
-    int lfd = net_raw_fd(st, sc->lsock);
+    myon_fd_t lfd = net_raw_fd(st, sc->lsock); /* known-issue #5 */
     for (;;) {
         char *peer = NULL, *aerr = NULL;
         int cid = net_try_accept(st, sc->lsock, &peer, &aerr);
@@ -3899,7 +3987,7 @@ static Value http_client_request(Interp *it, int line, const char *url,
         free(host); free(path);
         return tup;
     }
-    int fd = net_raw_fd(st, sock);
+    myon_fd_t fd = net_raw_fd(st, sock); /* known-issue #5 */
 
     /* connect (non-blocking, yield/loop until complete) */
     int rc = net_connect(st, sock, host, port, &err);
@@ -4117,6 +4205,8 @@ long long myon_ffi_callback_dispatch(int slot, int argc, const long long *args) 
      * barrier below skips the per-frame decrements, so snapshot the depth and
      * restore it on the way out to keep the counter balanced. */
     int saved_depth = it->call_depth;
+    /* Known-issue #1: free the call frames a callback-body error longjmps over. */
+    int cleanup_at = cleanup_mark(it);
 
     long long ret = 0;
     if (setjmp(it->on_error) == 0) {
@@ -4126,6 +4216,7 @@ long long myon_ffi_callback_dispatch(int slot, int argc, const long long *args) 
         else                          ret = 0; /* non-int return -> 0 */
         value_free(&r);
     } else {
+        cleanup_unwind(it, cleanup_at);
         fprintf(stderr,
                 "myon: runtime error inside FFI callback (slot %d); "
                 "returning 0\n", slot);
@@ -5076,6 +5167,10 @@ void interp_free(Interp *it) {
     for (int i = 0; i < it->program_count; i++)
         program_free(it->programs[i]);
     free(it->programs);
+    /* Known-issue #1: the cleanup registry is empty on a clean run (each frame
+     * pops itself) and fully unwound on an error, so only the backing array is
+     * left to free here. */
+    free(it->cleanup_stack);
     free(it->script_dir);
     free(it);
 }
@@ -5131,6 +5226,8 @@ int interp_run(Interp *it, Program *program) {
          * the per-frame call_depth decrements, so reset the counter for the
          * next program the (REPL) interpreter runs. */
         it->call_depth = 0;
+        /* Known-issue #1: free every call frame the longjmp unwound past. */
+        cleanup_unwind(it, 0);
         return 1;
     }
     return run_toplevel(it, program);
@@ -5270,6 +5367,7 @@ int interpret(Program *program) {
     if (setjmp(it.on_error)) {
         rc = 1;
         it.call_depth = 0; /* Phase5.2: see interp_run() */
+        cleanup_unwind(&it, 0); /* Known-issue #1: free unwound call frames */
     } else {
         rc = run_toplevel(&it, program);
     }
@@ -5294,6 +5392,7 @@ int interpret(Program *program) {
     for (int i = 0; i < it.program_count; i++)
         program_free(it.programs[i]);
     free(it.programs);
+    free(it.cleanup_stack); /* Known-issue #1: backing array (see interp_free) */
     free(it.script_dir);
     return rc;
 }
