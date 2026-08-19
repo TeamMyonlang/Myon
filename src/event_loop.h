@@ -18,6 +18,7 @@
 #define MYON_EVENT_LOOP_H
 
 #include <stddef.h>
+#include "net.h"   /* myon_fd_t (known-issue #5: raw fds carried at native width) */
 
 /*
  * Phase5, Step1: a single-threaded, cooperative event loop.
@@ -61,9 +62,10 @@ void       event_loop_destroy(EventLoop *loop);
 Task *event_loop_spawn(EventLoop *loop, void (*entry)(void *ud), void *ud);
 
 /* From the running task: suspend until `fd` is readable/writable.  Returns
- * >=0 on readiness, <0 on select() error. */
-int event_loop_wait_readable(EventLoop *loop, int fd);
-int event_loop_wait_writable(EventLoop *loop, int fd);
+ * >=0 on readiness, <0 on select() error.  `fd` is a myon_fd_t so a Windows
+ * SOCKET survives without truncation (known-issue #5). */
+int event_loop_wait_readable(EventLoop *loop, myon_fd_t fd);
+int event_loop_wait_writable(EventLoop *loop, myon_fd_t fd);
 
 /* From the running task: suspend for at least `ms` milliseconds. */
 void event_loop_sleep_ms(EventLoop *loop, long long ms);

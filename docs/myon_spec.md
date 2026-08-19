@@ -1343,27 +1343,34 @@ POSIX 版との主な差異は以下の通り（挙動・戻り値の規約は L
   （FFI の Windows 実装 `ffi_platform.c` と同じ手法）。
 - **リンク**：Windows ビルドでは `-lws2_32` を追加でリンクする（Makefile）。
 
-**Step3（イベントループ）での fd 型の決着（Step2 申し送りの解消）**：
-`net_raw_fd()` の戻り値型は `int` だが、Windows の `SOCKET` は
-64bit 環境で `UINT_PTR`（64bit）である。Step3 で `event_loop.c` の Windows
-版（Fiber + Winsock `select()`）を実装するにあたり、fd の型設計を次のように
-**確定**した。
+**fd 型の決着（既知の課題 #5 の恒久対応）**：
+`net_raw_fd()` が返す raw fd/socket は、Windows の `SOCKET`（64bit 環境で
+`UINT_PTR`）を `int` に切り詰めていた。Step2/Step3 の当初設計では「Winsock の
+カーネルハンドルは 32bit に収まる」ことに依拠し公開 fd 型を `int` に据え置いて
+いたが（実用上は安全だが型として不正確）、既知の課題 #5 の恒久対応として
+fd 型を次のように**確定・修正**した。
 
-- **公開インターフェースの fd 型は全プラットフォームで `int` のまま維持する**
-  （`event_loop.h` の `event_loop_wait_readable/writable(int fd)`、`net.h` の
-  `net_raw_fd() ret int`）。これは Linux 側では fd がまさに `int` であり、
-  ここを `intptr_t` 相当へ広げるのは Linux にとって無意味なインターフェース
-  破壊になるため。また `interpreter.c` 内で fd を持ち回る多数の `int fd`
-  ローカル変数への波及も避けられる。
-- **Windows 側では `SOCKET` の再構成を局所化する**。`event_loop.c` と `net.c`
-  の Windows 分岐で、Winsock `select()`/`fd_set` に渡す直前にのみ
-  `(SOCKET)(UINT_PTR)(unsigned int)fd` で `int` → `SOCKET` を復元する。
-  Winsock のカーネルハンドルは 32bit に収まる仕様（Microsoft Learn
-  "Socket Handles"）であり、`(unsigned int)` によるゼロ拡張で元の
-  `SOCKET` 値がロスなく復元される。したがって `int` 往復は実用上安全であり、
-  切り詰めによる不具合は生じない。
+- **公開インターフェースの fd 型を `myon_fd_t`（`intptr_t` 相当、`src/net.h`）に
+  統一する**。無効値は `MYON_INVALID_FD`。`net_raw_fd()` の戻り値、
+  `net_sync_wait_fd()` の引数、`event_loop_wait_readable/writable()` と
+  `Task.waiting_fd`、`interpreter.c` 内で fd を持ち回るローカル変数を
+  すべて `myon_fd_t` に広げた。これにより Windows の `SOCKET` が切り詰められず
+  そのまま往復する。
+- **Linux では `myon_fd_t` は実質 `int` の値域**であり、`FD_SET`/`select()` に
+  渡す直前に `(int)` へ戻す（widening はロスレスなのでこの narrowing は安全）。
+  Linux の挙動は従来と不変。
+- **Windows 側の `SOCKET` 復元は自明化した**。`(unsigned int)` によるゼロ拡張
+  再構成は不要になり、`event_loop.c` の `fd_to_socket()` は
+  `(SOCKET)(UINT_PTR)fd`、`net.c` は `(SOCKET)(UINT_PTR)fd` のみで復元する。
+- **回帰防止（CI）**：`src/net.c` の `_WIN32` 分岐に
+  `static_assert(sizeof(myon_fd_t) >= sizeof(SOCKET), ...)` を置き、fd 型が
+  再び狭くなった場合に Windows ビルド（`win-cross`/`win-native`）を
+  コンパイル時に失敗させる。`.github/workflows/heavy-checks.yml` の `win-cross`
+  ジョブには、正（Windows 向け `net.c` のコンパイル成功）と負の対照
+  （`myon_fd_t` を `int` に狭めた TU が同アサートで失敗する）を確認する
+  検証ステップを追加した。
 
-**Windows 同期待機ヘルパ `net_sync_wait_fd(int fd, int for_write)`**：
+**Windows 同期待機ヘルパ `net_sync_wait_fd(myon_fd_t fd, int for_write)`**：
 コルーチン外（同期文脈）での単一 fd 待機は、従来 `interpreter.c` が
 `select(2)` を直接呼んでいた。Windows では Winsock の `select()` が
 `<winsock2.h>`（→ `<windows.h>` → `<winnt.h>`）を引き込み、`winnt.h` の

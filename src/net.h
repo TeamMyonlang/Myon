@@ -38,6 +38,22 @@
  *     -1    a real error (*err_msg set, caller frees)
  */
 
+#include <stdint.h>
+
+/*
+ * Known-issue #5 fix: raw-fd width.
+ *
+ * A POSIX file descriptor is an `int`, but a Windows Winsock SOCKET is a
+ * UINT_PTR (64-bit on x64).  The public raw-fd type used to be a plain `int`,
+ * which truncated the SOCKET on Windows (safe in practice only because Winsock
+ * kernel handles are documented to fit in 32 bits, but type-incorrect).  We now
+ * carry the raw fd/socket as `myon_fd_t`, an intptr_t-sized integer that holds
+ * either representation losslessly.  On Linux this is exactly an int's worth of
+ * range, so behaviour there is unchanged; on Windows the full SOCKET survives
+ * the round trip.  MYON_INVALID_FD is the sentinel returned for a bad id. */
+typedef intptr_t myon_fd_t;
+#define MYON_INVALID_FD ((myon_fd_t)-1)
+
 typedef struct NetState NetState;
 
 NetState *net_state_create(void);
@@ -80,8 +96,10 @@ long long net_sendto(NetState *st, int sock_id, const char *data,
 long long net_recvfrom(NetState *st, int sock_id, char *buf, long long buf_len,
                        char **from_addr_out, char **err_msg);
 
-/* Raw fd (for the interpreter to register with the event loop's select). */
-int net_raw_fd(NetState *st, int sock_id);
+/* Raw fd/socket (for the interpreter to register with the event loop's select).
+ * Returns MYON_INVALID_FD for an invalid socket id.  See myon_fd_t above for
+ * why this is intptr_t-sized rather than int (known-issue #5). */
+myon_fd_t net_raw_fd(NetState *st, int sock_id);
 
 /*
  * Synchronous single-fd wait (Windows helper, Phase5 Step3).
@@ -94,7 +112,7 @@ int net_raw_fd(NetState *st, int sock_id);
  * TokenType.  On Linux the interpreter still uses select(2) inline; this
  * helper's Linux/stub definitions are provided only for symmetry.
  */
-void net_sync_wait_fd(int fd, int for_write);
+void net_sync_wait_fd(myon_fd_t fd, int for_write);
 
 void net_close(NetState *st, int sock_id);
 

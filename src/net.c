@@ -388,16 +388,18 @@ long long net_recvfrom(NetState *st, int sock_id, char *buf, long long buf_len,
     return (long long)n;
 }
 
-int net_raw_fd(NetState *st, int sock_id) {
-    if (!valid_id(st, sock_id)) return -1;
-    return st->fds[sock_id];
+myon_fd_t net_raw_fd(NetState *st, int sock_id) {
+    if (!valid_id(st, sock_id)) return MYON_INVALID_FD;
+    /* POSIX fds are ints; widening to myon_fd_t (intptr_t) is lossless. */
+    return (myon_fd_t)st->fds[sock_id];
 }
 
-void net_sync_wait_fd(int fd, int for_write) {
+void net_sync_wait_fd(myon_fd_t fd, int for_write) {
     if (fd < 0) return;
-    fd_set fds; FD_ZERO(&fds); FD_SET(fd, &fds);
-    if (for_write) select(fd + 1, NULL, &fds, NULL, NULL);
-    else           select(fd + 1, &fds, NULL, NULL, NULL);
+    int ifd = (int)fd; /* a POSIX fd always fits back into int */
+    fd_set fds; FD_ZERO(&fds); FD_SET(ifd, &fds);
+    if (for_write) select(ifd + 1, NULL, &fds, NULL, NULL);
+    else           select(ifd + 1, &fds, NULL, NULL, NULL);
 }
 
 void net_close(NetState *st, int sock_id) {
@@ -458,6 +460,22 @@ void net_close(NetState *st, int sock_id) {
 #include <limits.h>
 
 #define NET_MAX_SOCKETS 256
+
+/*
+ * Known-issue #5 verification (compile-time).
+ *
+ * The fix carries raw fds/sockets as `myon_fd_t` (intptr_t-sized) so a Windows
+ * SOCKET (UINT_PTR) survives net_raw_fd() -> event loop -> fd_to_socket()
+ * without the old (int) truncation.  Assert here, in the one translation unit
+ * that actually sees the real SOCKET type, that myon_fd_t is at least as wide
+ * as SOCKET: if a future change ever narrows myon_fd_t back toward int, this
+ * static assert fails the Windows (win-cross / win-native) build instead of
+ * silently reintroducing the truncation bug.  static_assert comes from
+ * <assert.h> (C11); the message shows up verbatim in the compiler error.
+ */
+#include <assert.h>
+static_assert(sizeof(myon_fd_t) >= sizeof(SOCKET),
+              "known-issue #5: myon_fd_t must hold a Windows SOCKET without truncation");
 
 /* Windows-specific NetState: the fd table must hold SOCKET (UINT_PTR) values,
  * which do not fit in the `int fds[]` the Linux struct uses.  net.h forward-
@@ -844,33 +862,22 @@ long long net_recvfrom(NetState *st, int sock_id, char *buf, long long buf_len,
     return (long long)n;
 }
 
-int net_raw_fd(NetState *st, int sock_id) {
-    if (!valid_id(st, sock_id)) return -1;
-    /* NOTE (Step3 hand-off): the public net_raw_fd() signature returns int, but
-     * a Windows SOCKET is a UINT_PTR (64-bit on x64).  The cast below truncates
-     * the handle to int.  It is currently safe *in practice* because Winsock
-     * kernel handles are documented to fit in 32 bits (see "Socket Handles" in
-     * the Winsock docs), and the interpreter only round-trips this value back
-     * through net.c on the same platform where int is 32-bit.  However, this is
-     * relied upon by event_loop.c's select() multiplexing, which Step3 will
-     * port to Windows.  If Step3 needs to pass the raw SOCKET to a Windows
-     * select()/fd_set directly (rather than re-looking it up by id), the
-     * net_raw_fd() return type — and its callers in event_loop.c /
-     * interpreter.c — should be widened to an intptr_t-sized type to avoid the
-     * truncation.  See the Step3 hand-off note in docs/myon_spec.md (10.7). */
-    return (int)st->socks[sock_id];
+myon_fd_t net_raw_fd(NetState *st, int sock_id) {
+    if (!valid_id(st, sock_id)) return MYON_INVALID_FD;
+    /* Known-issue #5 fix: myon_fd_t is intptr_t-sized, so the full UINT_PTR
+     * SOCKET now round-trips without truncation.  The previous (int) cast is
+     * gone; the handle is carried at its native width on every platform. */
+    return (myon_fd_t)st->socks[sock_id];
 }
 
-void net_sync_wait_fd(int fd, int for_write) {
-    if (fd < 0) return;
-    /* Reconstruct the SOCKET from the int fd (net_raw_fd truncated it; Winsock
-     * socket handles are documented to fit in 32 bits — see the Step3 hand-off
-     * note above and docs/myon_spec.md 10.7).  Zero-extend via (unsigned int)
-     * so the value is not sign-extended into the 64-bit UINT_PTR SOCKET.
+void net_sync_wait_fd(myon_fd_t fd, int for_write) {
+    if (fd == MYON_INVALID_FD) return;
+    /* Known-issue #5 fix: fd already carries the full SOCKET width (myon_fd_t),
+     * so no reconstruction/zero-extension trick is needed any more.
      *
      * Winsock select(): the fd_set is an array of SOCKETs and the first (nfds)
      * argument is ignored (kept only for BSD source compatibility), so pass 0. */
-    SOCKET s = (SOCKET)(UINT_PTR)(unsigned int)fd;
+    SOCKET s = (SOCKET)(UINT_PTR)fd;
     fd_set fds; FD_ZERO(&fds); FD_SET(s, &fds);
     if (for_write) select(0, NULL, &fds, NULL, NULL);
     else           select(0, &fds, NULL, NULL, NULL);
@@ -911,8 +918,8 @@ long long net_send(NetState *st, int sock_id, const char *data, long long len, c
 long long net_recv(NetState *st, int sock_id, char *buf, long long buf_len, char **err_msg) { (void)st;(void)sock_id;(void)buf;(void)buf_len; unsupported(err_msg); return -1; }
 long long net_sendto(NetState *st, int sock_id, const char *data, long long len, const char *host, int port, char **err_msg) { (void)st;(void)sock_id;(void)data;(void)len;(void)host;(void)port; unsupported(err_msg); return -1; }
 long long net_recvfrom(NetState *st, int sock_id, char *buf, long long buf_len, char **from_addr_out, char **err_msg) { (void)st;(void)sock_id;(void)buf;(void)buf_len;(void)from_addr_out; unsupported(err_msg); return -1; }
-int net_raw_fd(NetState *st, int sock_id) { (void)st;(void)sock_id; return -1; }
-void net_sync_wait_fd(int fd, int for_write) { (void)fd; (void)for_write; }
+myon_fd_t net_raw_fd(NetState *st, int sock_id) { (void)st;(void)sock_id; return MYON_INVALID_FD; }
+void net_sync_wait_fd(myon_fd_t fd, int for_write) { (void)fd; (void)for_write; }
 void net_close(NetState *st, int sock_id) { (void)st;(void)sock_id; }
 
 #endif /* MYON_NET_POSIX / _WIN32 / stub */

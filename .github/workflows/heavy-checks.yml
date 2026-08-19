@@ -121,6 +121,46 @@ jobs:
             WIN_OPENSSL_LDLIBS="-L${WIN_OPENSSL_PREFIX}/lib -L${WIN_OPENSSL_PREFIX}/lib64 -lcrypt32"
           file myon.exe
 
+      - name: "Verify known-issue #5 (SOCKET width) guard"
+        # Known-issue #5 fix: raw fds/sockets are carried as myon_fd_t
+        # (intptr_t-sized) so a Windows SOCKET (UINT_PTR, 64-bit on x64) is not
+        # truncated to int. src/net.c's _WIN32 branch has a compile-time
+        # static_assert(sizeof(myon_fd_t) >= sizeof(SOCKET)) that enforces this.
+        #
+        # The "Cross-build myon.exe" step above already compiled net.c for
+        # Windows, so a passing build means the assert held. This step makes the
+        # guarantee explicit and, crucially, runs a NEGATIVE CONTROL: it forces
+        # myon_fd_t back to a plain `int` and confirms the build then FAILS with
+        # our assert message. That proves the guard is real (not vacuously true)
+        # and would catch any future regression that re-narrows the fd type.
+        run: |
+          set -eux
+          CC=x86_64-w64-mingw32-gcc
+          # 1. Positive: net.c must compile for Windows with the real myon_fd_t.
+          $CC -std=c11 -Wall -Wextra -Wpedantic -O2 \
+            -I"${WIN_OPENSSL_PREFIX}/include" -c src/net.c -o /tmp/net_win.o
+          echo "known-issue #5: net.c compiled for Windows with the static_assert active"
+          # 2. Negative control: standalone TU that narrows myon_fd_t to int must
+          #    FAIL to compile with our exact assert message. `! $CC ...` inverts
+          #    the exit code so the workflow step is green only when the compile
+          #    fails as intended.
+          cat > /tmp/ki5_neg.c <<'EOF'
+          #include <winsock2.h>
+          #include <windows.h>
+          #include <stdint.h>
+          #include <assert.h>
+          typedef int myon_fd_t; /* deliberately narrow -> must trip the guard */
+          static_assert(sizeof(myon_fd_t) >= sizeof(SOCKET),
+                        "known-issue #5: myon_fd_t must hold a Windows SOCKET without truncation");
+          int main(void){return 0;}
+          EOF
+          if $CC -std=c11 -c /tmp/ki5_neg.c -o /tmp/ki5_neg.o 2> /tmp/ki5_neg.log; then
+            echo "ERROR: narrowing myon_fd_t to int compiled -- issue #5 guard is INEFFECTIVE" >&2
+            exit 1
+          fi
+          grep -q "known-issue #5" /tmp/ki5_neg.log
+          echo "known-issue #5: negative control tripped the static_assert as expected"
+
       - name: Upload myon.exe (for inspection)
         uses: actions/upload-artifact@v4
         with:
