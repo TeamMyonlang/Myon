@@ -1,0 +1,36 @@
+# net/http/tls hardening: myon.http URL validation (2026-08-19).
+#
+# These cases all fail *before* any socket connect, so they are deterministic
+# and need no network access (CI-safe).  They assert that http_parse_url()
+# rejects malformed / injection-prone authorities and request-targets instead
+# of silently connecting somewhere unexpected:
+#
+#   - a port above 65535                 -> "port out of range"
+#   - a non-numeric port                 -> "non-numeric port"
+#   - whitespace/control byte in host    -> "illegal character in host"  (CRLF/
+#                                            header-injection defence)
+#   - an empty authority                 -> "missing host"
+#
+# The status is 0 and the body is empty in every rejected case.
+module myon.stdio
+module myon.http
+
+# 1. port out of range (65536 > 65535)
+b1, s1, e1 = myon.http.get("http://example.com:65536/")
+myon.print(s1)
+myon.print(e1)
+
+# 2. non-numeric port
+b2, s2, e2 = myon.http.get("http://example.com:80x/")
+myon.print(s2)
+myon.print(e2)
+
+# 3. illegal (space) character in host -> would enable header injection
+b3, s3, e3 = myon.http.get("http://exa mple.com/")
+myon.print(s3)
+myon.print(e3)
+
+# 4. missing host
+b4, s4, e4 = myon.http.get("http:///path")
+myon.print(s4)
+myon.print(e4)

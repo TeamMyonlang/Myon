@@ -309,3 +309,70 @@ cc -std=c11 -g -O0 -fsanitize=address,undefined -fno-omit-frame-pointer \
   `hn >= sizeof(header)` になり、その後の `memcpy(buf, header, (size_t)hn)` がスタックバッファ外を読む。
 - **推奨修正**: `hn >= (int)sizeof(header)` をエラーとして扱うか、`snprintf(NULL, 0, ...)` / 動的確保で
   報告サイズ分のヘッダーを作ってからコピーする。
+
+---
+
+## D. 2026-08-19 ネットワーク（net/http/tls）堅牢化パス
+
+`myon` のネット関係（`src/tls.c` / `src/http.c` 相当のクライアント / `src/net.c`）を、
+OpenSSL 3.x 公式ガイド
+（<https://docs.openssl.org/3.3/man7/ossl-guide-tls-client-block/>）と RFC 8996
+（TLS 1.0/1.1 の非推奨）・RFC 6066（SNI）に沿って堅牢化した。従来 README で
+「ベストエフォートで MITM に脆弱な可能性」と注記していた TLS クライアントを、
+**フェイルクローズ**の実装へ引き上げるのが主眼。
+
+### D-1. 🔴 TLS クライアントの証明書検証をフェイルクローズ化（`src/tls.c`）
+
+- **従来**: `SSL_CTX_set_default_verify_paths` + `SSL_VERIFY_PEER` +
+  `SSL_set1_host` は入っていたが、(a) IP リテラルの扱い、(b) 空ホスト名時の
+  素通り、(c) 失効・不一致理由の握りつぶし、(d) 最低プロトコルバージョン未設定、
+  (e) ハンドシェイクの無制限待ち、が弱点だった。
+- **対応**:
+  - **最低 TLS 1.2 を強制**（`SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION)`）。
+    RFC 8996 に従い SSLv3/TLS1.0/1.1 を拒否。TLS 1.3 は対応時に自動選択。
+  - `SSL_OP_NO_COMPRESSION`（CRIME 対策）・`SSL_OP_NO_RENEGOTIATION` を設定、
+    セキュリティレベル 2 を明示。
+  - **ホスト名を必須化**。空ホスト名の TLS は「任意の証明書を受理」に堕ちるため
+    拒否する。
+  - **IP リテラルと DNS 名を分岐**。DNS 名は SNI + `SSL_set1_host`、IP リテラルは
+    SNI を送らず（RFC 6066）`X509_VERIFY_PARAM_set1_ip_asc` で iPAddress SAN 照合。
+    部分ワイルドカードは `X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS` で禁止。
+  - **失敗理由を可視化**。`SSL_get_verify_result` + `X509_verify_cert_error_string`
+    で「certificate has expired」「hostname mismatch」「self-signed certificate」等を
+    エラー文字列に含める。ハンドシェイク後も検証結果を再確認して二重に防御。
+  - **ハンドシェイクにタイムアウト**（既定 30 秒）。非ブロッキング fd の
+    `select()` スピンを絶対デッドラインで打ち切り、ハングした / 遅い peer が
+    シングルスレッドのインタプリタを無限に占有するのを防ぐ。
+  - `SSL_read`/`SSL_write` を `SSL_read_ex`/`SSL_write_ex`（`size_t` 版）へ移行し、
+    負の長さは拒否。
+- **動的検証**: `badssl.com` に対して expired / wrong.host / self-signed が
+  いずれも status=0 で明示エラー、tls-v1-1 は「unsupported protocol」で拒否、
+  tls-v1-2 と正規サイトは 200。ASan/UBSan でリーク・UB なし。
+
+### D-2. 🟠 HTTP クライアント URL の CRLF/ヘッダインジェクション対策（`src/interpreter.c`）
+
+- **場所**: `http_parse_url()`
+- **内容**: URL 由来の `host` は `Host:` ヘッダに、`path` はリクエストラインに
+  そのまま補間される。CR/LF/NUL/空白などの制御バイトが混入すると、追加の
+  リクエスト行・ヘッダを注入（HTTP リクエスト/ヘッダインジェクション）できた。
+  またポートは `strtol` で範囲外・非数値でも黙って既定値へフォールバックしていた。
+- **対応**:
+  - ポートを厳格にパース（`[1,65535]`、桁数・非数値・末尾ゴミを検査）し、
+    不正なら明示エラー。IPv6 authority の `]` 直後のゴミも拒否。
+  - `host` の制御・空白バイト（`<=0x20` / `0x7f`）を拒否。
+  - `path`（リクエストターゲット）の制御バイト（`<0x20` / `0x7f`）を拒否。
+
+### D-3. 🟠 低水準ソケットのポート範囲チェック（`src/net.c`）
+
+- **場所**: `fill_addr()`（POSIX / Windows 両分岐）
+- **内容**: `htons((unsigned short)port)` は範囲外 `port` を黙って 16bit に
+  巻き込む（例: 65536→0、-1→65535）ため、`myon.net.connect`/`bind` が意図しない
+  ポートへ向かう恐れ。
+- **対応**: `port < 0 || port > 65535` を拒否（`bind` の ephemeral 用に 0 は許可）。
+
+### D-4. ✅ 回帰テスト追加
+
+- `tests/cases/p_http_url_hardening.{myon,out}`: ポート範囲外・非数値ポート・
+  ホスト内不正文字・ホスト欠落がいずれも接続前に明示エラーで拒否されることを
+  固定（ネットワーク不要で CI セーフ）。`run_mvm_tests.sh` の除外リストにも追加。
+- 通常ビルド・`make test`・`make test-asan` すべて緑。
