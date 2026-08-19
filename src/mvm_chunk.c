@@ -54,6 +54,10 @@ const char *mvm_opcode_name(uint8_t op) {
         case MOP_JUMP_IF_FALSE:return "JUMP_IF_FALSE";
         case MOP_JUMP_IF_TRUE: return "JUMP_IF_TRUE";
         case MOP_MAKE_CLOSURE: return "MAKE_CLOSURE";
+        case MOP_LOAD_UPVALUE: return "LOAD_UPVALUE";
+        case MOP_STORE_UPVALUE:return "STORE_UPVALUE";
+        case MOP_SPAWN_ASYNC:  return "SPAWN_ASYNC";
+        case MOP_AWAIT:        return "AWAIT";
         case MOP_CALL:         return "CALL";
         case MOP_RET:          return "RET";
         case MOP_NEW_ARRAY:    return "NEW_ARRAY";
@@ -90,26 +94,50 @@ int mvm_opcode_operand_bytes(uint8_t op) {
         case MOP_STR_CONCAT: case MOP_TO_STR:
         case MOP_CAST_STR: case MOP_CAST_INT: case MOP_CAST_CHAR: case MOP_MAKE_ERROR:
         case MOP_CHECK_NOT_NIL:
+        case MOP_AWAIT:
             return 0;
         /* one u16 */
         case MOP_PUSH_CONST:
         case MOP_LOAD_LOCAL: case MOP_STORE_LOCAL:
         case MOP_LOAD_GLOBAL: case MOP_STORE_GLOBAL:
+        case MOP_LOAD_UPVALUE: case MOP_STORE_UPVALUE:
         case MOP_JUMP: case MOP_JUMP_IF_FALSE: case MOP_JUMP_IF_TRUE:
-        case MOP_MAKE_CLOSURE:
         case MOP_NEW_ARRAY: case MOP_NEW_MAP:
         case MOP_NEW_STRUCT: case MOP_GET_FIELD: case MOP_SET_FIELD:
             return 2;
         /* one u8 */
         case MOP_CALL: case MOP_RET: case MOP_UNPACK:
+        case MOP_SPAWN_ASYNC:
             return 1;
         /* u16 + u8 */
         case MOP_INVOKE:
         case MOP_CALL_NATIVE:
             return 3;
+        /*
+         * MOP_MAKE_CLOSURE is variable-length: u16 chunk_idx, u8 nupval, then
+         * nupval x (u8 kind, u16 index).  Its size cannot be expressed as a
+         * fixed operand count; callers that walk the code stream (disassembler,
+         * .myc reader) special-case it via mvm_make_closure_len().  Return -2 as
+         * a sentinel so a naive fixed-width walk fails loudly instead of
+         * silently mis-decoding.
+         */
+        case MOP_MAKE_CLOSURE:
+            return -2;
         default:
             return -1;
     }
+}
+
+int mvm_instruction_len(const uint8_t *code) {
+    uint8_t op = code[0];
+    if (op == MOP_MAKE_CLOSURE) {
+        /* u16 chunk_idx, u8 nupval, then nupval x (u8 kind, u16 index) */
+        uint8_t nupval = code[3];
+        return 1 + 2 + 1 + (int)nupval * 3;
+    }
+    int nb = mvm_opcode_operand_bytes(op);
+    if (nb < 0) return 0;
+    return 1 + nb;
 }
 
 /* ================================================================== */
@@ -127,6 +155,7 @@ static void chunk_free(Chunk *c) {
     free(c->name);
     free(c->code);
     free(c->lines);
+    free(c->captured);
     free(c);
 }
 
@@ -382,7 +411,7 @@ void mvm_chunk_disassemble(const Module *m, const Chunk *c, FILE *out) {
         uint8_t op = c->code[off];
         const char *name = mvm_opcode_name(op);
         int nb = mvm_opcode_operand_bytes(op);
-        if (nb < 0) {
+        if (nb == -1) {
             fprintf(out, "%-14s <unknown opcode 0x%02X>\n", "???", op);
             off += 1;
             continue;
@@ -426,8 +455,20 @@ void mvm_chunk_disassemble(const Module *m, const Chunk *c, FILE *out) {
             }
             case MOP_MAKE_CLOSURE: {
                 uint16_t idx = rd_u16(p);
+                uint8_t nupval = p[2];
                 const char *cn = (idx < (uint16_t)m->chunk_count) ? m->chunks[idx]->name : "?";
-                fprintf(out, "%-14s %u\t; chunk %s\n", name, idx, cn);
+                fprintf(out, "%-14s %u, %u upval\t; chunk %s\n", name, idx, nupval, cn);
+                break;
+            }
+            case MOP_LOAD_UPVALUE:
+            case MOP_STORE_UPVALUE: {
+                uint16_t idx = rd_u16(p);
+                fprintf(out, "%-14s %u\n", name, idx);
+                break;
+            }
+            case MOP_SPAWN_ASYNC: {
+                uint8_t a = p[0];
+                fprintf(out, "%-14s %u\n", name, a);
                 break;
             }
             case MOP_CALL:
@@ -455,7 +496,7 @@ void mvm_chunk_disassemble(const Module *m, const Chunk *c, FILE *out) {
                 fprintf(out, "%s\n", name);
                 break;
         }
-        off += 1 + (uint32_t)nb;
+        off += (uint32_t)mvm_instruction_len(&c->code[off]);
     }
 }
 
@@ -553,6 +594,10 @@ static void ser_chunk(Buf *b, const Chunk *c) {
     buf_u16(b, c->num_params);
     buf_u16(b, c->num_locals);
     buf_u16(b, c->ret_count);
+    buf_u8(b, c->is_async);
+    /* captured-slot bitmap (spec §7.3, minor 1): u16 length + that many bytes */
+    buf_u16(b, c->captured_len);
+    if (c->captured_len) buf_bytes(b, c->captured, c->captured_len);
     buf_u32(b, c->code_len);
     buf_bytes(b, c->code, c->code_len);
     buf_u32(b, c->line_count);
@@ -740,6 +785,14 @@ Module *mvm_module_read_file(const char *path) {
         c->num_params = rd16(&r);
         c->num_locals = rd16(&r);
         c->ret_count  = rd16(&r);
+        c->is_async   = rd8(&r);
+        c->captured_len = rd16(&r);
+        if (c->captured_len) {
+            if (r.err || r.pos + c->captured_len > r.len) { r.err = 1; break; }
+            c->captured = (uint8_t *)myon_xmalloc(c->captured_len);
+            memcpy(c->captured, r.p + r.pos, c->captured_len);
+            r.pos += c->captured_len;
+        }
         c->code_len   = rd32(&r);
         if (r.err || r.pos + c->code_len > r.len) { r.err = 1; break; }
         c->code_cap = c->code_len ? c->code_len : 1;

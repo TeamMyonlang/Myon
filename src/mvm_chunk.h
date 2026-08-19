@@ -49,6 +49,18 @@ typedef struct Chunk {
     uint16_t  num_params;
     uint16_t  num_locals;  /* total local slots this chunk uses (spec §5.5) */
     uint16_t  ret_count;
+    uint8_t   is_async;    /* 1 if compiled from a `myon.async myon.func` (spec §14.9) */
+
+    /*
+     * Per-local-slot capture bitmap (spec §7.3).  captured[s] != 0 means slot
+     * `s` is captured by some nested closure, so the VM must box it in a shared
+     * UpvalueCell for the frame's whole lifetime (rather than holding the value
+     * inline on the operand stack) so a closure's mutation is visible to the
+     * defining frame and to sibling closures.  NULL when no slot is captured.
+     * Length is num_locals.  Serialized after `code` in the .myc (minor 1).
+     */
+    uint8_t  *captured;
+    uint16_t  captured_len;   /* number of valid bytes in `captured` */
 
     uint8_t  *code;        /* bytecode bytes */
     uint32_t  code_len;

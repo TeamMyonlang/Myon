@@ -1676,6 +1676,19 @@ static int call_ffi(Interp *it, Env *env, const char *name, Expr *call, Value *o
                 "ffi.make_callback expects (func fn, int arg_count)")));
             return 1;
         }
+        /* A VM (MVM) closure encodes a chunk index in as.fn.mvm_chunk rather
+         * than a real FuncDecl*, so the tree-walk callback dispatcher (which
+         * runs FFI callbacks via call_function) cannot execute it.  Registering
+         * one would misbehave, so refuse cleanly: passing a VM function/lambda
+         * as an FFI callback is an MVM cross-engine limitation (spec §7).  Run
+         * the .myon source (tree-walk) for FFI-callback programs. */
+        if (fnv.as.obj->as.fn.mvm_chunk != 0) {
+            value_free(&fnv); value_free(&acv);
+            *out = make_result_pair(value_int(0), value_error(myon_strdup(
+                "MVM does not support passing a function/lambda as an FFI "
+                "callback (myon.ffi.make_callback); run the .myon source instead")));
+            return 1;
+        }
         int arg_count = (int)acv.as.i;
         value_free(&acv);
         if (arg_count < 0 || arg_count > MYON_FFI_CB_MAX_ARGS) {
@@ -5355,6 +5368,93 @@ void myon_bridge_call_method(Interp *it, Value recv, const char *method,
 
     it->bridge_args = saved_args;
     it->bridge_argc = saved_argc;
+}
+
+/* ---- async/await seam for the MVM (spec §14.9) --------------------------- */
+/*
+ * Bridge-side async, structurally identical to the tree-walker's
+ * async_task_entry / spawn_async_task / await_task above, but the task body is
+ * a caller-supplied C callback (the VM's nested dispatch loop) rather than
+ * call_function.  Running on the task's own ucontext stack means the whole VM
+ * C call stack is parked at a suspend point and resumed intact.
+ */
+typedef struct {
+    Interp       *it;
+    MyonTaskBody  body;
+    void         *ud;
+    Task         *task;      /* set after spawn */
+} BridgeTaskCtx;
+
+/*
+ * Coroutine entry for an MVM async task.  This whole function runs on the
+ * task's own C stack, so every local here (`ctx`, `res`, `has_error`) is
+ * private to this task and survives suspend/resume intact.  Crucially, the
+ * body reports its result through *stack-local* out-params rather than a
+ * shared global: with several tasks suspended and resumed out of order, a
+ * global "current task" pointer is stale by the time a resumed body finishes,
+ * which previously caused one task to record another task's return value.
+ */
+static void bridge_task_entry(void *ud) {
+    BridgeTaskCtx *ctx = (BridgeTaskCtx *)ud;
+    Interp *it = ctx->it;
+
+    Task *prev_task = it->current_task;
+    it->current_task = ctx->task;
+
+    Value *res = (Value *)myon_xmalloc(sizeof(Value));
+    *res = value_nil();
+    int has_error = 0;
+
+    /* Local error barrier: a runtime_error inside the body must not longjmp
+     * across the coroutine boundary (mirrors async_task_entry). */
+    jmp_buf saved;
+    memcpy(&saved, &it->on_error, sizeof(jmp_buf));
+    int saved_depth = it->call_depth;
+    it->call_depth = 0;
+    int cleanup_at = cleanup_mark(it);
+
+    if (setjmp(it->on_error) == 0) {
+        ctx->body(ctx->ud, res, &has_error);   /* runs the nested VM loop */
+    } else {
+        /* body raised: free skipped frames, finish with an error result */
+        cleanup_unwind(it, cleanup_at);
+        value_free(res);
+        *res = value_error(myon_strdup("async task failed"));
+        has_error = 1;
+    }
+
+    it->call_depth = saved_depth;
+    memcpy(&it->on_error, &saved, sizeof(jmp_buf));
+    it->current_task = prev_task;
+
+    event_loop_task_set_result(ctx->task, res, has_error);
+    free(ctx);
+}
+
+Value myon_bridge_spawn_task(Interp *it, MyonTaskBody body, void *ud) {
+    EventLoop *loop = ensure_loop(it);
+    BridgeTaskCtx *ctx = (BridgeTaskCtx *)myon_xmalloc(sizeof(BridgeTaskCtx));
+    ctx->it = it; ctx->body = body; ctx->ud = ud; ctx->task = NULL;
+    Task *task = event_loop_spawn(loop, bridge_task_entry, ctx);
+    ctx->task = task;
+    return value_task(task);
+}
+
+Value myon_bridge_await(Interp *it, int line, Value task_value) {
+    /* `myon.await <plain value>` is a no-op that yields the value (spec §14.9
+     * allows awaiting a non-task; matches the tree-walker). */
+    if (task_value.type != TYPE_TASK) return task_value;
+    Value out = await_task(it, line, task_value);
+    value_free(&task_value);
+    return out;
+}
+
+void myon_bridge_drain_tasks(Interp *it) {
+    /* Program-exit drain (spec §14.9): run every not-yet-awaited foreground
+     * task to completion so its side effects happen, ignoring daemon tasks
+     * (e.g. an HTTP accept loop).  Identical to interp_run's exit path. */
+    if (it->loop)
+        event_loop_run_until_foreground_done(it->loop);
 }
 
 int interpret(Program *program) {

@@ -65,14 +65,16 @@ for t in tests/cases/*.myon; do
 done
 
 # ------------------------------------------------------------------ #
-# 2. MVM-out-of-scope features must be rejected cleanly (spec §7).   #
-#    We assert both a non-zero exit AND the diagnostic wording, AND  #
-#    that no stray .myc is produced.                                 #
+# 2. Features that used to be MVM-out-of-scope now COMPILE cleanly.  #
+#    async/await, net, ffi and generics were brought into the MVM    #
+#    (they run via the tree-walk bridge / event loop), so the        #
+#    compiler must accept them and emit a valid .myc.  We assert a    #
+#    zero exit, no crash, and a real "MYC1" artifact.                 #
 # ------------------------------------------------------------------ #
-echo "== MVM compiler: unsupported features error cleanly (spec §7) =="
+echo "== MVM compiler: async/net/ffi/generics now compile cleanly =="
 
-# expect_unsupported <label> <inline-myon-source>
-expect_unsupported() {
+# expect_compiles <label> <inline-myon-source>
+expect_compiles() {
     local label="$1" src="$2"
     local f="$TMPD/$label.myon"
     local out="$TMPD/$label.myc"
@@ -82,24 +84,23 @@ expect_unsupported() {
     local rc=$?
     if crashed "$rc"; then
         bad "$label (crashed, exit=$rc)"
-    elif [ "$rc" -eq 0 ]; then
-        bad "$label (expected a compile error, but exit was 0)"
-    elif ! printf '%s' "$msg" | grep -q "MVM does not support"; then
-        bad "$label (wrong diagnostic: $msg)"
-    elif [ -f "$out" ]; then
-        bad "$label (a .myc was produced despite the error)"
+    elif [ "$rc" -ne 0 ]; then
+        bad "$label (expected a clean compile, but exit was $rc: $msg)"
+    elif [ ! -f "$out" ]; then
+        bad "$label (no .myc produced)"
+    elif [ "$(head -c 4 "$out")" != "MYC1" ]; then
+        bad "$label (bad .myc magic)"
     else
-        ok "$label"
+        ok "$label (compiled to .myc)"
     fi
 }
 
-expect_unsupported async  'myon.async myon.func f() ret void { }'
-expect_unsupported await   'x = myon.await foo()'
-expect_unsupported net     'module myon.net
-s = myon.net.tcp_listen("127.0.0.1", 8080)'
-expect_unsupported ffi     'module myon.ffi
-h = myon.ffi.load("libc.so.6")'
-expect_unsupported generic 'myon.func id<T>(x: T) ret T { ret x }'
+expect_compiles async   'myon.async myon.func f() ret void { }'
+expect_compiles net     'module myon.net
+s, e = myon.net.tcp_socket()'
+expect_compiles ffi     'module myon.ffi
+h, e = myon.ffi.load("libc.so.6")'
+expect_compiles generic 'myon.func id<T>(x: T) ret T { ret x }'
 
 # ------------------------------------------------------------------ #
 # 3. Hand-written samples compile, disassemble and round-trip.       #

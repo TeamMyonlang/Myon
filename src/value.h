@@ -92,6 +92,21 @@ typedef struct {
     int         tparam_count;
 } StructData;
 
+/*
+ * A boxed, reference-counted upvalue cell (MVM closures, spec §7.3).
+ *
+ * Myon closures capture *variables*, not snapshots: a lambda that mutates a
+ * captured outer local must be observable by the enclosing function and by
+ * sibling closures over the same variable, exactly like the tree-walking
+ * interpreter's shared Env.  The MVM realizes this by boxing each captured
+ * slot in a heap cell that both the defining frame and every capturing closure
+ * point at.  The cell is refcounted so it outlives the frame that created it.
+ */
+typedef struct UpvalueCell {
+    Value value;
+    int   refcount;
+} UpvalueCell;
+
 /* function object: closure over a definition environment */
 typedef struct {
     struct FuncDecl *decl;  /* the declaration/lambda AST (not owned) */
@@ -99,6 +114,17 @@ typedef struct {
     /* If this is a bound method, `self` holds the receiver (owned copy). */
     int              is_bound;
     Value           *bound_self;
+    /*
+     * MVM-only closure state (unused by the tree-walker, which leaves these
+     * zero via value_func()).  `mvm_chunk` is the target chunk index + 1 when
+     * this is an MVM function value (so 0 means "not an MVM closure" and the
+     * tree-walk `decl` pointer stays valid).  `upvalues` are the boxed cells
+     * this closure captured, in the order the compiler assigned them.
+     */
+    int              mvm_chunk;      /* chunk index + 1, or 0 if tree-walk fn */
+    int              mvm_is_async;   /* 1 if the target chunk is `myon.async` */
+    UpvalueCell    **upvalues;       /* owned array of borrowed cell refs */
+    int              upvalue_count;
 } FuncData;
 
 /* async task handle (Phase5): opaque pointer into the event loop.  The
@@ -157,6 +183,11 @@ void   struct_add_field(Value *sv, const char *name, Value v);
 /* array helpers */
 void  array_push(Value *av, Value v);
 int   array_pop(Value *av, Value *out);   /* returns 0 if empty */
+
+/* ---- MVM upvalue cells (boxed captured variables, spec §7.3) ---- */
+UpvalueCell *upvalue_cell_new(Value initial /* owned */);
+UpvalueCell *upvalue_cell_ref(UpvalueCell *c);     /* bump refcount, returns c */
+void         upvalue_cell_unref(UpvalueCell *c);   /* drop one ref, free at 0 */
 
 /* map helpers */
 void  map_set(Value *mv, Value key, Value val);
