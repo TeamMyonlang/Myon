@@ -71,9 +71,7 @@ DNS 名前解決（`getaddrinfo`）は libc に含まれるため追加依存は
 
 ### Windows でのビルド
 
-Windows は MinGW-w64（MSYS2 の native ビルド、または Linux からのクロスコンパイル）で
-ビルドできます。現状 **Wine 上でのリンク確認まで**しか行っておらず、実機での動作は
-未検証です（詳細は [`docs/features.md`](docs/features.md) の Phase 6 を参照）。
+Windows は 実機で動作済みです(Github Action workflowにて)
 
 ```sh
 # MSYS2 / MinGW-w64 (native): OpenSSL を導入してから make
