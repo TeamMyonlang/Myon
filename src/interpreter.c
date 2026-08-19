@@ -3786,6 +3786,11 @@ static int http_parse_url(const char *url, char **host_out, int *port_out,
     int port = default_port;
     size_t hlen;
     const char *host_start = p;
+    /* Parse a port substring strictly into [1, 65535].  Empty / non-numeric /
+     * out-of-range / trailing-junk ports are a malformed URL and reported as
+     * an error rather than silently falling back to the default. */
+    const char *port_str = NULL; size_t port_len = 0;
+
     if (p < hostend && *p == '[') {
         /* IPv6 literal: "[::1]" or "[::1]:8080" (known-issue.md #4).  The host
          * is everything between the brackets; a ':' inside must not be treated
@@ -3799,23 +3804,71 @@ static int http_parse_url(const char *url, char **host_out, int *port_out,
         hlen = (size_t)(rb - host_start);
         const char *after = rb + 1;
         if (after < hostend && *after == ':') {
-            port = (int)strtol(after + 1, NULL, 10);
-            if (port <= 0) port = default_port;
+            port_str = after + 1;
+            port_len = (size_t)(hostend - port_str);
+        } else if (after < hostend) {
+            if (err_out) *err_out = myon_strdup("invalid URL: malformed IPv6 authority");
+            return -1;
         }
     } else {
         const char *colon = memchr(p, ':', (size_t)(hostend - p));
         if (colon) {
             hlen = (size_t)(colon - p);
-            port = (int)strtol(colon + 1, NULL, 10);
-            if (port <= 0) port = default_port;
+            port_str = colon + 1;
+            port_len = (size_t)(hostend - port_str);
         } else {
             hlen = (size_t)(hostend - p);
         }
     }
+
+    if (port_str) {
+        if (port_len == 0 || port_len > 5) {
+            if (err_out) *err_out = myon_strdup("invalid URL: bad port");
+            return -1;
+        }
+        long pv = 0;
+        for (size_t i = 0; i < port_len; i++) {
+            char c = port_str[i];
+            if (c < '0' || c > '9') {
+                if (err_out) *err_out = myon_strdup("invalid URL: non-numeric port");
+                return -1;
+            }
+            pv = pv * 10 + (c - '0');
+        }
+        if (pv < 1 || pv > 65535) {
+            if (err_out) *err_out = myon_strdup("invalid URL: port out of range (1-65535)");
+            return -1;
+        }
+        port = (int)pv;
+    }
+
     if (hlen == 0) { if (err_out) *err_out = myon_strdup("invalid URL: missing host"); return -1; }
+
+    /* Reject control/whitespace bytes in the host: it is interpolated verbatim
+     * into the "Host:" header, so CR/LF/NUL/space would enable HTTP header /
+     * request injection (CRLF injection).  A real host/IP never contains them. */
+    for (size_t i = 0; i < hlen; i++) {
+        unsigned char c = (unsigned char)host_start[i];
+        if (c <= 0x20 || c == 0x7f) {
+            if (err_out) *err_out = myon_strdup("invalid URL: illegal character in host");
+            return -1;
+        }
+    }
     char *host = (char *)myon_xmalloc(hlen + 1);
     memcpy(host, host_start, hlen); host[hlen] = '\0';
-    char *path = myon_strdup(slash ? slash : "/");
+
+    /* The request-target is interpolated into the request line; reject any
+     * control byte so a crafted URL cannot inject extra request lines/headers. */
+    const char *raw_path = slash ? slash : "/";
+    for (const char *q2 = raw_path; *q2; q2++) {
+        unsigned char c = (unsigned char)*q2;
+        if (c < 0x20 || c == 0x7f) {
+            free(host);
+            if (err_out) *err_out = myon_strdup("invalid URL: illegal character in path");
+            return -1;
+        }
+    }
+    char *path = myon_strdup(raw_path);
     *host_out = host; *port_out = port; *path_out = path;
     if (is_https_out) *is_https_out = is_https;
     return 0;

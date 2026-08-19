@@ -29,10 +29,19 @@
  *
  * The interpreter's myon.http.get / myon.http.post use this for https:// URLs.
  *
- * SECURITY NOTE: certificate verification is enabled against the system's
- * default trust store (SSL_CTX_set_default_verify_paths) with SNI-based
- * hostname checking, on a best-effort basis.  It is NOT a hardened TLS stack;
- * do not treat it as a substitute for a reviewed production TLS client.
+ * SECURITY: this client is configured to fail closed.  It verifies the peer
+ * certificate chain against the system default trust store
+ * (SSL_CTX_set_default_verify_paths + SSL_VERIFY_PEER), pins the expected
+ * identity before the handshake (SSL_set1_host for DNS names, or an iPAddress
+ * SAN match for IP literals), enforces a TLS 1.2 minimum protocol version
+ * (RFC 8996), sends SNI only for DNS names (RFC 6066), disables TLS
+ * compression / renegotiation, and bounds the handshake with a timeout.  A TLS
+ * connection with no hostname to verify is refused rather than accepted blindly.
+ *
+ * This is intended to give real MITM protection for ordinary HTTPS use.  It is
+ * still a compact wrapper (no OCSP/CRL revocation checking, no certificate
+ * pinning, no client certificates); treat those gaps accordingly for
+ * high-assurance deployments.
  *
  * Return-code convention for tls_read / tls_write mirrors net_send/net_recv:
  *     >= 0  bytes transferred (0 from tls_read == clean EOF)

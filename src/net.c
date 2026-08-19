@@ -153,6 +153,14 @@ static int fill_addr(struct sockaddr_in *sa, const char *host, int port,
                      int kind, char **err_msg) {
     memset(sa, 0, sizeof(*sa));
     sa->sin_family = AF_INET;
+    /* A TCP/UDP port is 16-bit.  Casting an out-of-range signed `port` straight
+     * to unsigned short would silently wrap (e.g. 65536 -> 0, -1 -> 65535) and
+     * connect/bind somewhere unintended.  Reject anything outside [0, 65535]
+     * (0 is allowed so bind() can request an ephemeral port). */
+    if (port < 0 || port > 65535) {
+        if (err_msg) *err_msg = dup_msg("port out of range (0-65535)");
+        return -1;
+    }
     sa->sin_port = htons((unsigned short)port);
     if (!host || host[0] == '\0' || strcmp(host, "0.0.0.0") == 0) {
         sa->sin_addr.s_addr = INADDR_ANY;
@@ -589,6 +597,14 @@ static int fill_addr(struct sockaddr_in *sa, const char *host, int port,
                      int kind, char **err_msg) {
     memset(sa, 0, sizeof(*sa));
     sa->sin_family = AF_INET;
+    /* A TCP/UDP port is 16-bit.  Casting an out-of-range signed `port` straight
+     * to unsigned short would silently wrap (e.g. 65536 -> 0, -1 -> 65535) and
+     * connect/bind somewhere unintended.  Reject anything outside [0, 65535]
+     * (0 is allowed so bind() can request an ephemeral port). */
+    if (port < 0 || port > 65535) {
+        if (err_msg) *err_msg = dup_msg("port out of range (0-65535)");
+        return -1;
+    }
     sa->sin_port = htons((unsigned short)port);
     if (!host || host[0] == '\0' || strcmp(host, "0.0.0.0") == 0) {
         sa->sin_addr.s_addr = INADDR_ANY;

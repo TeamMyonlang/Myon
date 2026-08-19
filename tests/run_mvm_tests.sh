@@ -65,6 +65,7 @@ EXCLUDED_KNOWN=(
     p5_async_order p5_async_wait_task step17_async
     # net / http
     p5_net_tcp_echo p5_net_udp_echo p5_http_serve_static p51_net_dns_localhost
+    p_http_url_hardening
     # generics
     step15_generics
     # higher-order native methods driven by a VM lambda (array.map/filter/
