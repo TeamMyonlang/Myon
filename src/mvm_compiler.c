@@ -60,14 +60,40 @@ typedef struct {
     int  scope_depth;          /* block depth the loop body opened at */
 } LoopCtx;
 
-/* One function/chunk being compiled.  Chained so nested funcs know they are
- * nested (closures over outer locals are rejected, spec §7.3). */
+/*
+ * A resolved upvalue (spec §7.3): a variable captured from an enclosing
+ * function.  `from_local` distinguishes the two capture sources the VM
+ * understands at MOP_MAKE_CLOSURE time:
+ *   from_local == 1 : `index` is a LOCAL slot in the *immediately* enclosing
+ *                     function's frame (capture the live cell there).
+ *   from_local == 0 : `index` is an UPVALUE index in the enclosing function
+ *                     (re-capture a variable it itself captured).
+ */
+typedef struct {
+    int  index;
+    int  from_local;
+    char *name;   /* borrowed from AST, for diagnostics/dedup */
+} Upvalue;
+
+#define MAX_UPVALUES 256
+
+/* One function/chunk being compiled.  Chained so nested funcs can capture
+ * their enclosing functions' locals as upvalues (closures, spec §7.3). */
 typedef struct FnComp {
     struct FnComp *enclosing;
     int    chunk_idx;
     Local  locals[MAX_LOCALS];
     int    local_count;
     int    scope_depth;
+    Upvalue upvalues[MAX_UPVALUES];
+    int     upvalue_count;
+    /*
+     * A slot is "captured" once some nested function takes it as an upvalue.
+     * The VM must then box that slot in a heap cell so the closure and the
+     * defining frame share it; the compiler records which slots need boxing so
+     * MOP_MAKE_CLOSURE can reference the cell instead of a snapshot.
+     */
+    uint8_t captured_slot[MAX_LOCALS];
     /*
      * Per-depth flag mirroring the tree-walk interpreter's Env.is_block
      * (src/env.c / src/interpreter.c §9.2): only an *explicit* `{ }` block
@@ -143,32 +169,84 @@ static int resolve_local(FnComp *fn, const char *name) {
 }
 
 /*
- * Name-resolution result (spec §5.3 / §4.6 note).
+ * Name-resolution result (spec §5.3 / §4.6 note / §7.3).
  *   NAME_LOCAL   : in the current function frame -> LOAD_LOCAL/STORE_LOCAL
  *   NAME_GLOBAL  : a top-level (<main>) binding    -> LOAD_GLOBAL/STORE_GLOBAL
- *   NAME_CAPTURE : found in an *intermediate* enclosing function -> the
- *                  closure-over-outer-locals case that §7.3 defers.
+ *   NAME_UPVALUE : captured from an enclosing function -> LOAD/STORE_UPVALUE
  *   NAME_NONE    : not a variable at all (maybe a native / struct / error).
  */
-typedef enum { NAME_NONE, NAME_LOCAL, NAME_GLOBAL, NAME_CAPTURE } NameKind;
+typedef enum { NAME_NONE, NAME_LOCAL, NAME_GLOBAL, NAME_UPVALUE } NameKind;
 
 /*
- * Resolve a read/reference of `name` walking outward from the current
- * function.  A hit in the current frame is a local; a hit in the top-level
- * <main> frame (enclosing == NULL) is a global; a hit in any frame in between
- * would require a real closure upvalue, which the initial MVM does not support
- * (§7.3).  `*out_slot` receives the slot within whichever frame matched.
+ * Is `fn` the top-level <main> function?  Only <main> holds true globals; every
+ * other FnComp is a nested function whose locals are captured as upvalues.
  */
-static NameKind resolve_name(FnComp *fn, const char *name, int *out_slot) {
+static int is_main_fn(FnComp *fn) { return fn->enclosing == NULL; }
+
+/* Record that slot `s` of `fn` is captured by some inner closure so the VM
+ * boxes it in a shared cell (spec §7.3). */
+static void mark_captured(FnComp *fn, int slot) {
+    if (slot >= 0 && slot < MAX_LOCALS) fn->captured_slot[slot] = 1;
+}
+
+/* Add an upvalue descriptor to `fn`, deduplicating identical captures. */
+static int add_upvalue(Compiler *c, FnComp *fn, int index, int from_local, char *name) {
+    for (int i = 0; i < fn->upvalue_count; i++)
+        if (fn->upvalues[i].index == index && fn->upvalues[i].from_local == from_local)
+            return i;
+    if (fn->upvalue_count >= MAX_UPVALUES)
+        compile_error(c, 0, "too many captured variables (closures) in one function");
+    fn->upvalues[fn->upvalue_count].index = index;
+    fn->upvalues[fn->upvalue_count].from_local = from_local;
+    fn->upvalues[fn->upvalue_count].name = name;
+    return fn->upvalue_count++;
+}
+
+/*
+ * Resolve `name` as an upvalue of `fn` (spec §7.3), recursing outward.  Returns
+ * the upvalue index in `fn`, or -1 if `name` is not a capturable enclosing
+ * local.  A hit in the immediately-enclosing function's frame is captured
+ * `from_local`; a deeper hit is threaded through each intermediate function as
+ * a re-captured upvalue.  <main>'s locals are globals, not upvalues, so the
+ * walk stops before <main>.
+ */
+static int resolve_upvalue(Compiler *c, FnComp *fn, const char *name) {
+    FnComp *up = fn->enclosing;
+    if (!up || is_main_fn(fn)) return -1;  /* fn is <main>: no upvalues */
+
+    int local = resolve_local(up, name);
+    if (local >= 0 && !is_main_fn(up)) {
+        mark_captured(up, local);
+        return add_upvalue(c, fn, local, 1, (char *)name);
+    }
+    if (local >= 0 && is_main_fn(up))
+        return -1;  /* enclosing is <main>: this is a global, not an upvalue */
+
+    int uv = resolve_upvalue(c, up, name);
+    if (uv >= 0)
+        return add_upvalue(c, fn, uv, 0, (char *)name);
+    return -1;
+}
+
+/*
+ * Resolve a read/reference of `name` walking outward from the current function.
+ * Precedence (spec §5.3 / §7.3): own local, then a captured enclosing local
+ * (upvalue), then a top-level <main> global.  `*out_slot` receives the local
+ * slot, upvalue index, or global slot for the matched kind.
+ */
+static NameKind resolve_name(Compiler *c, FnComp *fn, const char *name, int *out_slot) {
     int slot = resolve_local(fn, name);
     if (slot >= 0) { *out_slot = slot; return NAME_LOCAL; }
-    for (FnComp *up = fn->enclosing; up; up = up->enclosing) {
-        int s = resolve_local(up, name);
-        if (s >= 0) {
-            *out_slot = s;
-            /* the outermost frame (no enclosing) is the global <main> frame */
-            return up->enclosing ? NAME_CAPTURE : NAME_GLOBAL;
-        }
+
+    int uv = resolve_upvalue(c, fn, name);
+    if (uv >= 0) { *out_slot = uv; return NAME_UPVALUE; }
+
+    /* Fall back to a top-level <main> global. */
+    if (!is_main_fn(fn)) {
+        FnComp *root = fn;
+        while (root->enclosing) root = root->enclosing;
+        int g = resolve_local(root, name);
+        if (g >= 0) { *out_slot = g; return NAME_GLOBAL; }
     }
     return NAME_NONE;
 }
@@ -207,10 +285,20 @@ static int declare_local(Compiler *c, const char *name) {
 
 /* Open a new lexical scope.  `is_block` marks an explicit `{ }` block so the
  * §9.2 shadowing rule applies (see FnComp.depth_is_block). */
-/* Emit a load for a resolved variable (LOAD_LOCAL vs LOAD_GLOBAL). */
+/* Emit a load for a resolved variable (LOAD_LOCAL / LOAD_GLOBAL / LOAD_UPVALUE). */
 static void emit_var_load(Compiler *c, int line, NameKind k, int slot) {
-    chunk_emit_op_u16(cur_chunk(c),
-        k == NAME_GLOBAL ? MOP_LOAD_GLOBAL : MOP_LOAD_LOCAL, (uint16_t)slot, line);
+    OpCode op = (k == NAME_GLOBAL)  ? MOP_LOAD_GLOBAL
+              : (k == NAME_UPVALUE) ? MOP_LOAD_UPVALUE
+                                    : MOP_LOAD_LOCAL;
+    chunk_emit_op_u16(cur_chunk(c), op, (uint16_t)slot, line);
+}
+
+/* Emit a store for a resolved variable (STORE_LOCAL / STORE_GLOBAL / STORE_UPVALUE). */
+static void emit_var_store(Compiler *c, int line, NameKind k, int slot) {
+    OpCode op = (k == NAME_GLOBAL)  ? MOP_STORE_GLOBAL
+              : (k == NAME_UPVALUE) ? MOP_STORE_UPVALUE
+                                    : MOP_STORE_LOCAL;
+    chunk_emit_op_u16(cur_chunk(c), op, (uint16_t)slot, line);
 }
 
 static void begin_scope(Compiler *c, int is_block) {
@@ -284,14 +372,18 @@ static void register_struct(Compiler *c, StructDecl *sd) {
     c->structs[c->struct_count++] = sd;
 }
 
-/* Reject the MVM-out-of-scope stdlib namespaces up front (spec §7.1). */
+/*
+ * Historically the MVM rejected the net/http/ffi/async stdlib namespaces up
+ * front (spec §7.1).  These are now MVM-supported: every `myon.*` native flows
+ * through the same bridge (myon_bridge_call_native -> call_stdlib) that the
+ * tree-walker uses, so `myon.net.*` / `myon.http.*` / `myon.ffi.*` and the
+ * event-loop-backed `myon.time.sleep_ms` behave identically under the VM.  The
+ * async task machinery (spawning, awaiting) is handled by the MOP_SPAWN_ASYNC /
+ * MOP_AWAIT opcodes, not here.  This hook is kept as the single place to gate
+ * any future out-of-scope native.
+ */
 static void check_native_supported(Compiler *c, int line, const char *name) {
-    if (strncmp(name, "myon.net.", 9) == 0 || strncmp(name, "myon.http.", 10) == 0)
-        unsupported(c, line, "myon.net / myon.http", NULL);
-    if (strncmp(name, "myon.ffi.", 9) == 0)
-        unsupported(c, line, "myon.ffi", NULL);
-    if (strncmp(name, "myon.async", 10) == 0)
-        unsupported(c, line, "async/await", NULL);
+    (void)c; (void)line; (void)name;
 }
 
 /* ================================================================== */
@@ -381,8 +473,11 @@ static OpCode binary_opcode(OpKind k) {
 static void compile_native_call(Compiler *c, Expr *e, const char *name) {
     Chunk *ch = cur_chunk(c);
     check_native_supported(c, e->line, name);
-    if (e->as.call.type_arg_count > 0)
-        unsupported(c, e->line, "generics", "Explicit type arguments are not supported by MVM.");
+    /*
+     * Explicit type arguments (e.g. a generic native/user call `f<int>(...)`)
+     * are type-erased in Myon (spec §14.8/§15): they never affect runtime
+     * behaviour, so the MVM simply ignores them and compiles the value args.
+     */
     for (int i = 0; i < e->as.call.arg_count; i++) {
         if (e->as.call.arg_names && e->as.call.arg_names[i])
             compile_error(c, e->line, "MVM: named arguments are only allowed on struct constructors");
@@ -473,11 +568,7 @@ static void compile_call(Compiler *c, Expr *e) {
          * through to the <main> globals is what makes recursion and mutually
          * recursive top-level functions work (spec §4.6 note / M4). */
         int slot = -1;
-        NameKind k = resolve_name(c->fn, name, &slot);
-        if (k == NAME_CAPTURE)
-            unsupported(c, e->line,
-                "calling an outer function's local (closures)",
-                "Define the function at top level so it is a global.");
+        NameKind k = resolve_name(c, c->fn, name, &slot);
         if (k == NAME_NONE)
             compile_error(c, e->line, "undefined function or variable '%s'", name);
         emit_var_load(c, e->line, k, slot);
@@ -487,8 +578,21 @@ static void compile_call(Compiler *c, Expr *e) {
         return;
     }
 
-    if (callee->kind == EXPR_GENERIC)
-        unsupported(c, e->line, "generics", "Generic instantiation is not supported by MVM.");
+    /*
+     * Generic struct constructor Name<T,...>(field=expr, ...) (spec §14.8 /
+     * §15).  Myon generics are type-erased at runtime: the type arguments are
+     * only recorded on the instance for diagnostics and never affect dispatch
+     * or output (see interpreter construct_struct).  The VM therefore builds
+     * the struct exactly like the non-generic ctor; the erased type args are
+     * simply ignored.  (Explicit type args on a *function* call are handled in
+     * compile_native_call / below by ignoring them.)
+     */
+    if (callee->kind == EXPR_GENERIC) {
+        StructDecl *sd = find_struct(c, callee->as.generic.name);
+        if (sd) { compile_struct_ctor(c, e, sd); return; }
+        compile_error(c, e->line, "unknown generic type '%s'",
+                      callee->as.generic.name);
+    }
 
     /* method call: obj.method(args) -> INVOKE (spec §4.11) */
     if (callee->kind == EXPR_MEMBER) {
@@ -510,9 +614,48 @@ static void compile_call(Compiler *c, Expr *e) {
 
 /* Compile a lambda/func body into a fresh chunk; leaves a closure on stack.
  * `self_struct` != NULL marks a struct method: `self` is bound to slot 0
- * (the first argument position) before the declared params (spec §4.11). */
+ * (the first argument position) before the declared params (spec §4.11).
+ * On return, `*out_upvals` / `*out_nupval` describe the variables the compiled
+ * function captured from enclosing frames so the caller can emit a
+ * MOP_MAKE_CLOSURE with the capture list (closures, spec §7.3). */
 static int compile_function(Compiler *c, FuncDecl *decl, const char *dbg_name,
-                            StructDecl *self_struct);
+                            StructDecl *self_struct,
+                            Upvalue *out_upvals, int *out_nupval);
+
+/*
+ * Emit MOP_MAKE_CLOSURE for chunk `cidx` with the `nupval` captures resolved by
+ * compile_function (spec §7.3).  Encoding: u16 chunk_idx, u8 nupval, then
+ * nupval x (u8 kind, u16 index), where kind 1 = capture the enclosing frame's
+ * LOCAL slot and kind 0 = re-capture the enclosing function's UPVALUE.
+ */
+/*
+ * Copy a function's captured-slot flags (marked by mark_captured while nested
+ * closures resolved their upvalues) into the chunk's serialized bitmap so the
+ * VM boxes exactly those slots in shared UpvalueCells (spec §7.3).  Only the
+ * live local range [0, num_locals) matters.
+ */
+static void fill_captured_bitmap(Chunk *ch, FnComp *fn) {
+    int n = ch->num_locals;
+    if (n > MAX_LOCALS) n = MAX_LOCALS;
+    int any = 0;
+    for (int i = 0; i < n; i++) if (fn->captured_slot[i]) { any = 1; break; }
+    if (!any) { ch->captured = NULL; ch->captured_len = 0; return; }
+    ch->captured = (uint8_t *)myon_xmalloc((size_t)(n > 0 ? n : 1));
+    for (int i = 0; i < n; i++) ch->captured[i] = fn->captured_slot[i] ? 1 : 0;
+    ch->captured_len = (uint16_t)n;
+}
+
+static void emit_make_closure(Compiler *c, int line, int cidx,
+                              Upvalue *upvals, int nupval) {
+    Chunk *ch = cur_chunk(c);
+    chunk_emit_op_u16(ch, MOP_MAKE_CLOSURE, (uint16_t)cidx, line);
+    chunk_emit_byte(ch, (uint8_t)nupval, line);
+    for (int i = 0; i < nupval; i++) {
+        chunk_emit_byte(ch, (uint8_t)(upvals[i].from_local ? 1 : 0), line);
+        chunk_emit_byte(ch, (uint8_t)(upvals[i].index & 0xFF), line);
+        chunk_emit_byte(ch, (uint8_t)((upvals[i].index >> 8) & 0xFF), line);
+    }
+}
 
 static void compile_expr(Compiler *c, Expr *e) {
     Chunk *ch = cur_chunk(c);
@@ -538,11 +681,7 @@ static void compile_expr(Compiler *c, Expr *e) {
             break;
         case EXPR_IDENT: {
             int slot = -1;
-            NameKind k = resolve_name(c->fn, e->as.ident, &slot);
-            if (k == NAME_CAPTURE)
-                unsupported(c, e->line,
-                    "capturing an outer function's local variable (closures)",
-                    "Only top-level globals and the function's own locals are visible.");
+            NameKind k = resolve_name(c, c->fn, e->as.ident, &slot);
             if (k == NAME_NONE)
                 compile_error(c, e->line, "undefined variable '%s'", e->as.ident);
             emit_var_load(c, e->line, k, slot);
@@ -610,9 +749,10 @@ static void compile_expr(Compiler *c, Expr *e) {
             break;
         }
         case EXPR_LAMBDA: {
-            /* A lambda must be self-contained (no outer capture, spec §7.3). */
-            int cidx = compile_function(c, e->as.lambda, "<lambda>", NULL);
-            chunk_emit_op_u16(cur_chunk(c), MOP_MAKE_CLOSURE, (uint16_t)cidx, e->line);
+            /* A lambda may capture enclosing locals as upvalues (spec §7.3). */
+            Upvalue uv[MAX_UPVALUES]; int nuv = 0;
+            int cidx = compile_function(c, e->as.lambda, "<lambda>", NULL, uv, &nuv);
+            emit_make_closure(c, e->line, cidx, uv, nuv);
             break;
         }
         case EXPR_STR_CTOR:
@@ -632,11 +772,26 @@ static void compile_expr(Compiler *c, Expr *e) {
             chunk_emit_op(ch, MOP_MAKE_ERROR, e->line);
             break;
         case EXPR_AWAIT:
-            unsupported(c, e->line, "async/await", NULL);
+            /* Evaluate the awaited expression (a Task, or a plain value that
+             * `myon.await` accepts), then AWAIT drives the event loop until it
+             * resolves and leaves the result on the stack (spec §14.9). */
+            compile_expr(c, e->as.operand);
+            chunk_emit_op(ch, MOP_AWAIT, e->line);
             break;
-        case EXPR_GENERIC:
-            unsupported(c, e->line, "generics", "Generic instantiation is not supported by MVM.");
+        case EXPR_GENERIC: {
+            /*
+             * A bare generic name used without a call — the interpreter treats
+             * this as an error ("must be instantiated with (...)").  In an
+             * expression position we reach here only for something like a
+             * value reference; mirror the tree-walker by erroring at compile
+             * time.  Generic *instantiation* Box<int>(...) is handled in
+             * compile_call (the callee is EXPR_GENERIC there).
+             */
+            compile_error(c, e->line,
+                "generic type '%s' must be instantiated with (...)",
+                e->as.generic.name);
             break;
+        }
         default:
             compile_error(c, e->line, "MVM: unsupported expression kind %d", (int)e->kind);
             break;
@@ -667,20 +822,21 @@ static void compile_assign_target_name(Compiler *c, int line, const char *name) 
     /*
      * Not in this function at all.  If it names an existing top-level global,
      * assign through to it (mirrors the interpreter's env_set() walking the
-     * parent chain, spec §9.2 (2b)); if it lives in an intermediate function
-     * that is the unsupported closure case (§7.3).
+     * parent chain, spec §9.2 (2b)); if it lives in an intermediate enclosing
+     * function, capture it as an upvalue and assign through the shared cell
+     * (closures, spec §7.3).
      */
     if (fn->enclosing) {
-        int gslot = -1;
-        NameKind gk = resolve_name(fn, name, &gslot);
-        if (gk == NAME_GLOBAL) {
-            chunk_emit_op_u16(cur_chunk(c), MOP_STORE_GLOBAL, (uint16_t)gslot, line);
+        int rslot = -1;
+        NameKind rk = resolve_name(c, fn, name, &rslot);
+        if (rk == NAME_GLOBAL) {
+            chunk_emit_op_u16(cur_chunk(c), MOP_STORE_GLOBAL, (uint16_t)rslot, line);
             return;
         }
-        if (gk == NAME_CAPTURE)
-            unsupported(c, line,
-                "assigning to an outer function's local (closures)",
-                "Only top-level globals and the function's own locals are visible.");
+        if (rk == NAME_UPVALUE) {
+            chunk_emit_op_u16(cur_chunk(c), MOP_STORE_UPVALUE, (uint16_t)rslot, line);
+            return;
+        }
     }
     int slot = declare_local(c, name);     /* (3) new local */
     chunk_emit_op_u16(cur_chunk(c), MOP_STORE_LOCAL, (uint16_t)slot, line);
@@ -757,16 +913,16 @@ static void compile_assign(Compiler *c, Stmt *s) {
          * declared.  Without the global path, `x, y = pair()` inside a function
          * would wrongly create shadowing locals instead of updating the outer
          * x, y (spec §9.2). (Step 7-b fix) */
-        char *names[64];
-        int   slots[64];
-        int   is_global[64];
+        char    *names[64];
+        int      slots[64];
+        NameKind kinds[64];   /* NAME_LOCAL / NAME_GLOBAL / NAME_UPVALUE */
         if (total > 64) compile_error(c, line, "too many assignment targets");
         names[0] = s->as.assign.name;
         for (int k = 0; k < s->as.assign.extra_count; k++)
             names[k + 1] = s->as.assign.extra_names[k];
         for (int k = 0; k < total; k++) {
             FnComp *fn = c->fn;
-            is_global[k] = 0;
+            kinds[k] = NAME_LOCAL;
             int idx = find_in_current_scope(fn, names[k]);
             if (idx < 0) {
                 int jj = find_in_outer_scope(fn, names[k]);
@@ -776,16 +932,12 @@ static void compile_assign(Compiler *c, Stmt *s) {
                 if (jj >= 0) {
                     idx = jj;
                 } else if (fn->enclosing) {
-                    /* not a local of this function: try a top-level global */
-                    int gslot = -1;
-                    NameKind gk = resolve_name(fn, names[k], &gslot);
-                    if (gk == NAME_GLOBAL) {
-                        is_global[k] = 1;
-                        idx = gslot;
-                    } else if (gk == NAME_CAPTURE) {
-                        unsupported(c, line,
-                            "assigning to an outer function's local (closures)",
-                            "Only top-level globals and the function's own locals are visible.");
+                    /* not a local of this function: try a global / upvalue */
+                    int rslot = -1;
+                    NameKind rk = resolve_name(c, fn, names[k], &rslot);
+                    if (rk == NAME_GLOBAL || rk == NAME_UPVALUE) {
+                        kinds[k] = rk;
+                        idx = rslot;
                     } else {
                         idx = declare_local(c, names[k]);
                     }
@@ -796,9 +948,7 @@ static void compile_assign(Compiler *c, Stmt *s) {
             slots[k] = idx;
         }
         for (int k = total - 1; k >= 0; k--)
-            chunk_emit_op_u16(ch,
-                is_global[k] ? MOP_STORE_GLOBAL : MOP_STORE_LOCAL,
-                (uint16_t)slots[k], line);
+            emit_var_store(c, line, kinds[k], slots[k]);
         return;
     }
 
@@ -1061,8 +1211,9 @@ static void compile_stmt(Compiler *c, Stmt *s) {
         case STMT_FUNC: {
             /* declare the function name as a local, build closure, store it. */
             int slot = declare_local(c, s->as.func->name);
-            int cidx = compile_function(c, s->as.func, s->as.func->name, NULL);
-            chunk_emit_op_u16(cur_chunk(c), MOP_MAKE_CLOSURE, (uint16_t)cidx, s->line);
+            Upvalue uv[MAX_UPVALUES]; int nuv = 0;
+            int cidx = compile_function(c, s->as.func, s->as.func->name, NULL, uv, &nuv);
+            emit_make_closure(c, s->line, cidx, uv, nuv);
             chunk_emit_op_u16(cur_chunk(c), MOP_STORE_LOCAL, (uint16_t)slot, s->line);
             break;
         }
@@ -1078,7 +1229,9 @@ static void compile_stmt(Compiler *c, Stmt *s) {
                 size_t need = strlen(sd->name) + 1 + strlen(md->name) + 1;
                 char *dbg = (char *)myon_xmalloc(need);
                 snprintf(dbg, need, "%s.%s", sd->name, md->name);
-                compile_function(c, md, dbg, sd);  /* sd => bind `self` at slot 0 */
+                /* Methods are compiled as top-level chunks (no enclosing
+                 * function), so they never capture upvalues. */
+                compile_function(c, md, dbg, sd, NULL, NULL);  /* sd => bind `self` at slot 0 */
                 free(dbg);
             }
             break;
@@ -1105,12 +1258,14 @@ static void compile_block(Compiler *c, StmtList *list, int open_scope) {
 /* ================================================================== */
 
 static int compile_function(Compiler *c, FuncDecl *decl, const char *dbg_name,
-                            StructDecl *self_struct) {
-    if (decl->is_async)
-        unsupported(c, 0, "async functions", NULL);
-    if (decl->tparam_count > 0)
-        unsupported(c, 0, "generics", "Generic functions are not supported by MVM.");
-
+                            StructDecl *self_struct,
+                            Upvalue *out_upvals, int *out_nupval) {
+    /*
+     * async functions (spec §14.9) compile like any other function; the chunk
+     * is flagged `is_async` (below) so a *bare* call spawns a task instead of
+     * running synchronously.  Generic type parameters are type-erased at
+     * runtime (spec §14.8/§15): the body compiles once, ignoring `tparams`.
+     */
     int cidx = module_add_chunk(c->module, dbg_name);
 
     FnComp fn;
@@ -1144,6 +1299,16 @@ static int compile_function(Compiler *c, FuncDecl *decl, const char *dbg_name,
     ch->num_params = (uint16_t)(decl->param_count + self_param);
     ch->num_locals = (uint16_t)fn.max_slot;
     ch->ret_count  = (uint16_t)(decl->ret_count > 0 ? decl->ret_count : 0);
+    ch->is_async   = decl->is_async ? 1 : 0;
+    fill_captured_bitmap(ch, &fn);
+
+    /* Copy the resolved upvalue list back to the caller before restoring the
+     * enclosing FnComp, so emit_make_closure() can encode the captures. */
+    int nupval = fn.upvalue_count;
+    if (out_upvals && out_nupval) {
+        *out_nupval = nupval;
+        for (int i = 0; i < nupval; i++) out_upvals[i] = fn.upvalues[i];
+    }
 
     c->fn = prev;
     return cidx;
@@ -1254,6 +1419,9 @@ Module *mvm_compile_program(Program *program, const char *source_path) {
     mc->num_params = 0;
     mc->num_locals = (uint16_t)mainfn.max_slot;
     mc->ret_count  = 0;
+    /* <main>'s locals are globals; nested functions capture them as GLOBAL,
+     * not upvalues, so this is normally empty — set it for completeness. */
+    fill_captured_bitmap(mc, &mainfn);
 
     fill_source_info(c.module, source_path);
 

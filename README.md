@@ -118,8 +118,14 @@ Windows ビルドでは Makefile が自動的に出力名を `myon.exe` とし�
 `.myon` を `--compile` すると MVM バイトコード（`.myc`, マジック `MYC1`）が生成され、
 `./myon foo.myc` で実行できます。`.myon`（ツリーウォーク）実行の挙動と一致します。
 `.myon` より古い `.myc` を実行しようとすると stale 警告が出ます（`--strict-stale` で
-エラー化）。async/await・`myon.net`／`myon.http`・FFI・ジェネリクスは MVM 非対応で、
-これらを使うプログラムはツリーウォーク実行（`.myon`）で動かしてください。
+エラー化）。async/await・`myon.net`／`myon.http`・FFI・ジェネリクス・クロージャ
+（上位変数キャプチャ）・高階関数は **MVM でも対応済み**です（イベントループや標準
+ライブラリはツリーウォーク実装をブリッジ経由で共有します）。ただし *VM で作った
+関数値をツリーウォークのネイティブに渡してコールバック実行させる*ケース
+（`array.map`／`filter`／`reduce` などの高階ネイティブメソッド、`myon.ffi.make_callback`）
+だけはエンジン境界をまたげないため MVM では明示的なエラーになります。該当プログラムは
+ツリーウォーク実行（`.myon`）で動かしてください。外部モジュール取り込み
+（`module external.* as ...`）も MVM 非対応です。
 
 ### 対話モード（REPL）
 

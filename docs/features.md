@@ -409,19 +409,30 @@ Linux 専用だった実行時レイヤ（C FFI・ソケット・協調的イベ
 `./myon foo.myon` は従来どおりツリーウォーク実行、`./myon foo.myc` は MVM VM
 実行、`./myon --compile foo.myon [-o out.myc]` はコンパイルのみ（実行しない）、
 `./myon --dump-bytecode foo.myon` は逆アセンブル表示です。`./myon --help`
-（`-h`）で使い方、`./myon --version`（`-v`）でバージョン（現在 0.8.0）を
+（`-h`）で使い方、`./myon --version`（`-v`）でバージョン（現在 0.9.0）を
 表示します。MVM が対応する
 言語機能（M0〜M8：リテラル・算術・比較・論理・変数・スコープ・制御構文・関数・
 複数戻り値・ネイティブ呼び出し・文字列補間・キャスト・配列/マップ・構造体/
 メソッド）の範囲では、ツリーウォークと MVM の出力が一致することを
 `tests/run_mvm_tests.sh` が回帰的に確認します（`make test` に統合済み）。
-async/await・`myon.net`／`myon.http`・FFI・ジェネリクスは MVM 非対応で、
-コンパイル時に明示エラーとなります（`mvm_spec.md` 7 節）。これらの機能を
-使うプログラムは従来どおり `.myon` のツリーウォーク実行で動かします。
+async/await・`myon.net`／`myon.http`・FFI・ジェネリクス・クロージャ（上位変数
+キャプチャ）・高階関数は **MVM でも対応済み**です（`mvm_spec.md` 7 節）。イベント
+ループ・ネットワーク・FFI などの実行時機構はツリーウォーク実装をブリッジ経由で
+共有し、ジェネリクスは型消去、クロージャは boxed upvalue セル（`LOAD_UPVALUE`／
+`STORE_UPVALUE`／upvalue 付き `MAKE_CLOSURE`）で実現しています。ただし *VM で作った
+関数値をツリーウォークのネイティブに渡してコールバック実行させる*ケース
+（`array.map`／`filter`／`reduce` などの高階ネイティブメソッドや
+`myon.ffi.make_callback`）だけはエンジン境界をまたげないため MVM では実行時に明示
+エラーになります。外部モジュール取り込み（`module external.* as ...`）も MVM 非対応
+（コンパイル時エラー）です。これらは従来どおり `.myon` のツリーウォーク実行で
+動かします。
 
 > **MVM の既知の制限（`mvm_spec.md` 7 節参照）**
 > - REPL は当面ツリーウォークのみ対応（MVM 版 REPL は将来課題）。
 > - `.myc` の Source Info（`src_mtime`/`src_size`/`src_hash`）は書き込み済みで、
 >   `./myon foo.myc` 実行時に「`.myon` より古い `.myc`」を検出する
 >   **stale チェックも実装済み**（既定は警告、`--strict-stale` でエラー化）。
-> - async/await・net/http・FFI・ジェネリクス・クロージャは MVM 非対応。
+> - VM で生成した関数値をツリーウォークのネイティブに渡すコールバック
+>   （高階ネイティブメソッド `array.map`/`filter`/`reduce`、`myon.ffi.make_callback`）は
+>   エンジン境界をまたげないため MVM では実行時に明示エラー。`.myon` で実行すること。
+> - 外部モジュール取り込み（`module external.* as ...`）は MVM 非対応（コンパイル時エラー）。

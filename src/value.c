@@ -123,7 +123,32 @@ Value value_func(FuncDecl *decl, Env *closure) {
     o->as.fn.closure = closure;
     o->as.fn.is_bound = 0;
     o->as.fn.bound_self = NULL;
+    o->as.fn.mvm_chunk = 0;
+    o->as.fn.mvm_is_async = 0;
+    o->as.fn.upvalues = NULL;
+    o->as.fn.upvalue_count = 0;
     return obj_value(TYPE_FUNC, o);
+}
+
+/* ---- MVM upvalue cells (boxed captured variables, spec §7.3) ---- */
+UpvalueCell *upvalue_cell_new(Value initial) {
+    UpvalueCell *c = (UpvalueCell *)myon_xmalloc(sizeof(UpvalueCell));
+    c->value = initial;   /* takes ownership */
+    c->refcount = 1;
+    return c;
+}
+
+UpvalueCell *upvalue_cell_ref(UpvalueCell *c) {
+    if (c) c->refcount++;
+    return c;
+}
+
+void upvalue_cell_unref(UpvalueCell *c) {
+    if (!c) return;
+    if (--c->refcount <= 0) {
+        value_free(&c->value);
+        free(c);
+    }
 }
 
 Value value_task(void *task) {
@@ -196,6 +221,12 @@ static void obj_free(Obj *o) {
             if (o->as.fn.bound_self) {
                 value_free(o->as.fn.bound_self);
                 free(o->as.fn.bound_self);
+            }
+            /* MVM closures own a ref on each captured upvalue cell (spec §7.3). */
+            if (o->as.fn.upvalues) {
+                for (int i = 0; i < o->as.fn.upvalue_count; i++)
+                    upvalue_cell_unref(o->as.fn.upvalues[i]);
+                free(o->as.fn.upvalues);
             }
             /* decl and closure are not owned by the function value */
             break;

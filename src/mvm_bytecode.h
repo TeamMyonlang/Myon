@@ -88,9 +88,18 @@ typedef enum {
     MOP_JUMP_IF_TRUE  = 0x42,  /* s16 off : pop, jump if truthy */
 
     /* 0x50-0x5F : function call / return (spec §4.8-4.9) */
-    MOP_MAKE_CLOSURE = 0x50,  /* u16 chunk_idx */
+    MOP_MAKE_CLOSURE = 0x50,  /* u16 chunk_idx, u8 nupval, then nupval x (u8 kind, u16 index)
+                               *   kind 0 = capture caller LOCAL slot (index = slot)
+                               *   kind 1 = capture caller UPVALUE (index = upval idx)
+                               * A closure with nupval==0 is a plain global fn. */
     MOP_CALL         = 0x51,  /* u8 argc */
     MOP_RET          = 0x52,  /* u8 n */
+    /* MVM closures (spec §7.3): captured outer variables live in boxed cells. */
+    MOP_LOAD_UPVALUE  = 0x53, /* u16 idx : push a copy of upvalues[idx] */
+    MOP_STORE_UPVALUE = 0x54, /* u16 idx : pop, write into upvalues[idx] cell */
+    /* async/await (spec §14.9): coroutine spawn + suspend (MVM). */
+    MOP_SPAWN_ASYNC   = 0x55, /* u8 argc : pop fn + argc args, push a Task value */
+    MOP_AWAIT         = 0x56, /* pop a Task (or plain value), push its result   */
 
     /* 0x60-0x6F : arrays / maps (spec §4.10) */
     MOP_NEW_ARRAY  = 0x60,  /* u16 type_idx */
@@ -146,7 +155,12 @@ typedef enum {
 #define MVM_MAGIC2        0x43  /* 'C' */
 #define MVM_MAGIC3        0x31  /* '1' */
 #define MVM_VERSION_MAJOR 1
-#define MVM_VERSION_MINOR 0
+/*
+ * Minor 1: added the per-chunk `is_async` flag and the variable-length
+ * MOP_MAKE_CLOSURE (upvalue capture) / MOP_LOAD_UPVALUE / MOP_STORE_UPVALUE /
+ * MOP_SPAWN_ASYNC / MOP_AWAIT instructions for closures & async/await support.
+ */
+#define MVM_VERSION_MINOR 1
 #define MVM_ENDIAN_LITTLE 1
 
 /*
@@ -161,5 +175,14 @@ const char *mvm_opcode_name(uint8_t op);
  * Returns -1 for an unknown opcode.
  */
 int mvm_opcode_operand_bytes(uint8_t op);
+
+/*
+ * Total encoded length (opcode byte + operands) of the instruction at `code`,
+ * which must point at the opcode byte.  Handles the variable-length
+ * MOP_MAKE_CLOSURE (whose size depends on its upvalue count); for all other
+ * opcodes it is 1 + mvm_opcode_operand_bytes(op).  Returns 0 for an unknown
+ * opcode so a walker can stop cleanly.
+ */
+int mvm_instruction_len(const uint8_t *code);
 
 #endif /* MYON_MVM_BYTECODE_H */

@@ -140,4 +140,30 @@ int myon_bridge_call_native(Interp *it, const char *name,
 void myon_bridge_call_method(Interp *it, Value recv, const char *method,
                              Value *args, int argc, int line, Value *out);
 
+/* ---- async/await seam for the MVM (spec §14.9) --------------------------- */
+/*
+ * The MVM realizes cooperative async by running each async function body as a
+ * task on the same event loop the tree-walker uses.  The bridge owns the loop
+ * and the coroutine bookkeeping (current-task save/restore, a per-task error
+ * barrier); the VM supplies a `body` callback that runs the target chunk on
+ * the task's own C stack and reports its outcome.
+ *
+ * myon_bridge_spawn_task: spawn `body(ud, ...)` as a task; returns a TYPE_TASK
+ *   value the VM pushes on its stack.  The task's C stack is preserved across
+ *   suspends (sleep / I/O), so `body` may run a full nested VM dispatch loop.
+ *   `body` reports its outcome by writing the task's result into `*out_result`
+ *   (ownership transferred to the task) and its error flag into `*out_has_error`.
+ *   The result is delivered through these out-params rather than a global so
+ *   concurrently-suspended tasks never clobber each other's result (a global
+ *   "current task ctx" is stale after an interleaved suspend/resume).
+ * myon_bridge_await:      drive/suspend until `task_value` (a TYPE_TASK, or a
+ *   plain value which is returned as-is) resolves; returns its result (moved)
+ *   or re-raises its error via the bridge error barrier.
+ */
+typedef void (*MyonTaskBody)(void *ud, Value *out_result, int *out_has_error);
+Value myon_bridge_spawn_task(Interp *it, MyonTaskBody body, void *ud);
+Value myon_bridge_await(Interp *it, int line, Value task_value);
+/* Run all not-yet-awaited foreground async tasks to completion (program end). */
+void  myon_bridge_drain_tasks(Interp *it);
+
 #endif /* MYON_INTERPRETER_H */

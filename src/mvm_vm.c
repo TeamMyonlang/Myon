@@ -37,6 +37,7 @@
 #include <stdarg.h>
 #include <string.h>
 #include <setjmp.h>
+#include <stdlib.h>
 
 /* --- limits (spec §3.4) --------------------------------------------------- */
 
@@ -62,12 +63,46 @@ typedef struct {
     uint8_t  *ip;      /* instruction pointer into chunk->code */
     int       base;    /* operand-stack index of this frame's slot 0 */
     int       fn_slot; /* stack index of the callee fn value (base-1), or -1 */
+    /*
+     * Closures (spec §7.3).  `upvalues` are the boxed cells this frame's
+     * function captured (borrowed from the FuncData that was called; NULL for
+     * <main>/methods).  `cells` holds, for each captured *local* slot, the
+     * shared UpvalueCell that backs it: when chunk->captured[slot] is set,
+     * cells[slot] owns the slot's value and the operand-stack slot is unused.
+     * `cells` is NULL when the chunk captures nothing.
+     */
+    UpvalueCell **upvalues;   /* borrowed from the closure FuncData */
+    int           upvalue_count;
+    UpvalueCell **cells;      /* owned array [num_locals], entries owned */
+    /*
+     * The <main> chunk's locals *are* the program globals (spec §4.6): within
+     * <main> a top-level var is a LOAD_LOCAL, but a nested function sees the
+     * same storage as a LOAD_GLOBAL.  For both to hit the same cell, the entry
+     * frame stores/loads its locals in VMShared.globals rather than on the
+     * operand stack.  `globals_frame` marks that frame.
+     */
+    int           globals_frame;
 } Frame;
 
+/*
+ * Process-wide VM state shared by the main execution and every async task
+ * (spec §14.9).  Async tasks each get their own operand/frame stack (a VM),
+ * but they must observe the same top-level globals and the same stdlib bridge
+ * (event loop, PRNG, net/ffi state), so those live here and are pointed at by
+ * every VM.  Globals are a heap array (not frame 0) precisely so a suspended
+ * task's stack does not shadow them.
+ */
 typedef struct {
     Module  *module;
     Program *program;     /* for struct/method decls (may be NULL) */
     Interp  *bridge;      /* keeps stdlib state alive across native calls */
+
+    Value   *globals;     /* top-level (<main>) variable slots (spec §4.6) */
+    int      global_count;
+} VMShared;
+
+typedef struct {
+    VMShared *sh;
 
     Value   *stack;
     int      sp;          /* next free operand-stack slot */
@@ -78,7 +113,20 @@ typedef struct {
 
     jmp_buf  on_error;    /* runtime-error unwind target */
     int      cur_line;    /* line of the instruction under execution (diag) */
+    /*
+     * When the outermost frame returns (frame_count 1->0), the <main> entry
+     * chunk discards its return value.  An async task body, however, runs its
+     * function chunk *as* the outermost frame and needs that value delivered to
+     * async_vm_body.  This flag tells RET to leave the return value(s) on the
+     * operand stack instead of discarding them (spec §14.9).
+     */
+    int      keep_top_return;
 } VM;
+
+/* Convenience accessors so most code keeps reading VM_MODULE(vm) etc. */
+#define VM_MODULE(vm)  ((vm)->sh->module)
+#define VM_PROGRAM(vm) ((vm)->sh->program)
+#define VM_BRIDGE(vm)  ((vm)->sh->bridge)
 
 /* --- struct-decl registry (spec §4.11) ------------------------------------ */
 /*
@@ -88,9 +136,9 @@ typedef struct {
  * resolve parent_name links exactly like the compiler / tree-walker do.
  */
 static StructDecl *find_struct_decl(VM *vm, const char *name) {
-    if (!vm->program) return NULL;
-    for (int i = 0; i < vm->program->stmts.count; i++) {
-        Stmt *s = vm->program->stmts.items[i];
+    if (!VM_PROGRAM(vm)) return NULL;
+    for (int i = 0; i < VM_PROGRAM(vm)->stmts.count; i++) {
+        Stmt *s = VM_PROGRAM(vm)->stmts.items[i];
         if (s->kind == STMT_STRUCT && s->as.struct_decl &&
             strcmp(s->as.struct_decl->name, name) == 0)
             return s->as.struct_decl;
@@ -111,8 +159,8 @@ static int find_method_chunk(VM *vm, StructDecl *sd, const char *method) {
     for (StructDecl *cur = sd; cur; cur = cur->parent) {
         char key[256];
         snprintf(key, sizeof(key), "%s.%s", cur->name, method);
-        for (int i = 0; i < vm->module->chunk_count; i++) {
-            Chunk *c = vm->module->chunks[i];
+        for (int i = 0; i < VM_MODULE(vm)->chunk_count; i++) {
+            Chunk *c = VM_MODULE(vm)->chunks[i];
             if (c->name && strcmp(c->name, key) == 0) return i;
         }
     }
@@ -192,30 +240,58 @@ static int line_for(Chunk *c, size_t off) {
     return best;
 }
 
-/* --- VM function values (spec §2, §4.8) ----------------------------------- */
+/* --- VM function values (spec §2, §4.8, §7.3) ----------------------------- */
 /*
- * An MVM closure is fully described by its chunk index (closures cannot capture
- * outer locals — spec §7.3).  We reuse OBJ_FUNC so value_copy/value_free's
- * refcounting Just Works, and stash the chunk index in the (unowned, never
- * dereferenced by value.c) `decl` pointer slot.  No per-instance heap state, so
- * nothing leaks.
+ * An MVM closure is an OBJ_FUNC whose `mvm_chunk` field holds (chunk index + 1)
+ * so 0 means "not an MVM closure" (a tree-walk fn), and whose `upvalues` array
+ * holds the boxed cells it captured from enclosing frames (spec §7.3).
+ * value_copy/value_free refcount the object and (in value.c) ref/unref each
+ * captured cell, so sharing and lifetime Just Work.
  */
-static Value vm_make_closure(int chunk_idx) {
+static Value vm_make_closure(int chunk_idx, int is_async,
+                             UpvalueCell **ups, int nups) {
     Value v = value_func(NULL, NULL);
-    v.as.obj->as.fn.decl = (struct FuncDecl *)(intptr_t)chunk_idx;
+    FuncData *fn = &v.as.obj->as.fn;
+    fn->mvm_chunk    = chunk_idx + 1;
+    fn->mvm_is_async = is_async ? 1 : 0;
+    fn->upvalue_count = nups;
+    if (nups > 0) {
+        fn->upvalues = (UpvalueCell **)myon_xmalloc(sizeof(UpvalueCell *) * (size_t)nups);
+        for (int i = 0; i < nups; i++) fn->upvalues[i] = upvalue_cell_ref(ups[i]);
+    } else {
+        fn->upvalues = NULL;
+    }
     return v;
 }
 
+/* Is `v` an MVM (bytecode) function value?  (vs. a tree-walk FuncDecl fn) */
+static int vm_is_mvm_fn(const Value *v) {
+    return v->type == TYPE_FUNC && v->as.obj->as.fn.mvm_chunk != 0;
+}
+
 static int vm_closure_chunk(const Value *v) {
-    return (int)(intptr_t)v->as.obj->as.fn.decl;
+    return v->as.obj->as.fn.mvm_chunk - 1;
 }
 
 /* --- native dispatch (spec §4.14) ----------------------------------------- */
 
 static void do_call_native(VM *vm, int line, const char *name, int argc) {
     Value *args = &vm->stack[vm->sp - argc];
+    /* An MVM closure encodes a chunk index in as.fn.mvm_chunk, not a real
+     * FuncDecl*, so a tree-walk native that would call it back (only
+     * myon.ffi.make_callback does) cannot execute it and would misbehave.
+     * Refuse cleanly and halt here rather than letting the program proceed
+     * with a bogus callback pointer (which crashes the foreign call). Passing
+     * a VM function/lambda into a native is an MVM cross-engine limitation
+     * (spec §7); run the .myon source instead. */
+    for (int i = 0; i < argc; i++) {
+        if (vm_is_mvm_fn(&args[i]))
+            vm_error(vm, line,
+                "MVM does not support passing a function/lambda to the native "
+                "'%s' (cross-engine callback; run the .myon source instead)", name);
+    }
     Value out = value_nil();
-    int handled = myon_bridge_call_native(vm->bridge, name, args, argc, line, &out);
+    int handled = myon_bridge_call_native(VM_BRIDGE(vm), name, args, argc, line, &out);
     if (!handled) {
         vm_error(vm, line, "unknown native function '%s'", name);
     }
@@ -226,8 +302,42 @@ static void do_call_native(VM *vm, int line, const char *name, int argc) {
 
 /* --- call setup (spec §4.9) ----------------------------------------------- */
 
-static void push_frame(VM *vm, int chunk_idx, int argc, int fn_slot, int line) {
-    Chunk *c = module_chunk(vm->module, chunk_idx);
+/*
+ * Set up `f->cells` for a freshly-pushed frame: if the chunk has captured
+ * slots (spec §7.3), box each captured slot's current value into a shared
+ * UpvalueCell and clear the operand-stack slot.  Thereafter LOAD_LOCAL /
+ * STORE_LOCAL on a captured slot go through the cell (see the dispatch loop),
+ * so a nested closure that captures the slot and the frame share one cell.
+ */
+static void frame_open_cells(VM *vm, Frame *f) {
+    Chunk *c = f->chunk;
+    f->cells = NULL;
+    if (!c->captured || c->captured_len == 0) return;
+    f->cells = (UpvalueCell **)myon_xmalloc(sizeof(UpvalueCell *) * (size_t)c->num_locals);
+    for (int i = 0; i < (int)c->num_locals; i++) {
+        if (i < (int)c->captured_len && c->captured[i]) {
+            /* move the slot's value into a fresh cell */
+            f->cells[i] = upvalue_cell_new(vm->stack[f->base + i]);
+            vm->stack[f->base + i] = value_nil();
+        } else {
+            f->cells[i] = NULL;
+        }
+    }
+}
+
+/* Tear down a frame's owned cells (drop our ref; the closure keeps its own). */
+static void frame_close_cells(Frame *f) {
+    if (!f->cells) return;
+    for (int i = 0; i < (int)f->chunk->num_locals; i++)
+        if (f->cells[i]) upvalue_cell_unref(f->cells[i]);
+    free(f->cells);
+    f->cells = NULL;
+}
+
+/* Push a call frame for `callee` (an MVM fn value; may be NULL for methods). */
+static void push_frame(VM *vm, const Value *callee, int chunk_idx, int argc,
+                       int fn_slot, int line) {
+    Chunk *c = module_chunk(VM_MODULE(vm), chunk_idx);
     if (!c) vm_error(vm, line, "internal: bad chunk index %d", chunk_idx);
     if ((int)c->num_params != argc)
         vm_error(vm, line, "function '%s' expects %d argument%s but got %d",
@@ -246,9 +356,105 @@ static void push_frame(VM *vm, int chunk_idx, int argc, int fn_slot, int line) {
     f->ip      = c->code;
     f->base    = base;
     f->fn_slot = fn_slot;
+    f->upvalues = NULL;
+    f->upvalue_count = 0;
+    if (callee && callee->type == TYPE_FUNC) {
+        f->upvalues      = callee->as.obj->as.fn.upvalues;
+        f->upvalue_count = callee->as.obj->as.fn.upvalue_count;
+    }
+    frame_open_cells(vm, f);
 }
 
 /* --- the dispatch loop ---------------------------------------------------- */
+
+/* --- async tasks (spec §14.9) --------------------------------------------- */
+static int run(VM *vm);   /* forward: the dispatch loop, reused by task bodies */
+
+/*
+ * Per-async-task VM invocation.  A spawned async task runs its function chunk
+ * on its OWN operand/frame stack (so concurrently-suspended tasks never share
+ * stack slots) while pointing at the same VMShared (globals + stdlib bridge).
+ * Its C stack is the event-loop coroutine's, so a suspend at sleep/I-O parks
+ * the whole nested run() intact.
+ */
+typedef struct {
+    VMShared *sh;
+    int       chunk_idx;
+    Value     fn;          /* owned closure value (for its upvalues) */
+    Value    *args;        /* owned */
+    int       argc;
+} AsyncVMCtx;
+
+static void async_vm_body(void *ud, Value *out_result, int *out_has_error) {
+    AsyncVMCtx *ctx = (AsyncVMCtx *)ud;
+    VM tvm;
+    memset(&tvm, 0, sizeof(tvm));
+    tvm.sh = ctx->sh;
+    tvm.keep_top_return = 1;   /* deliver the task's return value (spec §14.9) */
+
+    /* Build the task's frame: push args as slots 0..argc-1, then locals. */
+    Chunk *c = module_chunk(ctx->sh->module, ctx->chunk_idx);
+    Value result = value_nil();
+    int has_error = 0;
+
+    if (setjmp(tvm.on_error) == 0) {
+        for (int i = 0; i < ctx->argc; i++) vm_push(&tvm, value_copy(&ctx->args[i]));
+        for (int i = ctx->argc; i < (int)c->num_locals; i++) vm_push(&tvm, value_nil());
+        Frame *f = &tvm.frames[tvm.frame_count++];
+        f->chunk = c; f->ip = c->code; f->base = 0; f->fn_slot = -1;
+        f->upvalues = ctx->fn.as.obj->as.fn.upvalues;
+        f->upvalue_count = ctx->fn.as.obj->as.fn.upvalue_count;
+        f->globals_frame = 0;
+        frame_open_cells(&tvm, f);
+        run(&tvm);
+        /* run() leaves the single return value (RET normalizes 0->nil) on top */
+        if (tvm.sp > 0) result = tvm.stack[--tvm.sp];
+    } else {
+        has_error = 1;
+        result = value_error(myon_strdup("async task failed"));
+    }
+
+    /* drain any stragglers on the task stack */
+    while (tvm.sp > 0) { Value d = tvm.stack[--tvm.sp]; value_free(&d); }
+    free(tvm.stack);
+
+    value_free(&ctx->fn);
+    for (int i = 0; i < ctx->argc; i++) value_free(&ctx->args[i]);
+    free(ctx->args);
+    /* Deliver the outcome via the task-local out-params (see bridge header):
+     * out_result already holds a value_nil() we may overwrite. */
+    value_free(out_result);
+    *out_result = result;         /* ownership transfers to the task */
+    *out_has_error = has_error;
+    free(ctx);
+}
+
+/*
+ * MOP_CALL of an async function value: pop fn + argc args off the *current*
+ * stack, hand them to a freshly spawned task, and push the Task handle.  The
+ * task does not run yet (cooperative: it runs when the loop next schedules it).
+ */
+static void do_spawn_async(VM *vm, int line, int argc) {
+    (void)line;
+    Value *callee = vm_peek(vm, argc);
+    int cidx = vm_closure_chunk(callee);
+
+    AsyncVMCtx *ctx = (AsyncVMCtx *)myon_xmalloc(sizeof(AsyncVMCtx));
+    ctx->sh = vm->sh;
+    ctx->chunk_idx = cidx;
+    ctx->fn = value_copy(callee);
+    ctx->argc = argc;
+    ctx->args = argc ? (Value *)myon_xmalloc(sizeof(Value) * (size_t)argc) : NULL;
+    /* args sit above the callee: [callee][arg0..arg(argc-1)] */
+    for (int i = 0; i < argc; i++) ctx->args[i] = value_copy(&vm->stack[vm->sp - argc + i]);
+
+    /* pop args + callee off the operand stack */
+    for (int i = 0; i < argc; i++) { Value d = vm_pop(vm); value_free(&d); }
+    { Value d = vm_pop(vm); value_free(&d); }
+
+    Value task = myon_bridge_spawn_task(vm->sh->bridge, async_vm_body, ctx);
+    vm_push(vm, task);
+}
 
 static int run(VM *vm) {
     Frame *f = &vm->frames[vm->frame_count - 1];
@@ -265,9 +471,9 @@ static int run(VM *vm) {
 
         case MOP_PUSH_CONST: {
             uint16_t idx = read_u16(f);
-            if (idx >= (uint16_t)vm->module->const_count)
+            if (idx >= (uint16_t)VM_MODULE(vm)->const_count)
                 vm_error(vm, line, "internal: const index %u out of range", idx);
-            vm_push(vm, value_copy(&vm->module->consts[idx].value));
+            vm_push(vm, value_copy(&VM_MODULE(vm)->consts[idx].value));
             break;
         }
         case MOP_PUSH_TRUE:  vm_push(vm, value_bool(1)); break;
@@ -288,38 +494,73 @@ static int run(VM *vm) {
             Value r = vm_pop(vm);
             Value l = vm_pop(vm);
             /* myon_bridge_binary consumes l and r and may longjmp on error */
-            vm_push(vm, myon_bridge_binary(vm->bridge, line, to_opkind[op], l, r));
+            vm_push(vm, myon_bridge_binary(VM_BRIDGE(vm), line, to_opkind[op], l, r));
             break;
         }
-        case MOP_NEG: { Value v = vm_pop(vm); vm_push(vm, myon_bridge_neg(vm->bridge, line, v)); break; }
-        case MOP_NOT: { Value v = vm_pop(vm); vm_push(vm, myon_bridge_not(vm->bridge, line, v)); break; }
+        case MOP_NEG: { Value v = vm_pop(vm); vm_push(vm, myon_bridge_neg(VM_BRIDGE(vm), line, v)); break; }
+        case MOP_NOT: { Value v = vm_pop(vm); vm_push(vm, myon_bridge_not(VM_BRIDGE(vm), line, v)); break; }
 
-        /* local variables (frame-relative) */
+        /* local variables (frame-relative).  A captured slot lives in a boxed
+         * cell (spec §7.3) so closures share it; read/write through the cell. */
         case MOP_LOAD_LOCAL: {
             uint16_t slot = read_u16(f);
-            vm_push(vm, value_copy(&vm->stack[f->base + slot]));
+            if (f->cells && f->cells[slot])
+                vm_push(vm, value_copy(&f->cells[slot]->value));
+            else if (f->globals_frame)
+                vm_push(vm, value_copy(&vm->sh->globals[slot]));
+            else
+                vm_push(vm, value_copy(&vm->stack[f->base + slot]));
             break;
         }
         case MOP_STORE_LOCAL: {
             uint16_t slot = read_u16(f);
             Value v = vm_pop(vm);
-            value_free(&vm->stack[f->base + slot]);
-            vm->stack[f->base + slot] = v;
+            if (f->cells && f->cells[slot]) {
+                value_free(&f->cells[slot]->value);
+                f->cells[slot]->value = v;
+            } else if (f->globals_frame) {
+                value_free(&vm->sh->globals[slot]);
+                vm->sh->globals[slot] = v;
+            } else {
+                value_free(&vm->stack[f->base + slot]);
+                vm->stack[f->base + slot] = v;
+            }
             break;
         }
-        /* globals: absolute slots in the entry (<main>) frame (spec §4.6 note) */
+        /* upvalues: captured cells threaded in via the closure (spec §7.3) */
+        case MOP_LOAD_UPVALUE: {
+            uint16_t idx = read_u16(f);
+            if (idx >= (uint16_t)f->upvalue_count || !f->upvalues || !f->upvalues[idx])
+                vm_error(vm, line, "internal: bad upvalue index %u", idx);
+            vm_push(vm, value_copy(&f->upvalues[idx]->value));
+            break;
+        }
+        case MOP_STORE_UPVALUE: {
+            uint16_t idx = read_u16(f);
+            if (idx >= (uint16_t)f->upvalue_count || !f->upvalues || !f->upvalues[idx])
+                vm_error(vm, line, "internal: bad upvalue index %u", idx);
+            Value v = vm_pop(vm);
+            value_free(&f->upvalues[idx]->value);
+            f->upvalues[idx]->value = v;
+            break;
+        }
+        /* globals: shared top-level (<main>) slots (spec §4.6 note).  Held in a
+         * heap array (VMShared.globals), not frame 0, so a suspended async
+         * task's own stack cannot shadow them (spec §14.9). */
         case MOP_LOAD_GLOBAL: {
             uint16_t slot = read_u16(f);
-            int gbase = vm->frames[0].base;   /* entry frame base (== 0) */
-            vm_push(vm, value_copy(&vm->stack[gbase + slot]));
+            if (slot >= (uint16_t)vm->sh->global_count)
+                vm_error(vm, line, "internal: global slot %u out of range", slot);
+            vm_push(vm, value_copy(&vm->sh->globals[slot]));
             break;
         }
         case MOP_STORE_GLOBAL: {
             uint16_t slot = read_u16(f);
-            int gbase = vm->frames[0].base;
+            if (slot >= (uint16_t)vm->sh->global_count)
+                vm_error(vm, line, "internal: global slot %u out of range", slot);
             Value v = vm_pop(vm);
-            value_free(&vm->stack[gbase + slot]);
-            vm->stack[gbase + slot] = v;
+            value_free(&vm->sh->globals[slot]);
+            vm->sh->globals[slot] = v;
             break;
         }
 
@@ -345,17 +586,48 @@ static int run(VM *vm) {
         /* functions */
         case MOP_MAKE_CLOSURE: {
             uint16_t cidx = read_u16(f);
-            vm_push(vm, vm_make_closure(cidx));
+            uint8_t nupval = read_u8(f);
+            Chunk *tc = module_chunk(VM_MODULE(vm), cidx);
+            /* Resolve each capture against the *current* frame (spec §7.3):
+             * kind 1 = box/borrow this frame's local cell, kind 0 = re-share
+             * one of this frame's own upvalue cells. */
+            UpvalueCell *ups[256];
+            for (int i = 0; i < (int)nupval; i++) {
+                uint8_t kind = read_u8(f);
+                uint16_t index = read_u16(f);
+                if (kind == 1) {
+                    if (!f->cells || !f->cells[index])
+                        vm_error(vm, line,
+                            "internal: captured local slot %u is not boxed", index);
+                    ups[i] = f->cells[index];
+                } else {
+                    if (index >= (uint16_t)f->upvalue_count || !f->upvalues)
+                        vm_error(vm, line, "internal: bad re-captured upvalue %u", index);
+                    ups[i] = f->upvalues[index];
+                }
+            }
+            vm_push(vm, vm_make_closure(cidx, tc ? tc->is_async : 0, ups, (int)nupval));
             break;
         }
         case MOP_CALL: {
             uint8_t argc = read_u8(f);
             Value *callee = vm_peek(vm, argc);   /* fn sits below the args */
-            if (callee->type != TYPE_FUNC)
+            if (!vm_is_mvm_fn(callee))
                 vm_error(vm, line, "cannot call a %s value", value_type_name(callee));
             int cidx = vm_closure_chunk(callee);
+            /*
+             * Calling an `myon.async` function does not run it: it spawns a
+             * cooperative task and yields a Task value immediately (spec
+             * §14.9), exactly like the tree-walker.  Async-ness is a property
+             * of the function value (its chunk's is_async flag), so first-class
+             * async fn values behave the same as a bare named call.
+             */
+            if (callee->as.obj->as.fn.mvm_is_async) {
+                do_spawn_async(vm, line, argc);
+                break;
+            }
             int fn_slot = vm->sp - argc - 1;
-            push_frame(vm, cidx, argc, fn_slot, line);
+            push_frame(vm, callee, cidx, argc, fn_slot, line);
             f = &vm->frames[vm->frame_count - 1];
             break;
         }
@@ -374,7 +646,9 @@ static int run(VM *vm) {
              * below when frame_count hits 0) still discards it.  Multi-value
              * returns (n >= 1, used by `a, b = f()`) are unchanged. */
             if (n == 0) { rets[0] = value_nil(); n = 1; }
-            /* tear down: free locals, then the callee fn value */
+            /* tear down: drop boxed cells (spec §7.3), free locals, then the
+             * callee fn value */
+            frame_close_cells(f);
             while (vm->sp > f->base) { Value d = vm_pop(vm); value_free(&d); }
             if (f->fn_slot >= 0) {
                 /* pop the callee fn value that the caller pushed at base-1 */
@@ -384,8 +658,16 @@ static int run(VM *vm) {
             vm->frame_count--;
             for (int i = 0; i < n; i++) vm_push(vm, rets[i]);
             if (vm->frame_count == 0) {
-                /* entry chunk returned: done. discard any straggler returns. */
-                for (int i = 0; i < n; i++) { Value d = vm_pop(vm); value_free(&d); }
+                /* Outermost frame returned.  For the <main> entry chunk the
+                 * return value is discarded; for an async task body it must be
+                 * left on the stack so async_vm_body can hand it to the awaiter
+                 * (spec §14.9).  RET normalized n>=1 above, so the task result
+                 * is the single top value; drop any extra straggler returns. */
+                if (vm->keep_top_return) {
+                    for (int i = 0; i < n - 1; i++) { Value d = vm_pop(vm); value_free(&d); }
+                } else {
+                    for (int i = 0; i < n; i++) { Value d = vm_pop(vm); value_free(&d); }
+                }
                 return 0;
             }
             f = &vm->frames[vm->frame_count - 1];
@@ -395,13 +677,13 @@ static int run(VM *vm) {
         /* arrays / maps */
         case MOP_NEW_ARRAY: {
             uint16_t tidx = read_u16(f);
-            TypeSpec *ts = vm->module->consts[tidx].typespec;
+            TypeSpec *ts = VM_MODULE(vm)->consts[tidx].typespec;
             vm_push(vm, value_array(ts ? typespec_clone(ts) : NULL));
             break;
         }
         case MOP_NEW_MAP: {
             uint16_t tidx = read_u16(f);
-            TypeSpec *ms = vm->module->consts[tidx].typespec;
+            TypeSpec *ms = VM_MODULE(vm)->consts[tidx].typespec;
             TypeSpec *kt = (ms && ms->key)  ? typespec_clone(ms->key)  : NULL;
             TypeSpec *vt = (ms && ms->elem) ? typespec_clone(ms->elem) : NULL;
             vm_push(vm, value_map(kt, vt));
@@ -465,7 +747,7 @@ static int run(VM *vm) {
         /* structs / members / methods (spec §4.11) */
         case MOP_NEW_STRUCT: {
             uint16_t nidx = read_u16(f);
-            const char *sname = vm->module->consts[nidx].value.as.obj->as.str;
+            const char *sname = VM_MODULE(vm)->consts[nidx].value.as.obj->as.str;
             StructDecl *sd = find_struct_decl(vm, sname);
             if (!sd)
                 vm_error(vm, line,
@@ -504,7 +786,7 @@ static int run(VM *vm) {
         }
         case MOP_GET_FIELD: {
             uint16_t nidx = read_u16(f);
-            const char *fname = vm->module->consts[nidx].value.as.obj->as.str;
+            const char *fname = VM_MODULE(vm)->consts[nidx].value.as.obj->as.str;
             Value st = vm_pop(vm);
             if (st.type != TYPE_STRUCT) { value_free(&st); vm_error(vm, line, "member access on non-struct value"); }
             Value *fp = struct_field_ptr(&st, fname);
@@ -516,7 +798,7 @@ static int run(VM *vm) {
         }
         case MOP_SET_FIELD: {
             uint16_t nidx = read_u16(f);
-            const char *fname = vm->module->consts[nidx].value.as.obj->as.str;
+            const char *fname = VM_MODULE(vm)->consts[nidx].value.as.obj->as.str;
             Value v = vm_pop(vm);
             Value st = vm_pop(vm);
             if (st.type != TYPE_STRUCT) { value_free(&st); value_free(&v); vm_error(vm, line, "cannot set field on non-struct"); }
@@ -530,7 +812,7 @@ static int run(VM *vm) {
         case MOP_INVOKE: {
             uint16_t nidx = read_u16(f);
             uint8_t argc = read_u8(f);
-            const char *method = vm->module->consts[nidx].value.as.obj->as.str;
+            const char *method = VM_MODULE(vm)->consts[nidx].value.as.obj->as.str;
             Value *recv = vm_peek(vm, argc);   /* receiver below the args */
             if (recv->type == TYPE_STRUCT) {
                 /* static dispatch to the Struct.method chunk (self at slot 0) */
@@ -544,7 +826,7 @@ static int run(VM *vm) {
                 /* the receiver already occupies the self (slot 0) position;
                  * treat it as fn_slot-less: base = recv position. */
                 int base = vm->sp - argc - 1;
-                Chunk *mc = module_chunk(vm->module, cidx);
+                Chunk *mc = module_chunk(VM_MODULE(vm), cidx);
                 if ((int)mc->num_params != argc + 1)
                     vm_error(vm, line, "method '%s' expects %d argument%s but got %d",
                              method, mc->num_params - 1,
@@ -554,6 +836,8 @@ static int run(VM *vm) {
                 for (int i = (int)mc->num_params; i < (int)mc->num_locals; i++) vm_push(vm, value_nil());
                 Frame *nf = &vm->frames[vm->frame_count++];
                 nf->chunk = mc; nf->ip = mc->code; nf->base = base; nf->fn_slot = -1;
+                nf->upvalues = NULL; nf->upvalue_count = 0;
+                frame_open_cells(vm, nf);   /* methods may capture in nested lambdas */
                 f = &vm->frames[vm->frame_count - 1];
             } else {
                 /* built-in method (array/map/str): reuse the tree-walker */
@@ -575,7 +859,7 @@ static int run(VM *vm) {
                 }
                 Value recv_copy = value_copy(recv);
                 Value out = value_nil();
-                myon_bridge_call_method(vm->bridge, recv_copy, method, args, argc, line, &out);
+                myon_bridge_call_method(VM_BRIDGE(vm), recv_copy, method, args, argc, line, &out);
                 value_free(&recv_copy);
                 for (int i = 0; i < argc; i++) value_free(&vm->stack[vm->sp - 1 - i]);
                 vm->sp -= argc;
@@ -592,22 +876,31 @@ static int run(VM *vm) {
             Value a = vm_pop(vm);
             /* both are already str (compiler emits TO_STR as needed); reuse
              * the tree-walker's ADD-on-str semantics for identical behaviour */
-            vm_push(vm, myon_bridge_binary(vm->bridge, line, OP_ADD, a, b));
+            vm_push(vm, myon_bridge_binary(VM_BRIDGE(vm), line, OP_ADD, a, b));
             break;
         }
-        case MOP_TO_STR:   { Value v = vm_pop(vm); vm_push(vm, myon_bridge_cast_str(vm->bridge, line, v)); break; }
-        case MOP_CAST_STR: { Value v = vm_pop(vm); vm_push(vm, myon_bridge_cast_str(vm->bridge, line, v)); break; }
-        case MOP_CAST_INT: { Value v = vm_pop(vm); vm_push(vm, myon_bridge_cast_int(vm->bridge, line, v)); break; }
-        case MOP_CAST_CHAR:{ Value v = vm_pop(vm); vm_push(vm, myon_bridge_cast_char(vm->bridge, line, v)); break; }
-        case MOP_MAKE_ERROR:{ Value v = vm_pop(vm); vm_push(vm, myon_bridge_make_error(vm->bridge, line, v)); break; }
+        case MOP_TO_STR:   { Value v = vm_pop(vm); vm_push(vm, myon_bridge_cast_str(VM_BRIDGE(vm), line, v)); break; }
+        case MOP_CAST_STR: { Value v = vm_pop(vm); vm_push(vm, myon_bridge_cast_str(VM_BRIDGE(vm), line, v)); break; }
+        case MOP_CAST_INT: { Value v = vm_pop(vm); vm_push(vm, myon_bridge_cast_int(VM_BRIDGE(vm), line, v)); break; }
+        case MOP_CAST_CHAR:{ Value v = vm_pop(vm); vm_push(vm, myon_bridge_cast_char(VM_BRIDGE(vm), line, v)); break; }
+        case MOP_MAKE_ERROR:{ Value v = vm_pop(vm); vm_push(vm, myon_bridge_make_error(VM_BRIDGE(vm), line, v)); break; }
 
         /* native / module calls */
         case MOP_CALL_NATIVE: {
             uint16_t nid = read_u16(f);
             uint8_t argc = read_u8(f);
-            if (nid >= (uint16_t)vm->module->native_count)
+            if (nid >= (uint16_t)VM_MODULE(vm)->native_count)
                 vm_error(vm, line, "internal: native id %u out of range", nid);
-            do_call_native(vm, line, vm->module->natives[nid], argc);
+            do_call_native(vm, line, VM_MODULE(vm)->natives[nid], argc);
+            break;
+        }
+
+        /* async/await (spec §14.9): await drives/suspends the event loop until
+         * the awaited Task resolves, then leaves its result on the stack.  A
+         * non-task value passes straight through (myon.await of a plain value). */
+        case MOP_AWAIT: {
+            Value t = vm_pop(vm);
+            vm_push(vm, myon_bridge_await(VM_BRIDGE(vm), line, t));
             break;
         }
 
@@ -664,27 +957,47 @@ int mvm_run_module(Module *m, Program *program, const char *source) {
     }
     if (source) diag_set_source(source);
 
-    VM vm;
-    memset(&vm, 0, sizeof(vm));
-    vm.module  = m;
-    vm.program = program;
-    vm.bridge  = myon_bridge_interp_new();
+    VMShared sh;
+    memset(&sh, 0, sizeof(sh));
+    sh.module  = m;
+    sh.program = program;
+    sh.bridge  = myon_bridge_interp_new();
 
     int entry = m->entry_chunk;
     Chunk *ec = module_chunk(m, entry);
-    if (!ec) { myon_bridge_interp_free(vm.bridge); fprintf(stderr, "myon: bad entry chunk\n"); return 70; }
+    if (!ec) { myon_bridge_interp_free(sh.bridge); fprintf(stderr, "myon: bad entry chunk\n"); return 70; }
+
+    /* <main>'s locals are the program globals; hold them in a shared heap array
+     * so async tasks (each with their own operand stack) observe the same set
+     * (spec §4.6 note, §14.9). */
+    sh.global_count = ec->num_locals;
+    sh.globals = sh.global_count
+        ? (Value *)myon_xmalloc(sizeof(Value) * (size_t)sh.global_count) : NULL;
+    for (int i = 0; i < sh.global_count; i++) sh.globals[i] = value_nil();
+
+    VM vm;
+    memset(&vm, 0, sizeof(vm));
+    vm.sh = &sh;
 
     int rc = 0;
     if (setjmp(vm.on_error) == 0) {
         /* Point the shared stdlib's runtime_error() at our barrier so any
          * error raised deep inside a native unwinds cleanly back to us. */
-        jmp_buf *bridge_buf = (jmp_buf *)myon_bridge_error_buf(vm.bridge);
+        jmp_buf *bridge_buf = (jmp_buf *)myon_bridge_error_buf(sh.bridge);
         if (setjmp(*bridge_buf) == 0) {
-            /* entry frame: <main> has no callee fn value (fn_slot = -1). */
-            for (int i = 0; i < (int)ec->num_locals; i++) vm_push(&vm, value_nil());
+            /* entry frame: <main> keeps its locals in sh.globals (globals_frame
+             * = 1), and has no callee fn value (fn_slot = -1). */
             Frame *f = &vm.frames[vm.frame_count++];
             f->chunk = ec; f->ip = ec->code; f->base = 0; f->fn_slot = -1;
+            f->upvalues = NULL; f->upvalue_count = 0;
+            f->cells = NULL; f->globals_frame = 1;
             rc = run(&vm);
+            /*
+             * Drain any tasks still pending after <main> returns so background
+             * / not-yet-awaited async work runs to completion, matching the
+             * tree-walker's program-exit drain (spec §14.9).
+             */
+            myon_bridge_drain_tasks(sh.bridge);
         } else {
             rc = 1;   /* native raised (already reported by tree-walk diag) */
         }
@@ -692,10 +1005,12 @@ int mvm_run_module(Module *m, Program *program, const char *source) {
         rc = 1;       /* VM raised (already reported by vm_error) */
     }
 
-    /* clean up any values left on the operand stack */
+    /* clean up any values left on the operand stack + the globals */
     while (vm.sp > 0) { Value d = vm.stack[--vm.sp]; value_free(&d); }
     free(vm.stack);
-    myon_bridge_interp_free(vm.bridge);
+    for (int i = 0; i < sh.global_count; i++) value_free(&sh.globals[i]);
+    free(sh.globals);
+    myon_bridge_interp_free(sh.bridge);
     if (source) diag_clear_source();
     return rc;
 }
