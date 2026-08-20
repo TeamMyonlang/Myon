@@ -1,0 +1,34 @@
+# Regression: a struct method's throwaway (multi-)assignment must NOT write
+# through and clobber a same-named GLOBAL variable.
+#
+# A method's closure is the global scope, so before the fix an assignment
+# inside the method body to a name that happened to match a top-level
+# variable (here `bar`) reached up the chain and overwrote that global --
+# turning the caller's `bar` struct into a plain value, so the SECOND
+# `bar.render()` blew up with "type <T> has no methods".
+#
+# After the fix, method call frames are function boundaries: undefined
+# assignment targets are defined locally instead of mutating globals the
+# method never meant to touch.  Fields are still mutated via `self`, and
+# ordinary (non-method) functions keep the documented spec 9.2 write-through
+# to outer scopes (covered by p51_scope_multi_assign_outer).
+module myon.stdio
+
+myon.func pair() ret float, error {
+    ret 1.0, myon.nil
+}
+
+myon.struct Bar {
+    v: int
+    myon.func render() ret void {
+        # `bar` here is a throwaway method local; it must NOT touch the
+        # top-level `bar` variable of the same name.
+        bar, err = pair()
+        myon.print(bar)
+    }
+}
+
+bar = Bar(v=1)
+bar.render()   # prints 1.0 (method-local bar)
+bar.render()   # must NOT fail: global `bar` is still a struct
+myon.print("ok")
