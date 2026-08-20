@@ -1,0 +1,62 @@
+system myon.useversion=1
+module myon.stdio
+
+// A small CLI tool that demonstrates the Phase 8 stdio/argv additions:
+//   myon.write   - print without a trailing newline (enables \r overwrites)
+//   myon.flush   - force the partially-written line out to the terminal now
+//   myon.is_tty  - only emit carriage-return / ANSI control when interactive
+//   myon.eprint  - send diagnostics to stderr, keeping stdout clean
+//   myon.argv    - read the script's own command-line arguments
+//   myon.println - print with an explicit trailing newline
+//
+// Usage:
+//   myon examples/cli_progress.myon            # default 20 steps
+//   myon examples/cli_progress.myon 50         # 50 steps
+//   myon examples/cli_progress.myon -- 50      # same, after a `--` separator
+
+args = myon.argv()
+
+// Default step count; override with the first argument if given.
+steps = 20
+myon.if args.length() > 0 {
+    steps = int(args[0])
+}
+
+myon.if steps < 1 {
+    myon.eprint("error: steps must be >= 1")
+}
+
+interactive = myon.is_tty()
+
+i = 0
+myon.while i <= steps {
+    pct = i * 100 / steps
+
+    // Build a simple textual bar: '#' for done, '.' for remaining.
+    bar = ""
+    j = 0
+    myon.while j < steps {
+        myon.if j < i {
+            bar = bar + "#"
+        } myon.else {
+            bar = bar + "."
+        }
+        j = j + 1
+    }
+
+    myon.if interactive {
+        // Overwrite the same line in place using a carriage return.
+        myon.write("\r[" + bar + "] " + str(pct) + "%")
+        myon.flush()
+    } myon.else {
+        // Piped/redirected: emit one line per update instead of \r.
+        myon.println("[" + bar + "] " + str(pct) + "%")
+    }
+
+    i = i + 1
+}
+
+myon.if interactive {
+    myon.println("")
+}
+myon.eprint("done")

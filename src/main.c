@@ -93,8 +93,10 @@ static void usage(const char *prog) {
         "Myon interpreter\n"
         "\n"
         "usage:\n"
-        "  %s <file.myon>                 run a source file (tree-walking interpreter)\n"
-        "  %s <file.myc>                  run compiled MVM bytecode (bytecode VM)\n"
+        "  %s <file.myon> [args...]       run a source file (tree-walking interpreter);\n"
+        "                                 args after the path (or after `--`) are passed\n"
+        "                                 to the script and readable via myon.argv()\n"
+        "  %s <file.myc> [args...]        run compiled MVM bytecode (bytecode VM)\n"
         "  %s --compile <src> [-o out]    compile a .myon to MVM bytecode (.myc); does not run\n"
         "  %s --dump-bytecode <src>       print the MVM disassembly of a .myon (or .myc) and exit\n"
         "  %s --tokens <file.myon>        print the token stream and exit\n"
@@ -583,7 +585,37 @@ int main(int argc, char **argv) {
     const char *dump_src = NULL;
     const char *run_mvm_src = NULL;
 
+    /*
+     * Script argument passthrough (spec §10.1.1).  Once we have identified
+     * the script/file path, everything that follows on the command line — or
+     * everything after an explicit `--` separator — belongs to the script and
+     * is exposed via myon.argv(), NOT parsed as an interpreter option.  This
+     * lets tools written in Myon (e.g. `myon build.myon --release out.bin`)
+     * receive their own flags instead of erroring on an "unknown option".
+     *
+     * script_argv points into the process argv (borrowed), so no allocation or
+     * freeing is needed; interpret_set_script_args() borrows it in turn.
+     */
+    char **script_argv = NULL;
+    int    script_argc = 0;
+
     for (int i = 1; i < argc; i++) {
+        /* An explicit "--": consume it and hand every remaining token to the
+         * script, regardless of leading dashes.  Works both before a bare
+         * script path (`myon -- ...` is unusual but harmless) and, more
+         * usefully, after it (`myon foo.myon -- --flag`). */
+        if (strcmp(argv[i], "--") == 0) {
+            script_argv = &argv[i + 1];
+            script_argc = argc - (i + 1);
+            break;
+        }
+        /* If a positional file path was already seen, all following tokens are
+         * the script's own arguments (including ones that start with '-'). */
+        if (path) {
+            script_argv = &argv[i];
+            script_argc = argc - i;
+            break;
+        }
         if (strcmp(argv[i], "--tokens") == 0) tokens_only = 1;
         else if (strcmp(argv[i], "--strict-stale") == 0) strict_stale = 1;
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
@@ -612,6 +644,9 @@ int main(int argc, char **argv) {
             path = argv[i];
         }
     }
+
+    /* Publish the script arguments before any interpreter is created/run. */
+    interpret_set_script_args(script_argv, script_argc);
 
     if (dump_src)    return cmd_dump_bytecode(dump_src);
     if (compile_src) return cmd_compile(compile_src, compile_out);

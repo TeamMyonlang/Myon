@@ -60,6 +60,15 @@
 #include <stdint.h>
 #include <time.h>
 
+/* TTY detection (myon.is_tty): POSIX isatty()/fileno() live in <unistd.h>,
+ * while the Win32 CRT exposes _isatty()/_fileno() in <io.h>.  A tiny wrapper
+ * (myon_stream_is_tty) below hides the spelling difference from the builtin. */
+#if defined(_WIN32)
+#  include <io.h>
+#else
+#  include <unistd.h>
+#endif
+
 /* Phase5 myon.net: the synchronous fallback path in net_wait_fd() uses
  * select(2) directly (outside a coroutine).  On Linux this lives behind
  * <sys/select.h>.  On Windows the equivalent Winsock select() lives in
@@ -240,6 +249,16 @@ struct Interp {
      * stdin, where there is no owning file).
      */
     char        *script_dir;
+    /*
+     * Script command-line arguments (spec §10.1.1): everything the CLI
+     * passed after the script path (or after a `--` separator).  Exposed to
+     * Myon programs via the myon.argv() builtin.  Borrowed pointers into the
+     * process argv vector (owned by main.c / the module global below), so this
+     * interpreter never frees the strings.  script_argc == 0 / script_argv ==
+     * NULL when no script args were supplied (REPL, stdin, bare `myon file`).
+     */
+    char       **script_argv;
+    int          script_argc;
 };
 typedef struct Interp Interp;
 
@@ -619,7 +638,29 @@ static Value interpolate_string(Interp *it, Env *env, int line, const char *raw)
 /* Builtins: myon.print / myon.input                                   */
 /* ------------------------------------------------------------------ */
 
-static Value builtin_print(Interp *it, Env *env, Expr *call) {
+/* Return non-zero when the given C stream is connected to a terminal (TTY),
+ * abstracting the POSIX/Win32 spelling difference (see the <io.h>/<unistd.h>
+ * include block above).  Used by myon.is_tty(). */
+static int myon_stream_is_tty(FILE *stream) {
+#if defined(_WIN32)
+    return _isatty(_fileno(stream)) != 0;
+#else
+    return isatty(fileno(stream)) != 0;
+#endif
+}
+
+/*
+ * Shared core for the stdout writers.  Concatenates every argument's string
+ * form to `stream`, honouring the same named-argument rejection as before.
+ * `newline` controls whether a trailing '\n' is appended:
+ *   - myon.print    -> newline = 1 (auto newline, the historical behaviour)
+ *   - myon.println  -> newline = 1 (explicit auto-newline alias)
+ *   - myon.write    -> newline = 0 (no trailing newline; enables \r overwrites,
+ *                                   progress bars and spinners — spec §10.1)
+ */
+static Value builtin_print_impl(Interp *it, Env *env, Expr *call,
+                                FILE *stream, int newline,
+                                const char *who) {
     /* argc comes from the injected bridge vector when the VM calls us,
      * otherwise from the AST — see eval_arg() for the same convention. */
     int argc = it->bridge_args ? it->bridge_argc : call->as.call.arg_count;
@@ -627,15 +668,72 @@ static Value builtin_print(Interp *it, Env *env, Expr *call) {
         /* Named args (`x=...`) only exist in an AST call; the VM never
          * produces them, so this check is skipped in bridge mode. */
         if (!it->bridge_args && call->as.call.arg_names[i])
-            runtime_error(it, call->line, "myon.print does not accept named arguments");
+            runtime_error(it, call->line, "%s does not accept named arguments", who);
         Value v = eval_arg(it, env, call, i);
         char *s = value_to_cstr(&v);
-        fputs(s, stdout);
+        fputs(s, stream);
         free(s);
         value_free(&v);
     }
-    fputc('\n', stdout);
+    if (newline) fputc('\n', stream);
     return value_void();
+}
+
+static Value builtin_print(Interp *it, Env *env, Expr *call) {
+    /* myon.print: auto newline (unchanged historical behaviour). */
+    return builtin_print_impl(it, env, call, stdout, 1, "myon.print");
+}
+
+static Value builtin_println(Interp *it, Env *env, Expr *call) {
+    /* myon.println: explicit auto-newline writer (alias of print). */
+    return builtin_print_impl(it, env, call, stdout, 1, "myon.println");
+}
+
+static Value builtin_write(Interp *it, Env *env, Expr *call) {
+    /* myon.write: NO trailing newline.  This is the output path that makes
+     * carriage-return overwrites (progress bars, spinners) possible. */
+    return builtin_print_impl(it, env, call, stdout, 0, "myon.write");
+}
+
+static Value builtin_eprint(Interp *it, Env *env, Expr *call) {
+    /* myon.eprint: write to stderr, WITH a trailing newline, so diagnostics
+     * and progress output stay off stdout (which may be piped/processed). */
+    return builtin_print_impl(it, env, call, stderr, 1, "myon.eprint");
+}
+
+static Value builtin_flush(Interp *it, Env *env, Expr *call) {
+    /* myon.flush() ret void — force buffered stdout to the terminal now.
+     * Essential when using myon.write for a live-updating single line. */
+    int argc = it->bridge_args ? it->bridge_argc : call->as.call.arg_count;
+    if (argc != 0)
+        runtime_error(it, call->line, "myon.flush expects no arguments");
+    (void)env;
+    fflush(stdout);
+    return value_void();
+}
+
+static Value builtin_is_tty(Interp *it, Env *env, Expr *call) {
+    /* myon.is_tty() ret bool — true when stdout is an interactive terminal.
+     * Lets scripts suppress ANSI control codes when piped/redirected. */
+    int argc = it->bridge_args ? it->bridge_argc : call->as.call.arg_count;
+    if (argc != 0)
+        runtime_error(it, call->line, "myon.is_tty expects no arguments");
+    (void)env;
+    return value_bool(myon_stream_is_tty(stdout));
+}
+
+static Value builtin_argv(Interp *it, Env *env, Expr *call) {
+    /* myon.argv() ret myon.array(str) — the script arguments passed after the
+     * script path on the command line (spec §10.1.1).  Always returns an
+     * array (possibly empty), never nil. */
+    int argc = it->bridge_args ? it->bridge_argc : call->as.call.arg_count;
+    if (argc != 0)
+        runtime_error(it, call->line, "myon.argv expects no arguments");
+    (void)env;
+    Value arr = value_array(typespec_prim(TYPE_STR));
+    for (int i = 0; i < it->script_argc; i++)
+        array_push(&arr, value_str(myon_strdup(it->script_argv[i])));
+    return arr;
 }
 
 static Value builtin_input(Interp *it, Env *env, Expr *call) {
@@ -4262,6 +4360,12 @@ static Value eval_call(Interp *it, Env *env, Expr *e) {
     if (callee->kind == EXPR_IDENT) {
         const char *name = callee->as.ident;
         if (strcmp(name, "myon.print") == 0) return builtin_print(it, env, e);
+        if (strcmp(name, "myon.println") == 0) return builtin_println(it, env, e);
+        if (strcmp(name, "myon.write") == 0) return builtin_write(it, env, e);
+        if (strcmp(name, "myon.eprint") == 0) return builtin_eprint(it, env, e);
+        if (strcmp(name, "myon.flush") == 0) return builtin_flush(it, env, e);
+        if (strcmp(name, "myon.is_tty") == 0) return builtin_is_tty(it, env, e);
+        if (strcmp(name, "myon.argv") == 0) return builtin_argv(it, env, e);
         if (strcmp(name, "myon.input") == 0) return builtin_input(it, env, e);
         /* stdlib namespaced calls (myon.math.* / myon.string.*) */
         if (strncmp(name, "myon.", 5) == 0) {
@@ -5338,6 +5442,16 @@ static void prescan(Interp *it, Env *env, Program *prog) {
  */
 static char *g_script_dir = NULL;
 
+/*
+ * Script argument vector staged by main.c before a run and consumed when an
+ * interpreter is created (interp_create / one-shot interpret()).  These are
+ * borrowed pointers into the process argv (never freed here); the module
+ * global mirrors g_script_dir's lifetime discipline.  Exposed to programs via
+ * myon.argv().
+ */
+static char **g_script_argv = NULL;
+static int    g_script_argc = 0;
+
 /* Return a heap copy of the directory portion of `path`, or NULL when `path`
  * has no directory component (bare filename) or is NULL/empty. */
 static char *dirname_dup(const char *path) {
@@ -5361,11 +5475,19 @@ void interpret_set_script_path(const char *script_path) {
     g_script_dir = dirname_dup(script_path);
 }
 
+void interpret_set_script_args(char **argv, int argc) {
+    /* Borrow the caller's vector (main.c keeps it alive for the whole run). */
+    g_script_argv = argv;
+    g_script_argc = (argc > 0) ? argc : 0;
+}
+
 Interp *interp_create(void) {
     Interp *it = (Interp *)myon_xmalloc(sizeof(Interp));
     memset(it, 0, sizeof(*it));
     it->global = env_new(NULL);
     it->script_dir = g_script_dir ? myon_strdup(g_script_dir) : NULL;
+    it->script_argv = g_script_argv;   /* borrowed (see g_script_argv note) */
+    it->script_argc = g_script_argc;
     return it;
 }
 
@@ -5552,6 +5674,24 @@ int myon_bridge_call_native(Interp *it, const char *name,
     } else if (strcmp(name, "myon.print") == 0) {
         *out = builtin_print(it, NULL, &call);
         handled = 1;
+    } else if (strcmp(name, "myon.println") == 0) {
+        *out = builtin_println(it, NULL, &call);
+        handled = 1;
+    } else if (strcmp(name, "myon.write") == 0) {
+        *out = builtin_write(it, NULL, &call);
+        handled = 1;
+    } else if (strcmp(name, "myon.eprint") == 0) {
+        *out = builtin_eprint(it, NULL, &call);
+        handled = 1;
+    } else if (strcmp(name, "myon.flush") == 0) {
+        *out = builtin_flush(it, NULL, &call);
+        handled = 1;
+    } else if (strcmp(name, "myon.is_tty") == 0) {
+        *out = builtin_is_tty(it, NULL, &call);
+        handled = 1;
+    } else if (strcmp(name, "myon.argv") == 0) {
+        *out = builtin_argv(it, NULL, &call);
+        handled = 1;
     } else if (strcmp(name, "myon.input") == 0) {
         *out = builtin_input(it, NULL, &call);
         handled = 1;
@@ -5671,6 +5811,8 @@ int interpret(Program *program) {
     memset(&it, 0, sizeof(it));
     it.global = env_new(NULL);
     it.script_dir = g_script_dir ? myon_strdup(g_script_dir) : NULL;
+    it.script_argv = g_script_argv;   /* borrowed (see g_script_argv note) */
+    it.script_argc = g_script_argc;
 
     int rc = 0;
     if (setjmp(it.on_error)) {

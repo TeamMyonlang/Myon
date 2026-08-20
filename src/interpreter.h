@@ -42,6 +42,16 @@ int interpret(Program *program);
 void interpret_set_script_path(const char *script_path);
 
 /*
+ * Stage the script's command-line arguments (spec §10.1 / §11), i.e. the
+ * tokens the CLI passed after the script path (or after a `--` separator).
+ * The pointers are borrowed: the caller (main.c) must keep the argv vector
+ * alive for the whole run; the interpreter never frees the strings.  Exposed
+ * to programs through the myon.argv() builtin.  Must be called before
+ * interpret()/interp_create().  argc <= 0 means "no script arguments".
+ */
+void interpret_set_script_args(char **argv, int argc);
+
+/*
  * Persistent interpreter handle used by the interactive REPL (spec 12).
  *
  * Unlike interpret(), which builds and tears down a fresh interpreter for a

@@ -1,0 +1,22 @@
+system myon.useversion=1
+module myon.stdio
+
+// myon.write: no trailing newline (enables \r overwrites / progress bars).
+myon.write("a")
+myon.write("b")
+myon.write("c")
+myon.println("")
+// myon.println: explicit auto-newline (alias of print's newline behaviour).
+myon.println("line1")
+// myon.print: historical auto-newline behaviour is unchanged.
+myon.print("x=", 1, " y=", 2)
+// A carriage-return style single-line update ends with a real newline here so
+// the golden output is stable regardless of terminal handling.
+myon.write("progress: ")
+i = 0
+myon.while i < 5 {
+    myon.write(str(i))
+    i = i + 1
+}
+myon.println("")
+myon.flush()
