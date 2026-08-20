@@ -25,6 +25,7 @@ Env *env_new(Env *parent) {
     e->head = NULL;
     e->parent = parent;
     e->is_block = 0;
+    e->is_fn_boundary = 0;
     return e;
 }
 

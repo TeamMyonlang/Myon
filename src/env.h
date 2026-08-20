@@ -32,7 +32,12 @@ typedef struct Binding {
 typedef struct Env {
     Binding    *head;
     struct Env *parent;
-    int         is_block;   /* explicit { } block scope (spec 9.2 shadowing) */
+    int         is_block;       /* explicit { } block scope (spec 9.2 shadowing) */
+    int         is_fn_boundary; /* struct-method call frame: assignment must not
+                                 * write through this frame into an outer scope
+                                 * (methods operate on `self`, not on globals that
+                                 * happen to share a throwaway variable's name).
+                                 * See assign_or_define(). */
 } Env;
 
 Env  *env_new(Env *parent);

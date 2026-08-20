@@ -3404,6 +3404,16 @@ static Value call_function(Interp *it, int line, Value fn, Value *args, int argc
     /* bind self for methods */
     if (fn.as.obj->as.fn.is_bound && fn.as.obj->as.fn.bound_self) {
         env_define(call_env, "self", value_copy(fn.as.obj->as.fn.bound_self));
+        /* A struct method's closure is the global scope (see call_method), so
+         * without a boundary here an assignment inside the method body to a
+         * throwaway name that happens to match a global variable would write
+         * through and clobber that global (e.g. turning the caller's `bar`
+         * struct into a float, so the next `bar.method()` fails with
+         * "type <T> has no methods").  Mark this frame as a function boundary
+         * so assign_or_define() defines such names locally instead of
+         * mutating globals the method never meant to touch.  Reads still see
+         * globals (top-level funcs/structs) via env_get, which is unaffected. */
+        call_env->is_fn_boundary = 1;
     }
 
     /* bind parameters with type-checking (spec 6.1: annotations required) */
@@ -4713,15 +4723,38 @@ static void assign_target(Interp *it, Env *env, Expr *target, Value v) {
  * Takes ownership of `v` (either stored via env_set/env_define, or freed
  * on the error path).
  */
+/* Is `name` bound in some ENCLOSING scope that is reachable for
+ * assignment write-through?  Walk the parent chain but STOP crossing a
+ * struct-method function boundary (Env.is_fn_boundary): a method body must
+ * not silently write through into an outer scope (e.g. a global that merely
+ * shares a throwaway variable's name), which used to turn `bar` into a
+ * non-struct value and make a second `bar.render()` fail with
+ * "type <T> has no methods".  The frame carrying is_fn_boundary is the
+ * method's own call_env; scopes strictly outside it are not assignable
+ * targets, so a name found only there is treated as "not an outer binding"
+ * and a fresh local is defined instead. */
+static int assignable_outer(Env *env, const char *name) {
+    /* The boundary flag lives on the method's own call_env.  Everything
+     * strictly outside that frame (its parent chain) is off-limits for
+     * write-through.  Walk from the starting scope outward: at each frame,
+     * first honour a same-name binding (assignable), and if the frame is a
+     * boundary stop before crossing into its parent.  The starting scope's
+     * own locals are handled by the caller, so a boundary on `env` itself
+     * means no enclosing binding is assignable. */
+    for (Env *e = env; e; e = e->parent) {
+        if (e != env && env_defined_local(e, name)) return 1;
+        if (e->is_fn_boundary) return 0;
+    }
+    return 0;
+}
+
 static void assign_or_define(Interp *it, Env *env, int line,
                              const char *name, Value v) {
     if (env_defined_local(env, name)) {
         env_set(env, name, v);
         return;
     }
-    Value tmp;
-    int outer = (env->parent && env_get(env->parent, name, &tmp));
-    if (outer) value_free(&tmp);
+    int outer = assignable_outer(env, name);
     if (outer && env->is_block) {
         value_free(&v);
         runtime_error(it, line,
