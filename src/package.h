@@ -198,6 +198,98 @@ void pkg_install_url_reset(PkgInstallUrl *u);
 bool pkg_install_url_parse(const char *url, PkgInstallUrl *out, PkgError *err);
 
 /* ------------------------------------------------------------------ */
+/* Package-list registry ("myon pkg install <user>/<repo>")            */
+/* ------------------------------------------------------------------ */
+
+/*
+ * A GitHub "shorthand" reference "<owner>/<repo>" — the form a user types for
+ * `myon pkg install user/repo`.  This is NOT a URL; it is looked up in the
+ * package-list registries (spec: `.myon/packages.list`) to find the matching
+ * GitHub repository, which is then installed exactly like an explicit URL.
+ */
+typedef struct {
+    char *owner;
+    char *repo;
+} PkgShorthand;
+
+void pkg_shorthand_init(PkgShorthand *s);
+void pkg_shorthand_reset(PkgShorthand *s);
+
+/*
+ * True if `arg` looks like a "<owner>/<repo>" shorthand rather than a URL:
+ * it contains exactly one '/', no scheme ("://"), no whitespace/control bytes,
+ * and both segments are non-empty.  Used by the CLI to decide between the URL
+ * path and the registry-lookup path.  Does not fully validate the segments;
+ * pkg_shorthand_parse() does that.
+ */
+bool pkg_arg_is_shorthand(const char *arg);
+
+/*
+ * Parse and validate "<owner>/<repo>" into *out.  Segments must be valid
+ * GitHub path segments (ASCII letters/digits/'.'/'_'/'-', no "..", not "."
+ * alone, length-bounded).  A trailing ".git" on the repo is stripped.  Returns
+ * true on success (caller frees via pkg_shorthand_reset); false + *err
+ * (PKG_ERR_USAGE) otherwise.
+ */
+bool pkg_shorthand_parse(const char *arg, PkgShorthand *out, PkgError *err);
+
+/*
+ * One decoded registry entry: a repository shorthand "<owner>/<repo>", plus an
+ * optional short alias/name (registry JSON object form maps alias -> shorthand).
+ * `alias` is NULL for the array form.
+ */
+typedef struct {
+    char *alias;   /* optional short name (object form); NULL otherwise */
+    char *owner;
+    char *repo;
+} PkgRegistryEntry;
+
+typedef struct {
+    PkgRegistryEntry *entries;
+    size_t            count;
+} PkgRegistry;
+
+PkgRegistry *pkg_registry_new(void);
+void         pkg_registry_free(PkgRegistry *r);
+
+/*
+ * Parse a registry JSON document (NUL-terminated `text`) into *PkgRegistry.
+ *
+ * Two concrete, well-defined shapes are accepted (spec: package lists):
+ *
+ *   1. Array of shorthands:
+ *          ["acme/myon-json", "owner/pkg", ...]
+ *
+ *   2. Object mapping a short alias to a shorthand:
+ *          { "json": "acme/myon-json", "text": "acme/myon-text" }
+ *
+ * Every value must be a valid "<owner>/<repo>" shorthand.  This is a strict,
+ * self-contained JSON scanner (no external dependency) that rejects malformed
+ * JSON, non-string values, control bytes and oversized documents.  It NEVER
+ * executes anything — the registry is pure data.  Returns NULL + *err on error.
+ */
+PkgRegistry *pkg_registry_parse(const char *text, PkgError *err);
+
+/*
+ * Look up a "<owner>/<repo>" shorthand in a parsed registry.  Matching is on
+ * the owner/repo pair (case-sensitive, GitHub-style).  The registry alias, if
+ * any, is also accepted as a match when `want_owner` is NULL (alias-only
+ * lookup).  Returns the matching entry or NULL.
+ */
+const PkgRegistryEntry *pkg_registry_find(const PkgRegistry *r,
+                                          const char *want_owner,
+                                          const char *want_repo);
+
+/*
+ * Parse `.myon/packages.list` text into a heap array of registry URLs.  Each
+ * non-empty, non-comment ('#') line is one URL and must be https://.  Returns
+ * the number of URLs and stores a freshly-allocated array of heap strings in
+ * *out_urls (caller frees each element and the array); on error returns -1 and
+ * sets *err.  An empty/comment-only file yields 0 URLs and *out_urls == NULL.
+ */
+long pkg_packages_list_parse(const char *text, char ***out_urls, PkgError *err);
+
+/* ------------------------------------------------------------------ */
 /* Identity validators                                                 */
 /* ------------------------------------------------------------------ */
 
@@ -405,6 +497,15 @@ int pkg_ops_install_locked(void);
 
 /* `myon pkg install <github-url>` — add a dependency, resolve, lock, install. */
 int pkg_ops_install_url(const char *url);
+
+/*
+ * `myon pkg install <owner>/<repo>` — resolve the shorthand against the
+ * package-list registries in `.myon/packages.list`, then install the matching
+ * GitHub repository exactly like `pkg_ops_install_url`.  Fails with a clear
+ * diagnostic if there is no packages.list, if no registry lists the shorthand,
+ * or if a registry cannot be fetched/parsed.
+ */
+int pkg_ops_install_shorthand(const char *shorthand);
 
 /* ------------------------------------------------------------------ */
 /* CLI entry point                                                     */

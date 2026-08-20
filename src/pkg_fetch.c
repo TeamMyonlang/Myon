@@ -369,23 +369,32 @@ static bool http_once(const PkgTransport *tr, const char *host, int port,
     return true;
 }
 
-bool pkg_fetch_https_get(const PkgTransport *tr, const char *url,
-                         unsigned char **out_data, size_t *out_len,
-                         char **err_msg) {
+/*
+ * Core HTTPS GET with safe redirect following.  `restrict_github` selects the
+ * host policy: when true (the default archive/API path) only the GitHub
+ * allow-list is permitted; when false (package registry lists, whose URLs point
+ * at arbitrary third-party hosts) any host is allowed but every other safety
+ * check — HTTPS-only, no https->http downgrade, no embedded credentials, size
+ * caps, redirect cap — still applies.
+ */
+static bool https_get_core(const PkgTransport *tr, const char *url,
+                           bool restrict_github, const char *accept,
+                           unsigned char **out_data, size_t *out_len,
+                           char **err_msg) {
     *out_data = NULL; *out_len = 0;
     char *cur = myon_strdup(url);
 
     for (int hop = 0; hop <= PKG_FETCH_MAX_REDIRECTS; hop++) {
         char *host = NULL, *path = NULL; int port = 443;
         if (!pkg_fetch_parse_url(cur, &host, &port, &path, err_msg)) { free(cur); return false; }
-        if (!host_allowed(host)) {
+        if (restrict_github && !host_allowed(host)) {
             fset(err_msg, "fetch: refusing redirect to a non-GitHub host");
             free(host); free(path); free(cur); return false;
         }
 
         int status = 0; char *loc = NULL;
         Buf body; buf_init(&body);
-        bool ok = http_once(tr, host, port, path, "application/zip, */*", &status, &loc, &body, err_msg);
+        bool ok = http_once(tr, host, port, path, accept, &status, &loc, &body, err_msg);
         free(host); free(path);
         if (!ok) { buf_free(&body); free(loc); free(cur); return false; }
 
@@ -420,15 +429,252 @@ bool pkg_fetch_https_get(const PkgTransport *tr, const char *url,
     return false;
 }
 
+bool pkg_fetch_https_get(const PkgTransport *tr, const char *url,
+                         unsigned char **out_data, size_t *out_len,
+                         char **err_msg) {
+    return https_get_core(tr, url, /*restrict_github=*/true,
+                          "application/zip, */*", out_data, out_len, err_msg);
+}
+
+bool pkg_fetch_https_get_any(const PkgTransport *tr, const char *url,
+                             unsigned char **out_data, size_t *out_len,
+                             char **err_msg) {
+    return https_get_core(tr, url, /*restrict_github=*/false,
+                          "application/json, text/plain, */*",
+                          out_data, out_len, err_msg);
+}
+
 /* ================================================================== */
 /* GitHub ref resolution                                               */
 /* ================================================================== */
+/*
+ * Two strategies, tried in order:
+ *
+ *   1. git "smart HTTP" ref discovery on github.com (the transport used by
+ *      `git clone`):
+ *
+ *         GET https://github.com/<owner>/<repo>.git/info/refs?service=git-upload-pack
+ *
+ *      This endpoint is served from the same github.com host we already fetch
+ *      from and is NOT subject to the very low unauthenticated api.github.com
+ *      REST rate limit (60 requests/hour, tightened further in 2025-05 per the
+ *      GitHub changelog "Updated rate limits for unauthenticated requests").
+ *      It returns every ref -> commit SHA in one response, so branch/tag/HEAD
+ *      resolution needs no REST call at all.  Verified 2026-08-20 against the
+ *      live service.
+ *
+ *   2. the classic api.github.com REST fallback (kept for robustness, e.g. if
+ *      the git protocol response is ever unexpected):
+ *
+ *         GET https://api.github.com/repos/<owner>/<repo>/commits/<ref>
+ *         Accept: application/vnd.github.sha
+ *
+ * A full 40-hex SHA passed as the ref short-circuits both: it is already
+ * immutable, so it is validated locally and returned without any network call.
+ */
 
-bool pkg_fetch_resolve_ref(const PkgTransport *tr, const char *owner,
-                           const char *repo, const char *ref,
-                           char *out_sha, char **err_msg) {
+static bool is_hex40(const unsigned char *p) {
+    for (int i = 0; i < 40; i++) {
+        unsigned char c = p[i];
+        if (!((c>='0'&&c<='9')||(c>='a'&&c<='f'))) return false;
+    }
+    return true;
+}
+
+/*
+ * A single pkt-line advertisement entry: "<40-hex-sha> <refname>".  We keep the
+ * decoded refs in a small growable array while scanning, then pick the one that
+ * matches the requested ref.
+ */
+typedef struct { char sha[41]; char *name; } AdvRef;
+
+/*
+ * Decode the git smart-HTTP ref-advertisement pkt-line stream (protocol v0/v1)
+ * into (sha, refname) pairs.  Also captures the symref target of HEAD from the
+ * capability list ("symref=HEAD:refs/heads/<default>") when present, so we can
+ * resolve the default branch deterministically.
+ *
+ * Format (see git-scm.com/docs/http-protocol):
+ *   - each pkt-line is a 4-hex length prefix (covering the 4 bytes too) + data,
+ *   - "0000" is a flush packet,
+ *   - the first data line is "# service=git-upload-pack\n" (then a flush),
+ *   - the first ref line is "<sha> HEAD\0<capabilities...>\n",
+ *   - subsequent ref lines are "<sha> <refname>\n".
+ */
+static bool parse_ref_advertisement(const unsigned char *data, size_t len,
+                                    AdvRef **out_refs, size_t *out_n,
+                                    char **out_head_symref) {
+    *out_refs = NULL; *out_n = 0; *out_head_symref = NULL;
+    AdvRef *refs = NULL; size_t n = 0, cap = 0;
+    size_t i = 0;
+    while (i + 4 <= len) {
+        /* 4-hex length prefix. */
+        char lenhex[5];
+        memcpy(lenhex, data + i, 4); lenhex[4] = '\0';
+        for (int k = 0; k < 4; k++) {
+            char c = lenhex[k];
+            if (!((c>='0'&&c<='9')||(c>='a'&&c<='f')||(c>='A'&&c<='F'))) goto done; /* not pkt-line */
+        }
+        unsigned long plen = strtoul(lenhex, NULL, 16);
+        if (plen == 0) { i += 4; continue; }      /* flush pkt */
+        if (plen < 4 || i + plen > len) break;     /* malformed / truncated */
+        const unsigned char *payload = data + i + 4;
+        size_t paylen = plen - 4;
+        i += plen;
+
+        /* Skip the "# service=..." banner line. */
+        if (paylen >= 1 && payload[0] == '#') continue;
+
+        /* A ref line needs at least "<40-hex> <c>". */
+        if (paylen >= 42 && is_hex40(payload) && payload[40] == ' ') {
+            /* refname runs until NUL (capabilities separator) or LF/end. */
+            size_t j = 41;
+            while (j < paylen && payload[j] != '\0' && payload[j] != '\n') j++;
+            size_t namelen = j - 41;
+
+            if (n == cap) {
+                cap = cap ? cap * 2 : 16;
+                refs = myon_xrealloc(refs, cap * sizeof(AdvRef));
+            }
+            memcpy(refs[n].sha, payload, 40); refs[n].sha[40] = '\0';
+            refs[n].name = myon_strndup((const char*)payload + 41, namelen);
+            n++;
+
+            /* Capability section (after the first NUL) may carry symref=HEAD:. */
+            if (!*out_head_symref) {
+                size_t nul = 41 + namelen;
+                if (nul < paylen && payload[nul] == '\0') {
+                    const char *caps = (const char*)payload + nul + 1;
+                    size_t capslen = paylen - (nul + 1);
+                    /* Bounded search for "symref=HEAD:" within the caps blob. */
+                    static const char key[] = "symref=HEAD:";
+                    for (size_t s = 0; s + (sizeof(key)-1) <= capslen; s++) {
+                        if (memcmp(caps + s, key, sizeof(key)-1) == 0) {
+                            const char *t = caps + s + (sizeof(key)-1);
+                            size_t tl = 0;
+                            while ((size_t)(t - caps) + tl < capslen &&
+                                   t[tl] != ' ' && t[tl] != '\n' && t[tl] != '\0') tl++;
+                            *out_head_symref = myon_strndup(t, tl);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+done:
+    *out_refs = refs; *out_n = n;
+    return n > 0;
+}
+
+/* Free a decoded advertisement. */
+static void free_refs(AdvRef *refs, size_t n) {
+    for (size_t i = 0; i < n; i++) free(refs[i].name);
+    free(refs);
+}
+
+/*
+ * Given the decoded advertisement, resolve `ref` (branch / tag / "HEAD" /
+ * default) to a 40-hex SHA.  Matching order (most specific first):
+ *   - exact refname match ("refs/heads/x", "refs/tags/x", "HEAD"),
+ *   - annotated-tag peeled object "refs/tags/<ref>^{}" (prefer the commit),
+ *   - "refs/heads/<ref>" then "refs/tags/<ref>",
+ *   - for the default branch: follow the HEAD symref, else the "HEAD" entry.
+ * Returns true and writes out_sha on success.
+ */
+static bool select_ref_sha(AdvRef *refs, size_t n, const char *head_symref,
+                           const char *ref, char *out_sha) {
+    const char *want = (ref && *ref) ? ref : NULL;
+
+    if (!want) {
+        /* Default branch: prefer the HEAD symref target, else the HEAD entry. */
+        if (head_symref) {
+            for (size_t i = 0; i < n; i++)
+                if (strcmp(refs[i].name, head_symref) == 0) { memcpy(out_sha, refs[i].sha, 41); return true; }
+        }
+        for (size_t i = 0; i < n; i++)
+            if (strcmp(refs[i].name, "HEAD") == 0) { memcpy(out_sha, refs[i].sha, 41); return true; }
+        return false;
+    }
+
+    /* Exact refname (lets callers pass fully-qualified refs if they want). */
+    for (size_t i = 0; i < n; i++)
+        if (strcmp(refs[i].name, want) == 0) { memcpy(out_sha, refs[i].sha, 41); return true; }
+
+    char qualified[512];
+    /* Annotated tag: the peeled "^{}" entry points at the underlying commit. */
+    snprintf(qualified, sizeof(qualified), "refs/tags/%s^{}", want);
+    for (size_t i = 0; i < n; i++)
+        if (strcmp(refs[i].name, qualified) == 0) { memcpy(out_sha, refs[i].sha, 41); return true; }
+
+    snprintf(qualified, sizeof(qualified), "refs/heads/%s", want);
+    for (size_t i = 0; i < n; i++)
+        if (strcmp(refs[i].name, qualified) == 0) { memcpy(out_sha, refs[i].sha, 41); return true; }
+
+    snprintf(qualified, sizeof(qualified), "refs/tags/%s", want);
+    for (size_t i = 0; i < n; i++)
+        if (strcmp(refs[i].name, qualified) == 0) { memcpy(out_sha, refs[i].sha, 41); return true; }
+
+    return false;
+}
+
+/*
+ * Strategy 1: resolve via git smart-HTTP ref discovery on github.com.
+ * Returns true (out_sha set) on a successful match, false otherwise; when
+ * `*out_transport_ok` is set to false the transport itself failed (so the
+ * REST fallback would likely fail too), while a true value with a false return
+ * means "server answered but the ref was not found here".
+ */
+static bool resolve_ref_git_protocol(const PkgTransport *tr, const char *owner,
+                                      const char *repo, const char *ref,
+                                      char *out_sha, bool *out_transport_ok,
+                                      char **err_msg) {
+    *out_transport_ok = false;
+    char path[1024];
+    int pn = snprintf(path, sizeof(path),
+                      "/%s/%s.git/info/refs?service=git-upload-pack", owner, repo);
+    if (pn <= 0 || pn >= (int)sizeof(path)) { fset(err_msg, "resolve: ref path too long"); return false; }
+
+    int status = 0; char *loc = NULL;
+    Buf body; buf_init(&body);
+    /* git advertises with this content-type; a plain Accept is fine. */
+    bool ok = http_once(tr, "github.com", 443, path,
+                        "*/*", &status, &loc, &body, err_msg);
+    /* One safe redirect (github.com may 301 to add/strip ".git"). */
+    int hops = 0;
+    while (ok && (status == 301 || status == 302 || status == 307 || status == 308)
+           && loc && strncmp(loc, "https://", 8) == 0 && hops < PKG_FETCH_MAX_REDIRECTS) {
+        char *h2 = NULL, *p2 = NULL; int port2 = 443;
+        if (!pkg_fetch_parse_url(loc, &h2, &port2, &p2, err_msg)) { ok = false; break; }
+        if (!host_allowed(h2)) { free(h2); free(p2); fset(err_msg, "resolve: redirect to non-GitHub host"); ok = false; break; }
+        buf_free(&body); buf_init(&body);
+        char *loc2 = NULL; status = 0;
+        ok = http_once(tr, h2, port2, p2, "*/*", &status, &loc2, &body, err_msg);
+        free(h2); free(p2);
+        free(loc); loc = loc2;
+        hops++;
+    }
+    free(loc);
+    if (!ok) { buf_free(&body); return false; } /* transport error */
+    *out_transport_ok = true;
+    if (status != 200) { buf_free(&body); return false; } /* not here (404 etc.) */
+
+    AdvRef *refs = NULL; size_t n = 0; char *head_symref = NULL;
+    bool parsed = parse_ref_advertisement(body.data, body.len, &refs, &n, &head_symref);
+    buf_free(&body);
+    if (!parsed) { free_refs(refs, n); free(head_symref); return false; }
+
+    bool got = select_ref_sha(refs, n, head_symref, ref, out_sha);
+    free_refs(refs, n);
+    free(head_symref);
+    return got;
+}
+
+/* Strategy 2: the classic api.github.com REST fallback. */
+static bool resolve_ref_rest_api(const PkgTransport *tr, const char *owner,
+                                 const char *repo, const char *ref,
+                                 char *out_sha, char **err_msg) {
     const char *r = (ref && *ref) ? ref : "HEAD";
-    /* GET https://api.github.com/repos/<o>/<r>/commits/<ref>  Accept: sha */
     char path[1024];
     int pn = snprintf(path, sizeof(path), "/repos/%s/%s/commits/%s", owner, repo, r);
     if (pn <= 0 || pn >= (int)sizeof(path)) { fset(err_msg, "resolve: ref path too long"); return false; }
@@ -443,21 +689,52 @@ bool pkg_fetch_resolve_ref(const PkgTransport *tr, const char *owner,
         buf_free(&body);
         char msg[160];
         if (status == 404) snprintf(msg, sizeof(msg), "resolve: repository or ref '%s' not found (or repo is private)", r);
-        else if (status == 403) snprintf(msg, sizeof(msg), "resolve: GitHub API rate limit or forbidden (HTTP 403)");
+        else if (status == 403 || status == 429) snprintf(msg, sizeof(msg), "resolve: GitHub API rate limit or forbidden (HTTP %d)", status);
         else snprintf(msg, sizeof(msg), "resolve: GitHub API returned HTTP %d", status);
         fset(err_msg, msg);
         return false;
     }
-    /* Body should be exactly a 40-hex SHA (possibly with trailing whitespace). */
     size_t n = body.len;
     while (n > 0 && (body.data[n-1] == '\n' || body.data[n-1] == '\r' || body.data[n-1] == ' ')) n--;
     if (n != 40) { buf_free(&body); fset(err_msg, "resolve: unexpected GitHub API response (not a commit SHA)"); return false; }
-    for (size_t i = 0; i < 40; i++) {
-        unsigned char c = body.data[i];
-        if (!((c>='0'&&c<='9')||(c>='a'&&c<='f'))) { buf_free(&body); fset(err_msg, "resolve: API returned a non-hex SHA"); return false; }
-        out_sha[i] = (char)c;
-    }
-    out_sha[40] = '\0';
+    if (!is_hex40(body.data)) { buf_free(&body); fset(err_msg, "resolve: API returned a non-hex SHA"); return false; }
+    memcpy(out_sha, body.data, 40); out_sha[40] = '\0';
     buf_free(&body);
     return true;
+}
+
+bool pkg_fetch_resolve_ref(const PkgTransport *tr, const char *owner,
+                           const char *repo, const char *ref,
+                           char *out_sha, char **err_msg) {
+    /* A full commit SHA is already immutable: no network needed. */
+    if (ref && *ref && strlen(ref) == 40 && is_hex40((const unsigned char*)ref)) {
+        for (int i = 0; i < 40; i++) {
+            char c = ref[i];
+            /* normalise to lowercase hex for the canonical source form */
+            out_sha[i] = (c >= 'A' && c <= 'F') ? (char)(c - 'A' + 'a') : c;
+        }
+        out_sha[40] = '\0';
+        return true;
+    }
+
+    /* Strategy 1: git smart-HTTP ref discovery (avoids the REST rate limit). */
+    {
+        char *gerr = NULL;
+        bool transport_ok = false;
+        if (resolve_ref_git_protocol(tr, owner, repo, ref, out_sha, &transport_ok, &gerr)) {
+            free(gerr);
+            return true;
+        }
+        free(gerr);
+        /*
+         * If the git endpoint answered but the ref was simply not present, the
+         * repository exists yet the ref is wrong — a REST retry would only cost
+         * a rate-limited request to return the same "not found".  Still, we let
+         * the REST path produce the precise diagnostic below.
+         */
+        (void)transport_ok;
+    }
+
+    /* Strategy 2: REST API fallback (kept for robustness). */
+    return resolve_ref_rest_api(tr, owner, repo, ref, out_sha, err_msg);
 }

@@ -365,6 +365,121 @@ static void test_manifest_lock_match(void) {
     pkg_error_reset(&err);
 }
 
+static void test_shorthand(void) {
+    /* Recognition. */
+    CHECK(pkg_arg_is_shorthand("acme/json"), "shorthand: owner/repo recognised");
+    CHECK(pkg_arg_is_shorthand("acme/json.git"), "shorthand: .git suffix recognised");
+    CHECK(!pkg_arg_is_shorthand("https://github.com/acme/json"), "shorthand: URL not a shorthand");
+    CHECK(!pkg_arg_is_shorthand("acme"), "shorthand: bare name rejected");
+    CHECK(!pkg_arg_is_shorthand("acme/json/extra"), "shorthand: too many segments rejected");
+    CHECK(!pkg_arg_is_shorthand("acme/"), "shorthand: trailing slash rejected");
+    CHECK(!pkg_arg_is_shorthand("/json"), "shorthand: leading slash rejected");
+    CHECK(!pkg_arg_is_shorthand("acme json"), "shorthand: whitespace rejected");
+
+    /* Parse + validate. */
+    PkgError err; pkg_error_init(&err);
+    PkgShorthand sh;
+    CHECK(pkg_shorthand_parse("acme/json", &sh, &err), "shorthand parse ok");
+    CHECK(sh.owner && strcmp(sh.owner, "acme") == 0, "shorthand owner");
+    CHECK(sh.repo && strcmp(sh.repo, "json") == 0, "shorthand repo");
+    pkg_shorthand_reset(&sh);
+
+    CHECK(pkg_shorthand_parse("acme/json.git", &sh, &err), "shorthand parse strips .git");
+    CHECK(sh.repo && strcmp(sh.repo, "json") == 0, "shorthand repo without .git");
+    pkg_shorthand_reset(&sh);
+
+    pkg_error_reset(&err);
+    CHECK(!pkg_shorthand_parse("acme/..", &sh, &err), "shorthand rejects '..'");
+    pkg_shorthand_reset(&sh);
+    pkg_error_reset(&err);
+}
+
+static void test_registry_json(void) {
+    PkgError err; pkg_error_init(&err);
+
+    /* Array form. */
+    PkgRegistry *r = pkg_registry_parse(
+        "[\n  \"acme/myon-json\",\n  \"owner/pkg\"\n]\n", &err);
+    CHECK(r != NULL, "registry: array form parses");
+    if (r) {
+        CHECK(r->count == 2, "registry: two entries");
+        CHECK(pkg_registry_find(r, "acme", "myon-json") != NULL, "registry: find acme/myon-json");
+        CHECK(pkg_registry_find(r, "owner", "pkg") != NULL, "registry: find owner/pkg");
+        CHECK(pkg_registry_find(r, "no", "such") == NULL, "registry: miss");
+        pkg_registry_free(r);
+    }
+    pkg_error_reset(&err);
+
+    /* Object (alias) form. */
+    r = pkg_registry_parse(
+        "{ \"json\": \"acme/myon-json\", \"text\": \"acme/myon-text\" }", &err);
+    CHECK(r != NULL, "registry: object form parses");
+    if (r) {
+        CHECK(r->count == 2, "registry: object two entries");
+        const PkgRegistryEntry *e = pkg_registry_find(r, "acme", "myon-json");
+        CHECK(e != NULL, "registry: object find by owner/repo");
+        CHECK(e && e->alias && strcmp(e->alias, "json") == 0, "registry: alias captured");
+        /* alias-only lookup */
+        CHECK(pkg_registry_find(r, NULL, "text") != NULL, "registry: find by alias");
+        pkg_registry_free(r);
+    }
+    pkg_error_reset(&err);
+
+    /* Escapes + empty array. */
+    r = pkg_registry_parse("[]", &err);
+    CHECK(r != NULL && r->count == 0, "registry: empty array ok");
+    pkg_registry_free(r);
+    pkg_error_reset(&err);
+
+    /* Rejections. */
+    CHECK(pkg_registry_parse("", &err) == NULL, "registry: empty doc rejected");
+    pkg_error_reset(&err);
+    CHECK(pkg_registry_parse("[\"nowhere\"]", &err) == NULL, "registry: non-shorthand value rejected");
+    pkg_error_reset(&err);
+    CHECK(pkg_registry_parse("[\"a/b\", 3]", &err) == NULL, "registry: non-string value rejected");
+    pkg_error_reset(&err);
+    CHECK(pkg_registry_parse("[\"a/b\"", &err) == NULL, "registry: unterminated array rejected");
+    pkg_error_reset(&err);
+    CHECK(pkg_registry_parse("42", &err) == NULL, "registry: scalar top-level rejected");
+    pkg_error_reset(&err);
+    CHECK(pkg_registry_parse("[\"a/b\"] junk", &err) == NULL, "registry: trailing data rejected");
+    pkg_error_reset(&err);
+}
+
+static void test_packages_list(void) {
+    PkgError err; pkg_error_init(&err);
+    char **urls = NULL;
+    long n = pkg_packages_list_parse(
+        "# my registries\n"
+        "https://example.com/xxxx.json\n"
+        "\n"
+        "   https://ohmygodwhhhhooooo.com/xxxx.json   \n"
+        "# trailing comment\n", &urls, &err);
+    CHECK(n == 2, "packages.list: two URLs parsed");
+    if (n == 2) {
+        CHECK(strcmp(urls[0], "https://example.com/xxxx.json") == 0, "packages.list: first URL");
+        CHECK(strcmp(urls[1], "https://ohmygodwhhhhooooo.com/xxxx.json") == 0, "packages.list: second URL (trimmed)");
+    }
+    for (long i = 0; i < n; i++) free(urls[i]);
+    free(urls);
+    pkg_error_reset(&err);
+
+    /* Non-https rejected. */
+    urls = NULL;
+    long m = pkg_packages_list_parse("http://insecure.example/x.json\n", &urls, &err);
+    CHECK(m == -1, "packages.list: http:// rejected");
+    for (long i = 0; i < (m > 0 ? m : 0); i++) free(urls[i]);
+    free(urls);
+    pkg_error_reset(&err);
+
+    /* Empty / comment-only file. */
+    urls = NULL;
+    long z = pkg_packages_list_parse("# only a comment\n\n", &urls, &err);
+    CHECK(z == 0 && urls == NULL, "packages.list: comment-only yields no URLs");
+    free(urls);
+    pkg_error_reset(&err);
+}
+
 int main(void) {
     test_manifests();
     test_pkgmanifest();
@@ -373,6 +488,9 @@ int main(void) {
     test_install_url();
     test_lock();
     test_manifest_lock_match();
+    test_shorthand();
+    test_registry_json();
+    test_packages_list();
 
     printf("pkg unit tests: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

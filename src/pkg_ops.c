@@ -663,3 +663,138 @@ done:
     pkg_error_reset(&err);
     return rc;
 }
+
+/* ------------------------------------------------------------------ */
+/* install from a package-list shorthand ("<owner>/<repo>")            */
+/* ------------------------------------------------------------------ */
+
+/* Read a whole text file into a fresh NUL-terminated heap string (or NULL). */
+static char *read_whole_file(const char *path, PkgError *err) {
+    FILE *f = fopen(path, "rb");
+    if (!f) { pkg_error_set(err, PKG_ERR_IO, 0, "cannot open '%s'", path); return NULL; }
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); pkg_error_set(err, PKG_ERR_IO, 0, "cannot read '%s'", path); return NULL; }
+    long n = ftell(f);
+    if (n < 0) { fclose(f); pkg_error_set(err, PKG_ERR_IO, 0, "cannot size '%s'", path); return NULL; }
+    if (fseek(f, 0, SEEK_SET) != 0) { fclose(f); pkg_error_set(err, PKG_ERR_IO, 0, "cannot read '%s'", path); return NULL; }
+    char *buf = myon_xmalloc((size_t)n + 1);
+    size_t got = fread(buf, 1, (size_t)n, f);
+    fclose(f);
+    buf[got] = '\0';
+    return buf;
+}
+
+int pkg_ops_install_shorthand(const char *shorthand) {
+    PkgError err; pkg_error_init(&err);
+
+    /* Validate the shorthand up front (offline, immediate diagnostics). */
+    PkgShorthand sh;
+    if (!pkg_shorthand_parse(shorthand, &sh, &err)) {
+        report(&err, "install"); int rc = exit_code_for(err.code);
+        pkg_shorthand_reset(&sh); pkg_error_reset(&err); return rc;
+    }
+
+    /* We need a project root with a `.myon/packages.list`. */
+    Paths p;
+    if (!paths_discover(&p, &err, /*require_manifest=*/false)) {
+        report(&err, "install"); int rc = exit_code_for(err.code);
+        pkg_shorthand_reset(&sh); pkg_error_reset(&err); return rc;
+    }
+
+    char *dotmyon = pkg_fs_join(p.root, PKG_DIR_DOTMYON);
+    char *listpath = pkg_fs_join(dotmyon, "packages.list");
+    free(dotmyon);
+
+    int rc = 0;
+    char **urls = NULL; long nurls = 0;
+
+    if (!pkg_fs_is_file(listpath)) {
+        pkg_error_set(&err, PKG_ERR_USAGE, 0,
+                      "no .myon/packages.list found: '%s/%s/packages.list' is required to "
+                      "resolve '%s/%s' (or install by full URL: "
+                      "myon pkg install https://github.com/%s/%s)",
+                      p.root, PKG_DIR_DOTMYON, sh.owner, sh.repo, sh.owner, sh.repo);
+        report(&err, "install"); rc = exit_code_for(err.code); goto done;
+    }
+
+    {
+        char *listtext = read_whole_file(listpath, &err);
+        if (!listtext) { report(&err, "install"); rc = exit_code_for(err.code); goto done; }
+        nurls = pkg_packages_list_parse(listtext, &urls, &err);
+        free(listtext);
+        if (nurls < 0) { report(&err, "install"); rc = exit_code_for(err.code); goto done; }
+    }
+
+    if (nurls == 0) {
+        pkg_error_set(&err, PKG_ERR_USAGE, 0,
+                      ".myon/packages.list has no registry URLs to search for '%s/%s'",
+                      sh.owner, sh.repo);
+        report(&err, "install"); rc = exit_code_for(err.code); goto done;
+    }
+
+    /* Search each registry in order for the shorthand. */
+    char *resolved_url = NULL;
+    int reachable = 0;
+    for (long i = 0; i < nurls && !resolved_url; i++) {
+        unsigned char *data = NULL; size_t len = 0; char *ferr = NULL;
+        if (!pkg_fetch_https_get_any(transport(), urls[i], &data, &len, &ferr)) {
+            /* A single unreachable/invalid registry is non-fatal: warn and go on. */
+            fprintf(stderr, "myon pkg: install: warning: cannot fetch registry '%s': %s\n",
+                    urls[i], ferr ? ferr : "fetch failed");
+            free(ferr);
+            continue;
+        }
+        reachable++;
+        /* NUL-terminate the registry body for the JSON scanner. */
+        char *json = myon_xmalloc(len + 1);
+        if (len) memcpy(json, data, len);
+        json[len] = '\0';
+        free(data);
+
+        PkgError perr; pkg_error_init(&perr);
+        PkgRegistry *reg = pkg_registry_parse(json, &perr);
+        free(json);
+        if (!reg) {
+            fprintf(stderr, "myon pkg: install: warning: registry '%s' is malformed: %s\n",
+                    urls[i], perr.message ? perr.message : "parse error");
+            pkg_error_reset(&perr);
+            continue;
+        }
+        const PkgRegistryEntry *e = pkg_registry_find(reg, sh.owner, sh.repo);
+        if (e) {
+            /* Build https://github.com/<owner>/<repo> and stop searching. */
+            size_t need = strlen("https://github.com/") + strlen(e->owner) + 1 + strlen(e->repo) + 1;
+            resolved_url = myon_xmalloc(need);
+            snprintf(resolved_url, need, "https://github.com/%s/%s", e->owner, e->repo);
+        }
+        pkg_registry_free(reg);
+    }
+
+    if (!resolved_url) {
+        if (reachable == 0) {
+            pkg_error_set(&err, PKG_ERR_NETWORK, 0,
+                          "could not reach any registry in .myon/packages.list to resolve '%s/%s'",
+                          sh.owner, sh.repo);
+        } else {
+            pkg_error_set(&err, PKG_ERR_USAGE, 0,
+                          "'%s/%s' was not found in any registry listed in .myon/packages.list",
+                          sh.owner, sh.repo);
+        }
+        report(&err, "install"); rc = exit_code_for(err.code); goto done;
+    }
+
+    printf("myon pkg: resolved '%s/%s' via .myon/packages.list -> %s\n",
+           sh.owner, sh.repo, resolved_url);
+
+    /* Delegate to the exact same install path as an explicit URL. */
+    rc = pkg_ops_install_url(resolved_url);
+    free(resolved_url);
+
+done:
+    for (long i = 0; i < nurls; i++) free(urls[i]);
+    free(urls);
+    free(listpath);
+    pkg_shorthand_reset(&sh);
+    paths_free(&p);
+    pkg_error_reset(&err);
+    return rc;
+}

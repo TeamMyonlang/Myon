@@ -177,12 +177,45 @@ module 名だけで利用できます。
 # URL を指定して導入（初回・通常利用）
 myon pkg install https://github.com/owner/repository
 
+# パッケージリスト経由の shorthand 導入（下記「パッケージリスト」参照）
+myon pkg install owner/repository
+
 # 明示的な操作
 myon pkg lock       # 依存を解決して myon.lock を（再）生成
 myon pkg install    # 既存の myon.lock だけを信頼して再現インストール
 myon pkg verify     # myon.toml / myon.lock / 展開物の整合性を検査
 myon pkg tree       # ロック済み依存グラフを表示（ネットワーク不要）
 ```
+
+### パッケージリスト（`myon pkg install owner/repo`）
+
+毎回 URL を書く代わりに、`<owner>/<repo>` の **shorthand** でも導入できます。
+既存の URL 方式はそのままに、その前段として配布元レジストリで `<owner>/<repo>` を
+探して該当 GitHub repo を特定する層を追加したものです。
+
+project root の `.myon/packages.list` に、レジストリ JSON の URL を 1 行に 1 つ
+書きます（`#` コメント・空行可、`https://` のみ）:
+
+```text
+# 配布元レジストリ
+https://example.com/packages.json
+https://ohmygodwhhhhooooo.com/packages.json
+```
+
+レジストリ JSON は次のどちらかの形式で、値は GitHub の `owner/repo`:
+
+```json
+["acme/myon-json", "owner/pkg"]
+```
+
+```json
+{ "json": "acme/myon-json", "text": "acme/myon-text" }
+```
+
+`myon pkg install acme/myon-json` は、上のレジストリを順に検索して
+`https://github.com/acme/myon-json` を特定し、あとは URL 指定と全く同じ経路
+（ref 解決 → archive 取得 → 検証 → `.myon/packages/` へ atomic install）で導入します。
+レジストリはコードではなく純粋なデータとして読み、install 中に実行はしません。
 
 導入した package は、`myon.toml`／`myon.lock` に記録され、実体は
 `<project-root>/.myon/packages/<package-name>/` にプロジェクトローカルで
@@ -224,6 +257,18 @@ TLS 証明書・ホスト名を検証（fail-closed）、`https`→`http` ダウ
 redirect は最大 5 回かつ GitHub の archive host のみ許可、`Location` の制御文字拒否、
 `Content-Length`／総ダウンロード量の上限（64 MiB）、chunked 転送のデコードなどを
 実装しています。
+
+ref／branch／tag → full commit SHA の解決は、まず **git の smart-HTTP プロトコル**
+（`https://github.com/<owner>/<repo>.git/info/refs?service=git-upload-pack`、`git clone`
+と同じ transport）を使います。これは `api.github.com` の非認証 REST rate limit
+（60 req/時。2025-05 にさらに厳格化）とは別枠のため、通常利用では **rate limit に
+当たらず** 1 リクエストで全 ref を解決できます。解決できない場合のみ従来の
+REST API（`GET /repos/<o>/<r>/commits/<ref>`）へフォールバックします。full SHA を
+直接指定した場合はネットワークなしでそのまま採用します。
+
+パッケージリストのレジストリ取得だけは任意の第三者 host を許可します（レジストリ
+URL は外部サイトを指すため）が、HTTPS 限定・ダウングレード拒否・サイズ上限などの
+安全性は archive 取得と共通です。
 
 `.myon/packages/` は通常 `.gitignore` 対象とし、`myon.toml` と `myon.lock` を
 Git 管理する運用を推奨します（本リポジトリの [`.gitignore`](.gitignore) にも

@@ -509,6 +509,333 @@ bool pkg_install_url_parse(const char *url, PkgInstallUrl *out, PkgError *err) {
 }
 
 /* ================================================================== */
+/* Package-list registry ("myon pkg install <user>/<repo>")            */
+/* ================================================================== */
+
+/* A registry document is small metadata; refuse anything absurd. */
+#define PKG_REGISTRY_MAX_BYTES   (4u * 1024u * 1024u) /* 4 MiB */
+#define PKG_REGISTRY_MAX_ENTRIES 100000u
+#define PKG_PKGLIST_MAX_URLS     4096u
+
+void pkg_shorthand_init(PkgShorthand *s) { s->owner = NULL; s->repo = NULL; }
+void pkg_shorthand_reset(PkgShorthand *s) {
+    if (!s) return;
+    free(s->owner); s->owner = NULL;
+    free(s->repo);  s->repo = NULL;
+}
+
+bool pkg_arg_is_shorthand(const char *arg) {
+    if (!arg || !*arg) return false;
+    if (strstr(arg, "://")) return false;              /* it's a URL */
+    /* exactly one '/', no control/whitespace, both sides non-empty */
+    const char *slash = strchr(arg, '/');
+    if (!slash || slash == arg) return false;
+    if (strchr(slash + 1, '/')) return false;          /* more than one '/' */
+    if (slash[1] == '\0') return false;                /* trailing slash */
+    for (const char *p = arg; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c <= 0x20 || c == 0x7f) return false;      /* space/control */
+    }
+    return true;
+}
+
+bool pkg_shorthand_parse(const char *arg, PkgShorthand *out, PkgError *err) {
+    pkg_shorthand_init(out);
+    if (!pkg_arg_is_shorthand(arg)) {
+        pkg_error_set(err, PKG_ERR_USAGE, 0,
+                      "'%s' is not a valid <owner>/<repo> shorthand", arg ? arg : "");
+        return false;
+    }
+    const char *slash = strchr(arg, '/');
+    size_t owner_len = (size_t)(slash - arg);
+    size_t repo_len  = strlen(slash + 1);
+    /* strip a trailing ".git" the same way the URL parser does */
+    if (repo_len > 4 && strncmp(slash + 1 + repo_len - 4, ".git", 4) == 0)
+        repo_len -= 4;
+    if (owner_len > 128 || repo_len > 128 || repo_len == 0) {
+        pkg_error_set(err, PKG_ERR_USAGE, 0, "'%s' has an invalid owner/repository", arg);
+        return false;
+    }
+    if (!valid_repo_segment(arg, owner_len) ||
+        !valid_repo_segment(slash + 1, repo_len)) {
+        pkg_error_set(err, PKG_ERR_USAGE, 0, "'%s' has an invalid owner/repository", arg);
+        return false;
+    }
+    out->owner = myon_strndup(arg, owner_len);
+    out->repo  = myon_strndup(slash + 1, repo_len);
+    return true;
+}
+
+PkgRegistry *pkg_registry_new(void) {
+    PkgRegistry *r = myon_xmalloc(sizeof(*r));
+    r->entries = NULL; r->count = 0;
+    return r;
+}
+
+void pkg_registry_free(PkgRegistry *r) {
+    if (!r) return;
+    for (size_t i = 0; i < r->count; i++) {
+        free(r->entries[i].alias);
+        free(r->entries[i].owner);
+        free(r->entries[i].repo);
+    }
+    free(r->entries);
+    free(r);
+}
+
+/* ---- minimal, strict JSON scanner (registry documents only) ---------- */
+/*
+ * We only need two JSON shapes, so this is a small hand-written scanner rather
+ * than a general JSON parser.  It supports: whitespace, string literals with
+ * the standard escapes (\" \\ \/ \b \f \n \r \t \uXXXX for the BMP), arrays of
+ * strings, and objects with string keys and string values.  Anything else
+ * (numbers, booleans, null, nested containers) is a hard error, because a
+ * registry value is always a "<owner>/<repo>" string.  Control bytes inside
+ * strings are rejected.
+ */
+typedef struct { const char *p; const char *end; } JScan;
+
+static void j_skip_ws(JScan *j) {
+    while (j->p < j->end) {
+        char c = *j->p;
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') j->p++;
+        else break;
+    }
+}
+
+/* Append the UTF-8 encoding of a BMP code point to a StrBuf. */
+static void j_append_utf8(StrBuf *b, unsigned cp) {
+    char buf[4]; int n = 0;
+    if (cp < 0x80) { buf[n++] = (char)cp; }
+    else if (cp < 0x800) {
+        buf[n++] = (char)(0xC0 | (cp >> 6));
+        buf[n++] = (char)(0x80 | (cp & 0x3F));
+    } else {
+        buf[n++] = (char)(0xE0 | (cp >> 12));
+        buf[n++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        buf[n++] = (char)(0x80 | (cp & 0x3F));
+    }
+    buf[n] = '\0';
+    sb_append(b, buf);
+}
+
+/* Parse a JSON string literal at j->p (which must point at the opening '"').
+ * Returns a fresh heap string on success, or NULL + *err. */
+static char *j_parse_string(JScan *j, PkgError *err) {
+    if (j->p >= j->end || *j->p != '"') {
+        pkg_error_set(err, PKG_ERR_MANIFEST, 0, "registry JSON: expected a string");
+        return NULL;
+    }
+    j->p++; /* opening quote */
+    StrBuf b; sb_init(&b);
+    while (j->p < j->end) {
+        unsigned char c = (unsigned char)*j->p;
+        if (c == '"') { j->p++; return sb_take(&b); }
+        if (c < 0x20) { free(b.data); pkg_error_set(err, PKG_ERR_MANIFEST, 0, "registry JSON: control byte in string"); return NULL; }
+        if (c == '\\') {
+            j->p++;
+            if (j->p >= j->end) break;
+            char e = *j->p++;
+            switch (e) {
+                case '"':  sb_append(&b, "\""); break;
+                case '\\': sb_append(&b, "\\"); break;
+                case '/':  sb_append(&b, "/");  break;
+                case 'b':  sb_append(&b, "\b"); break;
+                case 'f':  sb_append(&b, "\f"); break;
+                case 'n':  sb_append(&b, "\n"); break;
+                case 'r':  sb_append(&b, "\r"); break;
+                case 't':  sb_append(&b, "\t"); break;
+                case 'u': {
+                    if (j->end - j->p < 4) { free(b.data); pkg_error_set(err, PKG_ERR_MANIFEST, 0, "registry JSON: truncated \\u escape"); return NULL; }
+                    unsigned cp = 0;
+                    for (int k = 0; k < 4; k++) {
+                        char h = j->p[k]; unsigned v;
+                        if (h >= '0' && h <= '9') v = (unsigned)(h - '0');
+                        else if (h >= 'a' && h <= 'f') v = (unsigned)(h - 'a' + 10);
+                        else if (h >= 'A' && h <= 'F') v = (unsigned)(h - 'A' + 10);
+                        else { free(b.data); pkg_error_set(err, PKG_ERR_MANIFEST, 0, "registry JSON: bad \\u escape"); return NULL; }
+                        cp = (cp << 4) | v;
+                    }
+                    j->p += 4;
+                    j_append_utf8(&b, cp);
+                    break;
+                }
+                default:
+                    free(b.data);
+                    pkg_error_set(err, PKG_ERR_MANIFEST, 0, "registry JSON: invalid escape '\\%c'", e);
+                    return NULL;
+            }
+        } else {
+            char one[2] = { (char)c, '\0' };
+            sb_append(&b, one);
+            j->p++;
+        }
+    }
+    free(b.data);
+    pkg_error_set(err, PKG_ERR_MANIFEST, 0, "registry JSON: unterminated string");
+    return NULL;
+}
+
+/* Split a validated "<owner>/<repo>" value into an entry (alias optional). */
+static bool registry_add(PkgRegistry *r, const char *alias, const char *value,
+                         PkgError *err) {
+    PkgShorthand sh;
+    if (!pkg_shorthand_parse(value, &sh, err)) {
+        /* re-tag as manifest error: the registry document is malformed data */
+        pkg_error_set(err, PKG_ERR_MANIFEST, 0,
+                      "registry JSON: '%s' is not a valid <owner>/<repo>", value);
+        return false;
+    }
+    if (r->count >= PKG_REGISTRY_MAX_ENTRIES) {
+        pkg_shorthand_reset(&sh);
+        pkg_error_set(err, PKG_ERR_MANIFEST, 0, "registry JSON: too many entries");
+        return false;
+    }
+    r->entries = myon_xrealloc(r->entries, (r->count + 1) * sizeof(PkgRegistryEntry));
+    r->entries[r->count].alias = alias ? myon_strdup(alias) : NULL;
+    r->entries[r->count].owner = sh.owner; /* transfer ownership */
+    r->entries[r->count].repo  = sh.repo;
+    sh.owner = NULL; sh.repo = NULL;
+    r->count++;
+    return true;
+}
+
+PkgRegistry *pkg_registry_parse(const char *text, PkgError *err) {
+    if (!text) { pkg_error_set(err, PKG_ERR_MANIFEST, 0, "registry JSON: empty document"); return NULL; }
+    size_t len = strlen(text);
+    if (len > PKG_REGISTRY_MAX_BYTES) {
+        pkg_error_set(err, PKG_ERR_MANIFEST, 0, "registry JSON: document too large");
+        return NULL;
+    }
+    JScan j = { text, text + len };
+    PkgRegistry *r = pkg_registry_new();
+
+    j_skip_ws(&j);
+    if (j.p >= j.end) { pkg_registry_free(r); pkg_error_set(err, PKG_ERR_MANIFEST, 0, "registry JSON: empty document"); return NULL; }
+
+    char open = *j.p;
+    if (open == '[') {
+        j.p++;
+        j_skip_ws(&j);
+        if (j.p < j.end && *j.p == ']') { j.p++; goto trailing; } /* empty array */
+        for (;;) {
+            j_skip_ws(&j);
+            char *val = j_parse_string(&j, err);
+            if (!val) { pkg_registry_free(r); return NULL; }
+            bool ok = registry_add(r, NULL, val, err);
+            free(val);
+            if (!ok) { pkg_registry_free(r); return NULL; }
+            j_skip_ws(&j);
+            if (j.p < j.end && *j.p == ',') { j.p++; continue; }
+            if (j.p < j.end && *j.p == ']') { j.p++; break; }
+            pkg_registry_free(r);
+            pkg_error_set(err, PKG_ERR_MANIFEST, 0, "registry JSON: expected ',' or ']' in array");
+            return NULL;
+        }
+    } else if (open == '{') {
+        j.p++;
+        j_skip_ws(&j);
+        if (j.p < j.end && *j.p == '}') { j.p++; goto trailing; } /* empty object */
+        for (;;) {
+            j_skip_ws(&j);
+            char *key = j_parse_string(&j, err);
+            if (!key) { pkg_registry_free(r); return NULL; }
+            j_skip_ws(&j);
+            if (j.p >= j.end || *j.p != ':') { free(key); pkg_registry_free(r); pkg_error_set(err, PKG_ERR_MANIFEST, 0, "registry JSON: expected ':' after key"); return NULL; }
+            j.p++;
+            j_skip_ws(&j);
+            char *val = j_parse_string(&j, err);
+            if (!val) { free(key); pkg_registry_free(r); return NULL; }
+            bool ok = registry_add(r, key, val, err);
+            free(key); free(val);
+            if (!ok) { pkg_registry_free(r); return NULL; }
+            j_skip_ws(&j);
+            if (j.p < j.end && *j.p == ',') { j.p++; continue; }
+            if (j.p < j.end && *j.p == '}') { j.p++; break; }
+            pkg_registry_free(r);
+            pkg_error_set(err, PKG_ERR_MANIFEST, 0, "registry JSON: expected ',' or '}' in object");
+            return NULL;
+        }
+    } else {
+        pkg_registry_free(r);
+        pkg_error_set(err, PKG_ERR_MANIFEST, 0,
+                      "registry JSON: top level must be an array or object");
+        return NULL;
+    }
+
+trailing:
+    j_skip_ws(&j);
+    if (j.p != j.end) {
+        pkg_registry_free(r);
+        pkg_error_set(err, PKG_ERR_MANIFEST, 0, "registry JSON: trailing data after top-level value");
+        return NULL;
+    }
+    return r;
+}
+
+const PkgRegistryEntry *pkg_registry_find(const PkgRegistry *r,
+                                          const char *want_owner,
+                                          const char *want_repo) {
+    if (!r) return NULL;
+    for (size_t i = 0; i < r->count; i++) {
+        const PkgRegistryEntry *e = &r->entries[i];
+        if (want_owner) {
+            if (strcmp(e->owner, want_owner) == 0 && strcmp(e->repo, want_repo) == 0)
+                return e;
+        } else if (want_repo && e->alias) {
+            if (strcmp(e->alias, want_repo) == 0) return e;
+        }
+    }
+    return NULL;
+}
+
+long pkg_packages_list_parse(const char *text, char ***out_urls, PkgError *err) {
+    *out_urls = NULL;
+    if (!text) return 0;
+    char **urls = NULL; size_t n = 0, cap = 0;
+    const char *p = text;
+    int line = 0;
+    while (*p) {
+        line++;
+        const char *nl = strchr(p, '\n');
+        size_t linelen = nl ? (size_t)(nl - p) : strlen(p);
+        /* trim leading/trailing whitespace (incl. a trailing '\r') */
+        const char *s = p;
+        const char *e = p + linelen;
+        while (s < e && (*s == ' ' || *s == '\t' || *s == '\r')) s++;
+        while (e > s && (e[-1] == ' ' || e[-1] == '\t' || e[-1] == '\r')) e--;
+        size_t slen = (size_t)(e - s);
+        if (slen > 0 && *s != '#') {
+            /* validate: https:// only, no control bytes/whitespace inside */
+            bool bad = false;
+            for (const char *q = s; q < e; q++) {
+                unsigned char c = (unsigned char)*q;
+                if (c <= 0x20 || c == 0x7f) { bad = true; break; }
+            }
+            if (bad || slen < 8 || strncmp(s, "https://", 8) != 0) {
+                for (size_t i = 0; i < n; i++) free(urls[i]);
+                free(urls);
+                pkg_error_set(err, PKG_ERR_MANIFEST, line,
+                              "packages.list: each entry must be an https:// URL");
+                return -1;
+            }
+            if (n >= PKG_PKGLIST_MAX_URLS) {
+                for (size_t i = 0; i < n; i++) free(urls[i]);
+                free(urls);
+                pkg_error_set(err, PKG_ERR_MANIFEST, line, "packages.list: too many registries");
+                return -1;
+            }
+            if (n == cap) { cap = cap ? cap * 2 : 8; urls = myon_xrealloc(urls, cap * sizeof(char*)); }
+            urls[n++] = myon_strndup(s, slen);
+        }
+        if (!nl) break;
+        p = nl + 1;
+    }
+    *out_urls = urls;
+    return (long)n;
+}
+
+/* ================================================================== */
 /* strict TOML-subset scanner                                         */
 /* ================================================================== */
 /*
@@ -1555,6 +1882,8 @@ static void pkg_usage(void) {
         "commands:\n"
         "  install <github-url>   add a dependency from a GitHub URL, resolve it,\n"
         "                         and install it under .myon/packages/\n"
+        "  install <owner>/<repo> resolve the shorthand via the registries listed\n"
+        "                         in .myon/packages.list, then install it\n"
         "  install                reinstall everything from the existing myon.lock\n"
         "  lock                   resolve dependencies and (re)write myon.lock\n"
         "  verify                 check myon.toml, myon.lock and installed packages\n"
@@ -1565,7 +1894,12 @@ static void pkg_usage(void) {
         "    host privileges. Packages are NOT sandboxed: treat an untrusted\n"
         "    package as arbitrary code.\n"
         "  * Only GitHub public repositories pinned to a full commit SHA are\n"
-        "    supported; branches/tags in a URL are resolved to an immutable SHA.\n");
+        "    supported; branches/tags in a URL are resolved to an immutable SHA.\n"
+        "  * Ref resolution uses git's smart-HTTP protocol on github.com first and\n"
+        "    falls back to the REST API, so it does not hit the low unauthenticated\n"
+        "    api.github.com rate limit in normal use.\n"
+        "  * `.myon/packages.list` holds one https:// registry-JSON URL per line;\n"
+        "    each registry maps \"<owner>/<repo>\" shorthands to GitHub repositories.\n");
 }
 
 /*
@@ -1739,8 +2073,14 @@ int pkg_cli_main(int argc, char **argv) {
     }
     if (strcmp(sub, "install") == 0) {
         if (argc == 1) return pkg_ops_install_locked();
-        if (argc == 2) return pkg_ops_install_url(argv[1]);
-        fprintf(stderr, "myon pkg: install takes at most one <github-url>\n");
+        if (argc == 2) {
+            /* "<owner>/<repo>" shorthand -> resolve via .myon/packages.list;
+             * anything else is treated as an explicit GitHub URL. */
+            if (pkg_arg_is_shorthand(argv[1]))
+                return pkg_ops_install_shorthand(argv[1]);
+            return pkg_ops_install_url(argv[1]);
+        }
+        fprintf(stderr, "myon pkg: install takes at most one <github-url> or <owner>/<repo>\n");
         return 64;
     }
 
