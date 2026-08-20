@@ -49,6 +49,16 @@
  */
 char *pkg_fs_find_project_root(char **err_msg);
 
+/*
+ * Like pkg_fs_find_project_root() but starts the upward walk from `start_dir`
+ * instead of the current working directory.  Used by the interpreter's
+ * installed-package module resolver (spec §6.2), which must find the project
+ * root relative to the script being run so a package import resolves the same
+ * way no matter what the process CWD is.  If `start_dir` is NULL or empty it
+ * falls back to the current working directory (matching the plain variant).
+ */
+char *pkg_fs_find_project_root_from(const char *start_dir, char **err_msg);
+
 /* Join "a/b" into a fresh heap string (caller frees).  Never returns NULL. */
 char *pkg_fs_join(const char *a, const char *b);
 

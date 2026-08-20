@@ -1,0 +1,3 @@
+module cyc.b as b
+
+myon.func from_a() ret int { ret b.from_b() }

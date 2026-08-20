@@ -1,0 +1,11 @@
+format = 1
+
+[[package]]
+name = "example-tools"
+version = "0.1.0"
+module = "example.tools"
+source = "github:owner/example-tools"
+revision = "4c2e5ad3d8e74f3f239d6b0d6c7ab2e5e7b8d910"
+archive = "https://codeload.github.com/owner/example-tools/zip/4c2e5ad3d8e74f3f239d6b0d6c7ab2e5e7b8d910"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+dependencies = ""

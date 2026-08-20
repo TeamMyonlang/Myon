@@ -1,0 +1,6 @@
+format = 1
+
+[package]
+name = "cyc"
+version = "0.1.0"
+module = "cyc"

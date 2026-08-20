@@ -1,0 +1,6 @@
+format = 1
+
+[package]
+name = "example-tools"
+version = "0.1.0"
+module = "example.tools"

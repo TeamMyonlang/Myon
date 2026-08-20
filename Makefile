@@ -79,7 +79,12 @@ ifeq ($(UNAME_S),Darwin)
 BREW_OPENSSL := $(shell brew --prefix openssl@3 2>/dev/null)
 ifneq ($(BREW_OPENSSL),)
 CFLAGS  += -I$(BREW_OPENSSL)/include
-LDLIBS  += -L$(BREW_OPENSSL)/lib
+# Exported separately so auxiliary link lines (e.g. the package-manager C
+# tests below) can reuse the same keg-only OpenSSL lib path.  Without this the
+# `test-pkg` link fails on macOS with "ld: library 'ssl' not found" because
+# Homebrew keeps OpenSSL off the default linker search path.
+BREW_OPENSSL_LDFLAGS := -L$(BREW_OPENSSL)/lib
+LDLIBS  += $(BREW_OPENSSL_LDFLAGS)
 endif
 endif
 endif
@@ -214,6 +219,11 @@ PKG_TEST_CFLAGS = $(CFLAGS) -D_POSIX_C_SOURCE=200809L -I$(SRC_DIR)
 PKG_TEST_LDLIBS = -lssl -lcrypto
 ifeq ($(UNAME_S),Linux)
 PKG_TEST_LDLIBS += -ldl
+endif
+# macOS: Homebrew's OpenSSL is keg-only, so the C test link line needs the same
+# -L<prefix>/lib that the main build uses; otherwise `ld` cannot find libssl.
+ifeq ($(UNAME_S),Darwin)
+PKG_TEST_LDLIBS += $(BREW_OPENSSL_LDFLAGS)
 endif
 
 test-pkg: | $(BUILD)

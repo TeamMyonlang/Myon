@@ -1,0 +1,3 @@
+module myon.stdio
+
+myon.func triple(n: int) ret int { ret n * 3 }

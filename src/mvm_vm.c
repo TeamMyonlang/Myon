@@ -392,10 +392,18 @@ static void async_vm_body(void *ud, Value *out_result, int *out_has_error) {
     tvm.sh = ctx->sh;
     tvm.keep_top_return = 1;   /* deliver the task's return value (spec §14.9) */
 
-    /* Build the task's frame: push args as slots 0..argc-1, then locals. */
+    /* Build the task's frame: push args as slots 0..argc-1, then locals.
+     *
+     * `result` and `has_error` are written inside the setjmp() TRY block and
+     * also read after a longjmp() lands in the CATCH block.  A non-volatile
+     * automatic whose value must survive a longjmp() is exactly the case
+     * -Wclobbered warns about (its value is indeterminate after longjmp).
+     * Marking them volatile keeps them live in memory across the jump so both
+     * branches observe well-defined state.  `Value` is a small POD struct, so
+     * the copy through the volatile lvalue below is well defined. */
     Chunk *c = module_chunk(ctx->sh->module, ctx->chunk_idx);
-    Value result = value_nil();
-    int has_error = 0;
+    volatile Value result_v = value_nil();
+    volatile int   has_error = 0;
 
     if (setjmp(tvm.on_error) == 0) {
         for (int i = 0; i < ctx->argc; i++) vm_push(&tvm, value_copy(&ctx->args[i]));
@@ -408,11 +416,14 @@ static void async_vm_body(void *ud, Value *out_result, int *out_has_error) {
         frame_open_cells(&tvm, f);
         run(&tvm);
         /* run() leaves the single return value (RET normalizes 0->nil) on top */
-        if (tvm.sp > 0) result = tvm.stack[--tvm.sp];
+        if (tvm.sp > 0) result_v = tvm.stack[--tvm.sp];
     } else {
         has_error = 1;
-        result = value_error(myon_strdup("async task failed"));
+        result_v = value_error(myon_strdup("async task failed"));
     }
+
+    /* Copy out of the volatile lvalue once the jump target is settled. */
+    Value result = result_v;
 
     /* drain any stragglers on the task stack */
     while (tvm.sp > 0) { Value d = tvm.stack[--tvm.sp]; value_free(&d); }
