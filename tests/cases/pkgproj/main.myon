@@ -1,0 +1,8 @@
+system myon.useversion=1
+module myon.stdio
+module example.tools as tools
+module example.tools.util as util
+
+myon.print(tools.greet(str("myon")))
+myon.print(tools.square(6))
+myon.print(util.triple(7))

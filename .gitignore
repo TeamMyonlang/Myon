@@ -10,6 +10,13 @@ tests/fixtures/libffi_callback_test.so
 # Step 5: compiled MVM bytecode output
 *.myc
 
+# Package manager: installed packages are project-local and reproducible
+# from myon.toml + myon.lock (spec §2.5). Commit myon.toml / myon.lock,
+# but not the extracted package contents.
+.myon/packages/
+# ...except the checked-in test fixtures, which the test-suite relies on.
+!tests/cases/**/.myon/packages/
+
 # Core dumps
 core
 core.*

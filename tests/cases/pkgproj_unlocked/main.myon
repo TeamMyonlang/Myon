@@ -1,0 +1,5 @@
+system myon.useversion=1
+module myon.stdio
+module example.tools as tools
+
+myon.print(1)

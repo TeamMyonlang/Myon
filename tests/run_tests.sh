@@ -160,6 +160,68 @@ check_version_flag() {
 check_version_flag --version
 check_version_flag -v
 
+# ---------------------------------------------------------------------------
+# Installed-package module import (spec §6).
+#
+# These fixtures are self-contained mini-projects under tests/cases/<proj>/
+# (each with its own myon.toml + myon.lock + .myon/packages tree), so they are
+# deliberately NOT matched by the flat tests/cases/*.myon glob above -- a
+# package module only resolves inside its own project root.  We drive them
+# explicitly here:
+#
+#   pkgproj           positive: root module + submodule import with aliases
+#   pkgproj_noalias   negative: package import without an alias is rejected
+#   pkgproj_unlocked  negative: a package not in myon.lock is rejected
+#   pkgproj_cycle     negative: package module A<->B cycle is detected
+#
+# The project root is discovered by walking up from the SCRIPT's directory, so
+# these must pass regardless of the caller's CWD (spec §6.2).
+echo "== Myon package module import tests (spec §6) =="
+check_output pkg_module_import \
+    tests/cases/pkgproj/main.myon tests/cases/pkgproj/main.out
+check_error  pkg_module_alias_required tests/cases/pkgproj_noalias/main.myon
+check_error  pkg_module_unlocked       tests/cases/pkgproj_unlocked/main.myon
+check_error  pkg_module_cycle          tests/cases/pkgproj_cycle/main.myon
+
+# Project-root discovery walks up from the SCRIPT's directory, so a package
+# import must resolve identically no matter what the process CWD is (spec §6.2).
+# Drive the positive fixture from an unrelated CWD using absolute paths.
+check_pkg_cwd_independent() {
+    local name="$1"
+    local myon_abs src_abs exp_abs got exp
+    myon_abs="$(pwd)/myon"
+    src_abs="$(pwd)/tests/cases/pkgproj/main.myon"
+    exp_abs="$(pwd)/tests/cases/pkgproj/main.out"
+    got=$(cd / && "$myon_abs" "$src_abs" 2>/dev/null | strip_cr)
+    exp=$(strip_cr < "$exp_abs")
+    if [ "$got" == "$exp" ]; then
+        echo "  ok   $name (package root resolved from a foreign CWD)"
+        pass=$((pass + 1))
+    else
+        echo "  FAIL $name (CWD-dependent package resolution)"
+        echo "    --- expected ---"; printf '%s\n' "$exp" | sed 's/^/    /'
+        echo "    --- got ---";      printf '%s\n' "$got" | sed 's/^/    /'
+        fail=$((fail + 1))
+    fi
+}
+check_pkg_cwd_independent pkg_module_cwd_independent
+
+# The MVM backend must reject installed-package imports explicitly rather than
+# silently diverging from the tree-walker (spec §6.3).
+check_pkg_mvm_unsupported() {
+    local name="$1" src="$2"
+    local msg rc
+    msg="$("$MYON" --compile "$src" -o /dev/null 2>&1)"; rc=$?
+    if [ "$rc" -ne 0 ] && printf '%s' "$msg" | grep -q "MVM does not support installed package module"; then
+        echo "  ok   $name (MVM rejects package import as unsupported)"
+        pass=$((pass + 1))
+    else
+        echo "  FAIL $name (expected explicit MVM-unsupported error; exit $rc)"
+        fail=$((fail + 1))
+    fi
+}
+check_pkg_mvm_unsupported pkg_module_mvm_unsupported tests/cases/pkgproj/main.myon
+
 if [ "$skip" -gt 0 ]; then
     echo "== results: $pass passed, $fail failed, $skip skipped =="
 else

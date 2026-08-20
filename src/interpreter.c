@@ -41,6 +41,12 @@
 #include "net.h"
 #include "http.h"
 #include "tls.h"
+/* Package-manager data model + filesystem layer, reused (read-only) by the
+ * installed-package module resolver (spec §6.2).  The interpreter never
+ * fetches or installs here — it only reads the already-written myon.lock and
+ * the on-disk .myon/packages/ tree to resolve `module <pkg-module> as <alias>`. */
+#include "package.h"
+#include "pkg_fs.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -4934,7 +4940,20 @@ static ModuleEntry *find_module_by_alias(Interp *it, const char *alias) {
 static void prescan(Interp *it, Env *env, Program *prog);
 
 static int load_external_module(Interp *it, Stmt *decl);
+static int load_package_module(Interp *it, Stmt *decl);
+static void interp_retain_program(Interp *it, Program *prog);
 
+/*
+ * Spec §6.1 prefix dispatch.  A dotted module path resolves in exactly one of
+ * three disjoint ways, and the branch is chosen up front so the three resolver
+ * responsibilities stay separated (legacy `external.*`, installed package, and
+ * builtin) rather than being tangled into a single function:
+ *
+ *   myon.*        -> builtin module (recorded only)
+ *   external.*    -> legacy external resolver, relative to the script directory
+ *   <anything>    -> installed package module resolver (validated against the
+ *                    project's myon.lock and the on-disk .myon/packages tree)
+ */
 static void handle_module_decl(Interp *it, Stmt *s) {
     const char *path = s->as.module_decl.path;
     if (is_builtin_module(path)) {
@@ -4948,8 +4967,67 @@ static void handle_module_decl(Interp *it, Stmt *s) {
         it->modules = m;
         return;
     }
-    /* external module: external.util.math -> ./util/math.myon */
-    load_external_module(it, s);
+    if (strncmp(path, "external.", 9) == 0 || strcmp(path, "external") == 0) {
+        /* legacy external module: external.util.math -> ./util/math.myon */
+        load_external_module(it, s);
+        return;
+    }
+    /* installed package module: resolved from myon.lock + .myon/packages/. */
+    load_package_module(it, s);
+}
+
+/*
+ * Shared module-body loader used by both the legacy external resolver and the
+ * installed-package resolver.  `file` is an already-resolved filesystem path;
+ * `m` is the freshly-created ModuleEntry (its `loading` flag set, its `ns`
+ * chosen).  Reads the file, lexes/parses it, executes its top level into the
+ * module's target scope, and retains the AST for the interpreter's lifetime.
+ * On any I/O / lex / parse failure this runtime_error()s (never returns).
+ */
+static void exec_module_file(Interp *it, Stmt *decl, ModuleEntry *m,
+                             const char *file) {
+    const char *path = decl->as.module_decl.path;
+    Env *target = m->ns ? m->ns : it->global;
+
+    FILE *f = fopen(file, "rb");
+    if (!f) {
+        char *fcopy = myon_strdup(file);
+        runtime_error(it, decl->line,
+                      "cannot open module file '%s' for '%s'", fcopy, path);
+    }
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz < 0) { fclose(f); runtime_error(it, decl->line, "cannot read module '%s'", path); }
+    char *src = (char *)myon_xmalloc((size_t)sz + 1);
+    size_t n = fread(src, 1, (size_t)sz, f);
+    src[n] = '\0';
+    fclose(f);
+
+    TokenList tl;
+    if (!lexer_tokenize(src, &tl)) { free(src); runtime_error(it, decl->line, "lex error in module '%s'", path); }
+    Program *mp = parser_parse(&tl);
+    if (!mp) { token_list_free(&tl); free(src); runtime_error(it, decl->line, "parse error in module '%s'", path); }
+
+    /* Execute module top-level into the target scope.  Aliased modules use
+     * their own namespace env (`m.<name>` access); unaliased ones flatten into
+     * global (historical simple namespace model). */
+    prescan(it, target, mp);
+    for (int i = 0; i < mp->stmts.count; i++) {
+        if (mp->stmts.items[i]->kind == STMT_MODULE)
+            handle_module_decl(it, mp->stmts.items[i]);
+        else
+            exec_stmt(it, target, mp->stmts.items[i]);
+    }
+
+    /* Retain the module AST for the interpreter's lifetime: function/struct
+     * values captured above reference its nodes, so it must outlive the run and
+     * be freed exactly once at interp_free() rather than leaked. */
+    interp_retain_program(it, mp);
+    token_list_free(&tl);
+    free(src);
+
+    m->loading = 0;
 }
 
 /* Retain a parsed Program for the interpreter's lifetime so its AST stays
@@ -5027,47 +5105,178 @@ static int load_external_module(Interp *it, Stmt *decl) {
     if (!file)
         runtime_error(it, decl->line, "out of memory resolving module path: '%s'", path);
 
-    Env *target = m->ns ? m->ns : it->global;
-
-    FILE *f = fopen(file, "rb");
-    if (!f) {
-        char *fcopy = myon_strdup(file);
-        free(file);
-        runtime_error(it, decl->line, "cannot open module file '%s' for '%s'", fcopy, path);
-    }
+    exec_module_file(it, decl, m, file);
     free(file);
-    fseek(f, 0, SEEK_END);
-    long sz = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    char *src = (char *)myon_xmalloc((size_t)sz + 1);
-    size_t n = fread(src, 1, (size_t)sz, f);
-    src[n] = '\0';
-    fclose(f);
+    return 1;
+}
 
-    TokenList tl;
-    if (!lexer_tokenize(src, &tl)) { free(src); runtime_error(it, decl->line, "lex error in module '%s'", path); }
-    Program *mp = parser_parse(&tl);
-    if (!mp) { token_list_free(&tl); free(src); runtime_error(it, decl->line, "parse error in module '%s'", path); }
+/* ------------------------------------------------------------------ */
+/* Installed package module resolver (spec §6.2)                        */
+/* ------------------------------------------------------------------ */
+/*
+ * Resolve `module <pkg-module-path> as <alias>` against the project's
+ * myon.lock and the on-disk .myon/packages tree.  The package that owns the
+ * import is the locked package whose declared `module` namespace is the
+ * LONGEST dotted-prefix of the requested path (spec §6.2: "package manifest が
+ * 宣言した import path の最長一致で package module namespace を決める").  The
+ * file read is always:
+ *
+ *     <project-root>/.myon/packages/<package-name>/modules/<path→slashes>.myon
+ *
+ * where <path→slashes> is the *full* requested dotted path with '.' turned
+ * into '/'.  Every path segment is validated with pkg_fs_safe_component so a
+ * crafted import can never escape the package directory (spec §6.2: reject
+ * "..", absolute paths, separator injection; never resolve outside
+ * .myon/packages/).
+ *
+ * Constraints enforced here (spec §6.2):
+ *   - a package import MUST carry an alias;
+ *   - the package must exist in myon.lock (unlocked packages are rejected);
+ *   - cycles are caught via the shared ModuleEntry `loading` flag.
+ */
 
-    /* Execute module top-level into the target scope.  Aliased modules use
-     * their own namespace env (`m.<name>` access); unaliased ones flatten into
-     * global (historical simple namespace model). */
-    prescan(it, target, mp);
-    for (int i = 0; i < mp->stmts.count; i++) {
-        if (mp->stmts.items[i]->kind == STMT_MODULE)
-            handle_module_decl(it, mp->stmts.items[i]);
-        else
-            exec_stmt(it, target, mp->stmts.items[i]);
+/* True if dotted namespace `ns` is `path` itself or a dotted prefix of it,
+ * i.e. the next char in `path` after `ns` is '.' (component boundary). */
+static int module_ns_is_prefix(const char *ns, const char *path) {
+    size_t n = strlen(ns);
+    if (strncmp(path, ns, n) != 0) return 0;
+    return path[n] == '\0' || path[n] == '.';
+}
+
+static int load_package_module(Interp *it, Stmt *decl) {
+    const char *path  = decl->as.module_decl.path;
+    const char *alias = decl->as.module_decl.alias;
+
+    /* Already loaded (or loading -> cycle)? */
+    ModuleEntry *existing = find_module(it, path);
+    if (existing) {
+        if (existing->loading)
+            runtime_error(it, decl->line,
+                          "circular package module import detected: '%s' (spec §6.2)", path);
+        return 1;
     }
 
-    /* Retain the module AST for the interpreter's lifetime: function/struct
-     * values captured above reference its nodes, so it must outlive the run and
-     * be freed exactly once at interp_free() rather than leaked. */
-    interp_retain_program(it, mp);
-    token_list_free(&tl);
-    free(src);
+    /* Spec §6.2: package imports require an alias. */
+    if (!alias)
+        runtime_error(it, decl->line,
+                      "package module '%s' must be imported with an alias "
+                      "(module %s as <name>) (spec §6.2)", path, path);
 
-    m->loading = 0;
+    /* Discover the project root relative to the running script (not the
+     * process CWD), then read the lockfile. */
+    char *root_err = NULL;
+    char *root = pkg_fs_find_project_root_from(it->script_dir, &root_err);
+    if (!root) {
+        char *msg = root_err ? root_err : myon_strdup("no project root");
+        runtime_error(it, decl->line,
+                      "cannot import package module '%s': %s "
+                      "(run `myon pkg install` in your project first)", path, msg);
+    }
+
+    char *lock_path = pkg_fs_join(root, "myon.lock");
+    if (!pkg_fs_is_file(lock_path)) {
+        char rp[4096]; snprintf(rp, sizeof(rp), "%s", root);
+        free(lock_path); free(root);
+        runtime_error(it, decl->line,
+                      "cannot import package module '%s': no myon.lock in project '%s' "
+                      "(run `myon pkg install` first)", path, rp);
+    }
+
+    PkgError perr; pkg_error_init(&perr);
+    PkgLock *lock = pkg_lock_parse_file(lock_path, &perr);
+    free(lock_path);
+    if (!lock) {
+        char ebuf[512];
+        snprintf(ebuf, sizeof(ebuf), "%s",
+                 (perr.message && perr.message[0]) ? perr.message : "invalid myon.lock");
+        pkg_error_reset(&perr);
+        free(root);
+        runtime_error(it, decl->line,
+                      "cannot import package module '%s': %s", path, ebuf);
+    }
+
+    /* Longest-prefix match of a locked package's declared module namespace. */
+    const PkgLockEntry *best = NULL;
+    size_t best_len = 0;
+    for (size_t i = 0; i < lock->count; i++) {
+        const PkgLockEntry *e = &lock->entries[i];
+        if (e->module && module_ns_is_prefix(e->module, path)) {
+            size_t l = strlen(e->module);
+            if (!best || l > best_len) { best = e; best_len = l; }
+        }
+    }
+    if (!best) {
+        pkg_lock_free(lock);
+        free(root);
+        runtime_error(it, decl->line,
+                      "package module '%s' is not provided by any locked package "
+                      "(is it installed and declared in myon.toml?) (spec §6.2)", path);
+    }
+
+    char *pkg_name = myon_strdup(best->name);
+    pkg_lock_free(lock);
+
+    /* Build .../.myon/packages/<pkg>/modules and validate each requested
+     * segment so nothing can escape the package directory. */
+    char *dotmyon  = pkg_fs_join(root, PKG_DIR_DOTMYON);
+    char *packages = pkg_fs_join(dotmyon, PKG_DIR_PACKAGES);
+    char *pkgroot  = pkg_fs_join(packages, pkg_name);
+    char *modules  = pkg_fs_join(pkgroot, "modules");
+    free(dotmyon); free(packages); free(root);
+
+    if (!pkg_fs_is_dir(pkgroot)) {
+        char pn[256]; snprintf(pn, sizeof(pn), "%s", pkg_name);
+        free(pkg_name); free(pkgroot); free(modules);
+        runtime_error(it, decl->line,
+                      "package '%s' is locked but not installed on disk "
+                      "(run `myon pkg install`) (spec §6.2)", pn);
+    }
+
+    /* Turn the full dotted path into modules/<a>/<b>/.../<z>.myon, validating
+     * every segment.  A copy of `path` is tokenised on '.'. */
+    char *dup = myon_strdup(path);
+    char *cur = modules; /* accumulates the file path; freed as we go */
+    char *save = NULL;
+    for (char *seg = strtok_r(dup, ".", &save); seg; seg = strtok_r(NULL, ".", &save)) {
+        if (!pkg_fs_safe_component(seg)) {
+            char pbad[256]; snprintf(pbad, sizeof(pbad), "%s", path);
+            free(dup); free(cur); free(pkg_name); free(pkgroot);
+            runtime_error(it, decl->line,
+                          "illegal package module path component in '%s' (spec §6.2)", pbad);
+        }
+        char *next = pkg_fs_join(cur, seg);
+        free(cur);
+        cur = next;
+    }
+    free(dup);
+
+    /* Append ".myon". */
+    size_t clen = strlen(cur);
+    char *file = (char *)myon_xmalloc(clen + 6);
+    memcpy(file, cur, clen);
+    memcpy(file + clen, ".myon", 6);
+    free(cur);
+    free(pkgroot);
+    free(pkg_name);
+
+    if (!pkg_fs_is_file(file)) {
+        char fp[4096]; snprintf(fp, sizeof(fp), "%s", file);
+        free(file);
+        runtime_error(it, decl->line,
+                      "package module '%s' has no source file '%s' (spec §6.2)", path, fp);
+    }
+
+    /* Register the module (aliased namespace, cycle flag) and load it. */
+    ModuleEntry *m = (ModuleEntry *)myon_xmalloc(sizeof(ModuleEntry));
+    m->path = myon_strdup(path);
+    m->alias = myon_strdup(alias);
+    m->loading = 1;
+    m->ns = env_new(it->global);   /* package imports are always aliased */
+    m->next = it->modules;
+    it->modules = m;
+
+    exec_module_file(it, decl, m, file);
+    free(file);
     return 1;
 }
 

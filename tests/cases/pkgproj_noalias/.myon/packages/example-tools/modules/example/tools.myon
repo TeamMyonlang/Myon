@@ -1,0 +1,4 @@
+module myon.stdio
+
+myon.func greet(name: str) ret str { ret "hello, {name}" }
+myon.func square(n: int) ret int { ret n * n }

@@ -1,0 +1,11 @@
+format = 1
+
+[[package]]
+name = "cyc"
+version = "0.1.0"
+module = "cyc"
+source = "github:owner/cyc"
+revision = "4c2e5ad3d8e74f3f239d6b0d6c7ab2e5e7b8d910"
+archive = "https://codeload.github.com/owner/cyc/zip/4c2e5ad3d8e74f3f239d6b0d6c7ab2e5e7b8d910"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+dependencies = ""

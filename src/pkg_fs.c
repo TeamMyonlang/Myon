@@ -22,6 +22,19 @@
 #  define _DARWIN_C_SOURCE 1
 #endif
 
+/*
+ * rand_s() (a CSPRNG on Windows) is only declared by <stdlib.h> when
+ * _CRT_RAND_S is defined *before* <stdlib.h> is first included.  Without
+ * this, a Windows/MinGW build fails with an implicit-declaration error
+ * (see build log: "implicit declaration of function 'rand_s'").  Define it
+ * unconditionally on Windows targets ahead of every standard header.
+ */
+#if defined(_WIN32) || defined(_WIN64)
+#  ifndef _CRT_RAND_S
+#    define _CRT_RAND_S
+#  endif
+#endif
+
 #include "platform.h"
 #include "pkg_fs.h"
 #include "common.h"
@@ -220,14 +233,16 @@ bool pkg_fs_safe_component(const char *seg) {
 /* project-root discovery                                              */
 /* ------------------------------------------------------------------ */
 
-char *pkg_fs_find_project_root(char **err_msg) {
-    char cwd[4096];
-    if (!getcwd(cwd, sizeof(cwd))) {
-        set_err(err_msg, "cannot determine current directory%s", "");
-        return NULL;
-    }
+char *pkg_fs_find_project_root_from(const char *start_dir, char **err_msg) {
     char dir[4096];
-    snprintf(dir, sizeof(dir), "%s", cwd);
+    if (start_dir && start_dir[0]) {
+        snprintf(dir, sizeof(dir), "%s", start_dir);
+    } else {
+        if (!getcwd(dir, sizeof(dir))) {
+            set_err(err_msg, "cannot determine current directory%s", "");
+            return NULL;
+        }
+    }
     for (int depth = 0; depth < 256; depth++) {
         char *probe = pkg_fs_join(dir, "myon.toml");
         bool found = pkg_fs_is_file(probe);
@@ -246,6 +261,10 @@ char *pkg_fs_find_project_root(char **err_msg) {
     set_err(err_msg,
             "no myon.toml found in this directory or any parent%s", "");
     return NULL;
+}
+
+char *pkg_fs_find_project_root(char **err_msg) {
+    return pkg_fs_find_project_root_from(NULL, err_msg);
 }
 
 /* ------------------------------------------------------------------ */

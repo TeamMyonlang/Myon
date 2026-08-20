@@ -50,6 +50,10 @@ x = str("人間")
 myon.print("Hello Worlddd! ", x + "!")
 ```
 
+GitHub の package を使いたい場合は [パッケージ管理（`myon pkg`）](#パッケージ管理myon-pkg)
+を参照してください（詳細な仕様は [`docs/package_manager.md`](docs/package_manager.md)、
+package を自作したい場合は [`docs/package_development.md`](docs/package_development.md)）。
+
 ## ビルド
 
 ```sh
@@ -125,7 +129,9 @@ Windows ビルドでは Makefile が自動的に出力名を `myon.exe` とし�
 （`array.map`／`filter`／`reduce` などの高階ネイティブメソッド、`myon.ffi.make_callback`）
 だけはエンジン境界をまたげないため MVM では明示的なエラーになります。該当プログラムは
 ツリーウォーク実行（`.myon`）で動かしてください。外部モジュール取り込み
-（`module external.* as ...`）も MVM 非対応です。
+（`module external.* as ...`）とインストール済みパッケージの module 取り込み
+（`module <package-module> as ...`）も MVM 非対応で、`--compile`／`--run-mvm`
+では明示的なエラーになります（仕様 §6.3）。
 
 ### 対話モード（REPL）
 
@@ -152,6 +158,77 @@ myon: syntax error at line 5, column 17: expected ')' to close call (got an inte
      5 | myon.print(1, 2 3)
        |                 ^
 ```
+
+## パッケージ管理（`myon pkg`）
+
+GitHub の public repository を配布元とする、プロジェクト単位のパッケージ管理を
+内蔵しています。URL を一度指定するだけで導入でき、導入後は package が宣言した
+module 名だけで利用できます。
+
+```sh
+# URL を指定して導入（初回・通常利用）
+myon pkg install https://github.com/owner/repository
+
+# 明示的な操作
+myon pkg lock       # 依存を解決して myon.lock を（再）生成
+myon pkg install    # 既存の myon.lock だけを信頼して再現インストール
+myon pkg verify     # myon.toml / myon.lock / 展開物の整合性を検査
+myon pkg tree       # ロック済み依存グラフを表示（ネットワーク不要）
+```
+
+導入した package は、`myon.toml`／`myon.lock` に記録され、実体は
+`<project-root>/.myon/packages/<package-name>/` にプロジェクトローカルで
+配置されます（グローバルキャッシュや PATH 変更は行いません）。
+
+利用側の source からは、package manifest が宣言した **module 名**を alias 付きで
+取り込みます（GitHub URL やインストール先 path は import 文に書きません）。
+
+```myon
+module example.tools as tools           # package のルート module
+module example.tools.util as util       # サブ module
+
+myon.print(tools.greet(str("myon")))
+myon.print(util.triple(7))
+```
+
+module import の解決規則（仕様 §6）:
+
+- 取り込み path は、`myon.lock` に記録された各 package の宣言 module namespace の
+  **最長一致**で所属 package を決めます。
+- package の実 file は
+  `<project-root>/.myon/packages/<package-name>/modules/<path→スラッシュ>.myon`
+  に解決され、各 path 要素は安全性検証されます（`..`／絶対 path／区切り混入を拒否し、
+  `.myon/packages/` の外へは解決しません）。
+- project root は**実行スクリプトのディレクトリ**から上方向に `myon.toml` を探して
+  決めるため、プロセスの作業ディレクトリに依存しません。
+- package import は **alias 必須**、`myon.lock` にない package は拒否、
+  循環 import は検出してエラーにします。
+- **⚠️ package code は sandbox されません。** package の module を import することは、
+  任意の Myon code（file I/O・network・FFI 等を含む）を実行することと同じ扱いです。
+  信頼できる repository のみを導入してください。
+- `--compile`／`--run-mvm`／`.myc` 実行では package module 取り込みは未対応で、
+  明示的なエラーになります（仕様 §6.3）。ツリーウォーク実行（`.myon`）で利用して
+  ください。
+
+GitHub からの archive 取得（仕様 §7）は package manager 専用の C 層
+（`src/pkg_fetch.c`）で行い、既存の `myon.http` とは独立です。HTTPS のみを許可し、
+TLS 証明書・ホスト名を検証（fail-closed）、`https`→`http` ダウングレード拒否、
+redirect は最大 5 回かつ GitHub の archive host のみ許可、`Location` の制御文字拒否、
+`Content-Length`／総ダウンロード量の上限（64 MiB）、chunked 転送のデコードなどを
+実装しています。
+
+`.myon/packages/` は通常 `.gitignore` 対象とし、`myon.toml` と `myon.lock` を
+Git 管理する運用を推奨します（本リポジトリの [`.gitignore`](.gitignore) にも
+`.myon/packages/` を記載しています）。
+
+より詳しい情報は次のドキュメントを参照してください。
+
+- 仕様・内部実装: [`docs/package_manager.md`](docs/package_manager.md)
+  — GitHub URL 解決・`myon.toml`／`myon.lock`／`package.myon` の文法・network 層・
+  ZIP 安全性・install トランザクション・module import 解決規則（§6）
+- package を作って公開する方法: [`docs/package_development.md`](docs/package_development.md)
+  — ディレクトリ構成・`package.myon` の書き方・module 名と path の対応・
+  公開／導入フロー・ローカル検証手順
 
 ## サンプル
 
@@ -300,6 +377,10 @@ tests/               回帰テスト（`make test`）
   EBNF 文法など）
 - [`docs/mvm_spec.md`](docs/mvm_spec.md) — MVM バイトコード仕様
 - [`docs/features.md`](docs/features.md) — 機能一覧・実装状況・開発の歩み
+- [`docs/package_manager.md`](docs/package_manager.md) — GitHub ベース package
+  管理の仕様・内部実装（`myon pkg` / `myon.toml` / `myon.lock` / module import §6）
+- [`docs/package_development.md`](docs/package_development.md) — package 開発者向け
+  ガイド（package の作り方・公開／導入・ローカル検証）
 
 ## ライセンス
 

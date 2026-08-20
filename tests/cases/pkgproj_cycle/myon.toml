@@ -1,0 +1,8 @@
+format = 1
+
+[project]
+name = "pkgproj_cycle"
+version = "0.1.0"
+
+[dependencies]
+cyc = "github:owner/cyc@4c2e5ad3d8e74f3f239d6b0d6c7ab2e5e7b8d910"

@@ -1166,6 +1166,18 @@ static void compile_stmt(Compiler *c, Stmt *s) {
                 unsupported(c, s->line, "external module imports (module external.*)",
                     "The MVM backend cannot yet load external modules; run it as "
                     ".myon (tree-walking) instead.");
+            /*
+             * Installed package modules (spec §6.2, e.g. `module example.tools
+             * as tools`) are neither a builtin `myon.*` module nor an
+             * `external.*` module.  The MVM has no package-module linking yet
+             * (spec §6.3), so — exactly as for external modules — reject them
+             * explicitly rather than silently skipping the import and letting a
+             * later symbol use diverge from the .myon behaviour. */
+            else if (mpath && strncmp(mpath, "myon.", 5) != 0 &&
+                     strcmp(mpath, "myon") != 0)
+                unsupported(c, s->line, "installed package module imports",
+                    "The MVM backend cannot yet load installed package modules "
+                    "(spec §6.3); run it as .myon (tree-walking) instead.");
             break;
         }
         case STMT_ASSIGN:
