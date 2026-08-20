@@ -1,9 +1,10 @@
-# Release workflow for Myon (TODO section 4.5).
+# Release workflow for Myon.
 #
 # Manual-only (workflow_dispatch). The operator chooses pre vs stable and
 # types a version; the tag string is derived from those inputs. The Linux
-# `myon`, the Windows `myon.exe` and the macOS Apple Silicon `myon` (arm64,
-# built natively on macos-15) are all built first, and the GitHub Release is
+# `myon`, the Windows `myon.exe` (built natively on windows-latest via MSYS2
+# UCRT64) and the macOS Apple Silicon `myon` (arm64, built natively on
+# macos-15) are all built first, and the GitHub Release is
 # only created if ALL builds succeed (no half-a-release). Tags are always
 # newly created, never overwritten -- pre tags carry a date+sequence suffix
 # so repeated runs stack up as distinct tags.
@@ -31,9 +32,6 @@ concurrency:
 
 permissions:
   contents: write  # needed to create tags/releases and upload assets
-
-env:
-  OPENSSL_VERSION: "3.3.2"
 
 jobs:
   # ------------------------------------------------------------------ #
@@ -124,49 +122,46 @@ jobs:
           if-no-files-found: error
 
   # ------------------------------------------------------------------ #
-  # 2. Cross-build the Windows binary (myon.exe).                     #
+  # 2. Build the Windows binary (myon.exe) NATIVELY.                  #
+  #                                                                    #
+  # Built on a real Windows runner (windows-latest) inside an MSYS2   #
+  # UCRT64 environment, so the shipped binary is a genuine native     #
+  # Windows build produced by the mingw-w64 UCRT64 GCC toolchain --   #
+  # not a Linux cross-compile. OpenSSL comes from the MSYS2 UCRT64    #
+  # package (mingw-w64-ucrt-x86_64-openssl), whose default            #
+  # -lssl/-lcrypto import libraries are already on the compiler's     #
+  # search path, so the Makefile's Windows branch links cleanly with  #
+  # no extra WIN_OPENSSL_LDLIBS. See msys2.org/docs/ci for the        #
+  # upstream-recommended setup this mirrors.                          #
   # ------------------------------------------------------------------ #
   build-windows:
-    name: build windows (cross)
+    name: build windows (native)
     needs: prepare
-    runs-on: ubuntu-latest
-    env:
-      WIN_OPENSSL_PREFIX: ${{ github.workspace }}/win-openssl
+    runs-on: windows-latest
+    defaults:
+      run:
+        # Every `run:` step executes inside the MSYS2 UCRT64 login shell.
+        shell: msys2 {0}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install MinGW-w64 toolchain
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends mingw-w64
-
-      - name: Cache Windows OpenSSL (cross-built)
-        id: cache-openssl
-        uses: actions/cache@v4
+      - name: Set up MSYS2 (UCRT64) toolchain
+        uses: msys2/setup-msys2@v2
         with:
-          path: ${{ env.WIN_OPENSSL_PREFIX }}
-          key: win-openssl-${{ runner.os }}-${{ env.OPENSSL_VERSION }}
+          msystem: UCRT64
+          update: true
+          # make + the UCRT64 GCC toolchain + OpenSSL headers/import libs.
+          install: >-
+            base-devel
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-make
+            mingw-w64-ucrt-x86_64-openssl
 
-      - name: Cross-build Windows OpenSSL (cache miss only)
-        if: steps.cache-openssl.outputs.cache-hit != 'true'
+      - name: Build myon.exe (native)
         run: |
           set -eux
-          git clone --depth 1 --branch "openssl-${OPENSSL_VERSION}" \
-            https://github.com/openssl/openssl.git openssl-src
-          cd openssl-src
-          ./Configure mingw64 no-shared no-tests no-docs no-apps \
-            --cross-compile-prefix=x86_64-w64-mingw32- \
-            --prefix="${WIN_OPENSSL_PREFIX}"
-          make -j"$(nproc)"
-          make install_sw
-
-      - name: Cross-build myon.exe
-        run: |
-          set -eux
-          make win-cross \
-            CFLAGS="-std=c11 -Wall -Wextra -Wpedantic -O2 -I${WIN_OPENSSL_PREFIX}/include" \
-            WIN_OPENSSL_LDLIBS="-L${WIN_OPENSSL_PREFIX}/lib -L${WIN_OPENSSL_PREFIX}/lib64 -lcrypt32"
+          make
           cp myon.exe myon-windows-x86_64.exe
           file myon-windows-x86_64.exe
 
