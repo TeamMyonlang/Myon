@@ -225,6 +225,16 @@ endif
 ifeq ($(UNAME_S),Darwin)
 PKG_TEST_LDLIBS += $(BREW_OPENSSL_LDFLAGS)
 endif
+# Windows: PKG_TEST_SRCS links src/net.c and src/tls.c (the fetch layer's
+# default transport), whose _WIN32 branch calls Winsock2 (WSAStartup, socket,
+# select, ...). The main build pulls this in via LDLIBS (see -lws2_32 above),
+# but PKG_TEST_LDLIBS is a separate variable, so it needs the same flag here
+# or the test-pkg link fails with "undefined reference to `__imp_WSAStartup'"
+# and friends. WIN_OPENSSL_LDLIBS is also folded in for consistency with the
+# main Windows build (see the note above LDLIBS).
+ifeq ($(OS),Windows_NT)
+PKG_TEST_LDLIBS += -lws2_32 $(WIN_OPENSSL_LDLIBS)
+endif
 
 test-pkg: | $(BUILD)
 	@echo "== Myon package-manager C tests =="
