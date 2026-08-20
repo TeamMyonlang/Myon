@@ -94,6 +94,19 @@ bool pkg_fetch_https_get(const PkgTransport *tr, const char *url,
                          char **err_msg);
 
 /*
+ * Like pkg_fetch_https_get(), but the host is NOT restricted to the GitHub
+ * allow-list.  This is used only for fetching package-registry list files
+ * (`.myon/packages.list` entries), whose URLs legitimately point at arbitrary
+ * third-party hosts.  Every other safety property is unchanged: HTTPS only, no
+ * https->http downgrade on redirect, no embedded credentials, the redirect cap,
+ * and the total body-size cap all still apply.  The fetched body is registry
+ * metadata (JSON), never executed as code.
+ */
+bool pkg_fetch_https_get_any(const PkgTransport *tr, const char *url,
+                             unsigned char **out_data, size_t *out_len,
+                             char **err_msg);
+
+/*
  * Parse an https:// URL into host / port / path (all heap, caller frees the
  * three via the single free of *host after using them — actually each is a
  * separate allocation; free host, path individually).  Rejects non-https,
@@ -107,16 +120,27 @@ bool pkg_fetch_parse_url(const char *url, char **host, int *port, char **path,
 /* ------------------------------------------------------------------ */
 
 /*
- * Resolve a GitHub ref (branch/tag/short-or-full sha/HEAD-for-default) for
- * <owner>/<repo> to a full 40-hex commit SHA, using the GitHub REST API
+ * Resolve a GitHub ref (branch/tag/full-sha/HEAD-for-default) for
+ * <owner>/<repo> to a full 40-hex commit SHA.  `ref` may be NULL/empty to mean
+ * the repository default branch.  On success writes 40 lowercase hex chars +
+ * NUL into `out_sha` (>= 41 bytes) and returns true; on failure returns
+ * false + *err_msg.
  *
- *     GET https://api.github.com/repos/<owner>/<repo>/commits/<ref>
- *     Accept: application/vnd.github.sha
+ * Resolution strategy (see pkg_fetch.c for the rationale):
  *
- * which returns the resolved 40-hex SHA as the plain-text body (verified
- * 2026-08-19).  `ref` may be NULL/empty to mean the default branch (resolved
- * via the "HEAD" ref).  On success writes 40 lowercase hex chars + NUL into
- * `out_sha` (>= 41 bytes) and returns true.  On failure returns false + *err_msg.
+ *   0. A ref that is already a full 40-hex SHA is immutable and returned
+ *      immediately with no network request.
+ *   1. git "smart HTTP" ref discovery on github.com:
+ *         GET https://github.com/<owner>/<repo>.git/info/refs
+ *                 ?service=git-upload-pack
+ *      This is the transport `git clone` uses; it lists every ref -> SHA in one
+ *      response and is NOT subject to the very low unauthenticated
+ *      api.github.com REST rate limit (60/hour, tightened 2025-05).  This is
+ *      the primary path and avoids rate-limit failures in normal use.
+ *   2. api.github.com REST fallback:
+ *         GET https://api.github.com/repos/<owner>/<repo>/commits/<ref>
+ *         Accept: application/vnd.github.sha
+ *      Used only if strategy 1 does not yield a SHA.
  *
  * Uses the same PkgTransport seam so it is testable offline.
  */

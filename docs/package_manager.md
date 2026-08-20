@@ -60,13 +60,39 @@ URL 検証で拒否するもの: `https` 以外の scheme、`github.com` 以外�
 credentials（`user:pass@`）、query／fragment、制御文字、想定外に深い path。
 
 ref／tag／default branch は、取得時に **immutable な full commit SHA へ解決**する。
-解決には GitHub の commit API を用いる（実装で検証済みの endpoint）:
 
-```text
-GET https://api.github.com/repos/<owner>/<repo>/commits/<ref>
-Accept: application/vnd.github.sha
--> 応答 body は 40 桁の commit SHA
-```
+解決は次の順で行う（`src/pkg_fetch.c` の `pkg_fetch_resolve_ref`。確認日
+2026-08-20）:
+
+0. ref が既に 40 桁 hex（full SHA）なら immutable なので、**ネットワークなし**で
+   そのまま採用する（大文字は小文字へ正規化）。
+1. **git smart-HTTP の ref discovery を `github.com` に対して行う**（`git clone` が
+   使う transport と同じ）:
+
+   ```text
+   GET https://github.com/<owner>/<repo>.git/info/refs?service=git-upload-pack
+   -> pkt-line 形式で「<40桁SHA> <refname>」を全 ref 分返す
+      先頭 ref の capability に "symref=HEAD:refs/heads/<default>" が付く
+   ```
+
+   これは既に fetch 許可済みの `github.com` host であり、`api.github.com` の
+   非認証 REST rate limit（60 req/時。2025-05 の GitHub changelog
+   "Updated rate limits for unauthenticated requests" でさらに厳格化）とは
+   **別枠**で、branch／tag／HEAD の解決を 1 リクエストで完結できる。通常運用では
+   この経路のみで解決するため、rate limit に当たらない。
+
+2. 1 で解決できなかった場合の **fallback** として、従来どおり GitHub commit API を
+   用いる（実装で検証済みの endpoint）:
+
+   ```text
+   GET https://api.github.com/repos/<owner>/<repo>/commits/<ref>
+   Accept: application/vnd.github.sha
+   -> 応答 body は 40 桁の commit SHA
+   ```
+
+ref 名の照合順（最も具体的なものを優先）: 完全一致 refname → annotated tag の
+peeled `refs/tags/<ref>^{}` → `refs/heads/<ref>` → `refs/tags/<ref>`。default branch
+（ref 省略）は HEAD の symref target、無ければ `HEAD` エントリを採用する。
 
 archive は解決済み SHA から package manager が生成する。利用者・開発者が
 manifest に任意 URL を書くことはできない:
@@ -75,8 +101,71 @@ manifest に任意 URL を書くことはできない:
 https://codeload.github.com/<owner>/<repository>/zip/<commit SHA>
 ```
 
-HTTP status（404＝repo/ref なしまたは private、403＝rate limit／forbidden）は
+HTTP status（404＝repo/ref なしまたは private、403／429＝rate limit／forbidden）は
 利用者に区別可能な形で報告する。
+
+---
+
+## 2.5. パッケージリスト（`.myon/packages.list`）と shorthand install
+
+URL を毎回書かずに `myon pkg install <owner>/<repo>` の **shorthand** で導入できる。
+これは既存の URL 方式（§2）を一切変更せず、その前段に「配布元レジストリで
+`<owner>/<repo>` を探して該当 GitHub repo を特定する」層を足したものである。
+
+### `.myon/packages.list`
+
+project root の `.myon/packages.list` に、レジストリ JSON の配布元 URL を **1 行に
+1 つ**書く（`src/package.c` の `pkg_packages_list_parse`）。
+
+```text
+# 任意のコメント行（'#' 始まり）と空行は無視
+https://example.com/xxxx.json
+https://ohmygodwhhhhooooo.com/xxxx.json
+```
+
+- 各行は `https://` のみ許可（`http://` や制御文字・空白混入は行番号付きで拒否）。
+- コメントのみ／空ファイルは「レジストリ 0 件」として扱う。
+
+### レジストリ JSON の形式
+
+レジストリは **純粋なデータ**であり、install 中にコード実行は一切しない
+（`src/package.c` の `pkg_registry_parse`。自己完結の strict JSON scanner）。次の 2 形式を
+受け付ける。
+
+1. shorthand の配列:
+
+   ```json
+   ["acme/myon-json", "owner/pkg", "another/repo"]
+   ```
+
+2. 短い alias → shorthand の object:
+
+   ```json
+   { "json": "acme/myon-json", "text": "acme/myon-text" }
+   ```
+
+各値は `https://github.com/<owner>/<repo>` の `<owner>/<repo>` 部分（GitHub の
+`user/repo`）で、`valid_repo_segment` で検証する。値が非文字列・非 shorthand・
+制御文字を含む・JSON が壊れている・4 MiB 超・要素過多、などは拒否する。
+
+### `myon pkg install <owner>/<repo>` の解決フロー
+
+`src/pkg_ops.c` の `pkg_ops_install_shorthand`:
+
+1. 引数が shorthand（`://` を含まず `/` が 1 個、両側非空）かを CLI で判定
+   （`pkg_arg_is_shorthand`）。URL はこれまでどおり `pkg_ops_install_url` へ。
+2. project root（`myon.toml` を上方向に探索、無ければ CWD）を決め、
+   `.myon/packages.list` を読む。無ければ「URL で入れてください」と案内して失敗。
+3. 各レジストリ URL を **任意 host 許可の HTTPS GET**（`pkg_fetch_https_get_any`）で
+   取得。単一レジストリの到達不可／壊れは **warning にして次へ**（fail-closed に
+   しない）。全滅なら network error。
+4. 最初に `<owner>/<repo>` を含むレジストリで解決し、`https://github.com/<owner>/<repo>`
+   を組み立てて、**既存の URL install（§2, §7）へそのまま委譲**する。
+   どのレジストリにも無ければ usage error。
+
+`pkg_fetch_https_get_any` は host allow-list を外す点だけが通常の archive fetch と
+異なり、HTTPS 限定・`https→http` ダウングレード拒否・credential 埋め込み拒否・
+redirect 上限・本文サイズ上限（64 MiB）は同じく適用する。
 
 ---
 
@@ -212,6 +301,7 @@ dependencies = "acme.text"
 
 ```sh
 myon pkg install https://github.com/owner/repository   # 主導入（URL 指定）
+myon pkg install owner/repository                       # shorthand（packages.list 経由, §2.5）
 myon pkg lock                                           # 依存解決 + myon.lock 生成
 myon pkg install                                        # lockfile から再現インストール
 myon pkg verify                                         # 整合性検査
@@ -222,6 +312,9 @@ myon pkg tree                                           # 依存グラフ表示�
   URL 検証・ref 解決 → archive 取得 → package manifest から name／module 取得 →
   manifest へ依存追加（既存保持）→ full SHA と archive SHA-256 を lockfile へ保存 →
   依存を再帰解決 → 検証・展開 → `.myon/packages/` へ atomic install。
+- `myon pkg install <owner>/<repo>`: `.myon/packages.list` の各レジストリを検索して
+  `<owner>/<repo>` に対応する GitHub repo を特定し、`https://github.com/<owner>/<repo>`
+  を上記 URL install へ委譲する（§2.5）。
 - `myon pkg lock`: archive を取得するが install directory は更新しない。
 - `myon pkg install`（URL なし）: 既存 lockfile だけを信頼。lockfile が無ければ失敗。
   mutable ref の再解決はしない。manifest を手編集して lock が古い場合は
@@ -240,8 +333,13 @@ binary buffer + length で保持する（NUL 終端 string に丸めない）。
   fail-closed。
 - redirect は最大 5 回（`PKG_FETCH_MAX_REDIRECTS`）。
 - `https`→`http` ダウングレードを拒否。
-- redirect 先 host は allow-list（`github.com` / `codeload.github.com` /
-  `api.github.com`）のみ。`Location` の CR／LF／NUL／制御文字を拒否。
+- archive／ref 解決／REST の redirect 先 host は allow-list（`github.com` /
+  `codeload.github.com` / `api.github.com` / `objects.githubusercontent.com` /
+  `raw.githubusercontent.com`）のみ。`Location` の CR／LF／NUL／制御文字を拒否。
+- ただし **package-list レジストリの取得**（`pkg_fetch_https_get_any`）だけは
+  任意の第三者 host を許可する（レジストリ URL は本質的に外部サイトを指すため）。
+  それ以外の安全性（HTTPS 限定・ダウングレード拒否・credential 拒否・redirect 上限・
+  本文サイズ上限）は共通。取得内容は JSON メタデータであり、コードとして実行しない。
 - status 200 以外を失敗にする。
 - `Content-Length` 上限検査と、総ダウンロード量の上限（`PKG_FETCH_MAX_BODY` =
   64 MiB）。

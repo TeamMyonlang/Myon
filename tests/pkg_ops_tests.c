@@ -243,6 +243,54 @@ static void mock_set_response_status(MockHandle *h, int status, const char *reas
     h->resp_off = 0;
 }
 
+/* Emit one pkt-line ("<4-hex-len><payload>") into a growable buffer. */
+static void pktline(unsigned char **buf, size_t *n, const char *payload, size_t plen) {
+    size_t total = plen + 4;
+    char hdr[5];
+    snprintf(hdr, sizeof(hdr), "%04zx", total);
+    *buf = realloc(*buf, *n + total);
+    memcpy(*buf + *n, hdr, 4);
+    if (plen) memcpy(*buf + *n + 4, payload, plen);
+    *n += total;
+}
+
+/*
+ * Build a git smart-HTTP ref-advertisement body for the repo, exposing:
+ *   - HEAD (with a symref=HEAD:refs/heads/main capability),
+ *   - refs/heads/main and refs/heads/HEAD-alias pointing at the repo's sha,
+ * so the resolver can map HEAD / "main" -> the canned commit SHA.
+ */
+static unsigned char *build_info_refs(const Repo *r, size_t *out_len) {
+    unsigned char *buf = NULL; size_t n = 0;
+    pktline(&buf, &n, "# service=git-upload-pack\n", strlen("# service=git-upload-pack\n"));
+    /* flush after banner */
+    buf = realloc(buf, n + 4); memcpy(buf + n, "0000", 4); n += 4;
+    /* First ref line: "<sha> HEAD\0<capabilities incl. symref=HEAD:...>\n".
+     * The NUL after "HEAD" is significant (it separates refname from caps), so
+     * the line is assembled by hand rather than with snprintf. */
+    {
+        char l2[512]; size_t p = 0;
+        memcpy(l2 + p, r->sha, 40); p += 40;
+        l2[p++] = ' ';
+        memcpy(l2 + p, "HEAD", 4); p += 4;
+        l2[p++] = '\0';
+        const char *caps = "multi_ack symref=HEAD:refs/heads/main agent=git/test\n";
+        memcpy(l2 + p, caps, strlen(caps)); p += strlen(caps);
+        pktline(&buf, &n, l2, p);
+    }
+    /* refs/heads/main -> sha */
+    { char l[128]; int k = snprintf(l, sizeof(l), "%s refs/heads/main\n", r->sha); pktline(&buf, &n, l, (size_t)k); }
+    /* final flush */
+    buf = realloc(buf, n + 4); memcpy(buf + n, "0000", 4); n += 4;
+    *out_len = n;
+    return buf;
+}
+
+/* Optional registry document served from a fake registry host. */
+static char g_registry_host[128] = {0};
+static char g_registry_path[256] = {0};
+static char g_registry_json[1024] = {0};
+
 /* Parse "GET <path> HTTP/1.1" out of the request and dispatch. */
 static bool mock_write(void *handle, const unsigned char *data, size_t len, char **err_msg) {
     (void)err_msg;
@@ -254,6 +302,47 @@ static bool mock_write(void *handle, const unsigned char *data, size_t len, char
     /* "GET <path> HTTP/1.1" */
     char path[2048] = {0};
     if (sscanf(req, "GET %2047s", path) != 1) { mock_set_response_status(h, 400, "Bad Request"); return true; }
+
+    /* Fake package-registry host (arbitrary third-party host). */
+    if (g_registry_host[0] && strcmp(h->host, g_registry_host) == 0) {
+        if (strcmp(path, g_registry_path) == 0) {
+            mock_set_response_200(h, (const unsigned char*)g_registry_json, strlen(g_registry_json));
+        } else {
+            mock_set_response_status(h, 404, "Not Found");
+        }
+        return true;
+    }
+
+    /* git smart-HTTP ref discovery on github.com. */
+    if (strcmp(h->host, "github.com") == 0) {
+        /* Expect: /<owner>/<repo>.git/info/refs?service=git-upload-pack
+         * Parse owner/repo by hand (repo names may contain dots). */
+        Repo *r = NULL;
+        if (path[0] == '/') {
+            const char *o = path + 1;
+            const char *slash = strchr(o, '/');
+            const char *suffix = strstr(path, ".git/info/refs");
+            if (slash && suffix && suffix > slash) {
+                char owner[128]={0}, repo[128]={0};
+                size_t ol = (size_t)(slash - o);
+                size_t rl = (size_t)(suffix - (slash + 1));
+                if (ol < sizeof(owner) && rl < sizeof(repo)) {
+                    memcpy(owner, o, ol); owner[ol]='\0';
+                    memcpy(repo, slash + 1, rl); repo[rl]='\0';
+                    for (size_t i=0;i<g_nrepos;i++)
+                        if (strcmp(g_repos[i].owner,owner)==0 && strcmp(g_repos[i].repo,repo)==0) { r=&g_repos[i]; break; }
+                }
+            }
+        }
+        if (r) {
+            size_t bl = 0; unsigned char *body = build_info_refs(r, &bl);
+            mock_set_response_200(h, body, bl);
+            free(body);
+        } else {
+            mock_set_response_status(h, 404, "Not Found");
+        }
+        return true;
+    }
 
     if (strcmp(h->host, "api.github.com") == 0) {
         /* /repos/<owner>/<repo>/commits/<ref> */
@@ -538,6 +627,74 @@ static void test_ref_not_found(void) {
     project_leave();
 }
 
+/* Ref resolution now goes through the git smart-HTTP endpoint on github.com
+ * first (avoiding the api.github.com rate limit). Prove it resolves without
+ * ever contacting api.github.com by only serving github.com/info/refs. */
+static void test_git_protocol_resolution(void) {
+    project_enter("gitproto");
+    repos_reset();
+    /* ref "main" is advertised by build_info_refs via refs/heads/main. */
+    make_repo("acme", "json", "main", SHA_A, "acme-json", "acme.json", NULL, 0);
+
+    char sha[41] = {0}; char *err = NULL;
+    bool ok = pkg_fetch_resolve_ref(&g_mock, "acme", "json", "main", sha, &err);
+    CHECK(ok, "gitproto: resolve 'main' via git smart-HTTP");
+    CHECK(strcmp(sha, SHA_A) == 0, "gitproto: resolved to the advertised sha");
+    free(err); err = NULL;
+
+    /* default branch (NULL ref) resolves via the HEAD symref. */
+    char sha2[41] = {0};
+    ok = pkg_fetch_resolve_ref(&g_mock, "acme", "json", NULL, sha2, &err);
+    CHECK(ok, "gitproto: resolve default branch via HEAD symref");
+    CHECK(strcmp(sha2, SHA_A) == 0, "gitproto: default branch sha");
+    free(err); err = NULL;
+
+    /* a full SHA short-circuits with no network at all. */
+    char sha3[41] = {0};
+    ok = pkg_fetch_resolve_ref(&g_mock, "acme", "json", SHA_B, sha3, &err);
+    CHECK(ok && strcmp(sha3, SHA_B) == 0, "gitproto: full sha returned as-is");
+    free(err);
+    project_leave();
+}
+
+/* End-to-end `myon pkg install <owner>/<repo>` via .myon/packages.list. */
+static void test_install_shorthand(void) {
+    project_enter("shorthand");
+    repos_reset();
+    make_repo("acme", "json", "main", SHA_A, "acme-json", "acme.json", NULL, 0);
+
+    /* Point the mock registry host at a JSON array listing acme/json. */
+    snprintf(g_registry_host, sizeof(g_registry_host), "registry.example");
+    snprintf(g_registry_path, sizeof(g_registry_path), "/packages.json");
+    snprintf(g_registry_json, sizeof(g_registry_json), "[\"acme/json\", \"other/thing\"]");
+
+    /* Create .myon/packages.list with the registry URL. */
+    pkg_fs_mkdirs(".myon", NULL);
+    write_file(".myon/packages.list",
+               "# my registries\nhttps://registry.example/packages.json\n");
+
+    int rc = pkg_ops_install_shorthand("acme/json");
+    CHECK(rc == 0, "shorthand: install acme/json succeeds");
+    CHECK(pkg_fs_is_file(".myon/packages/acme-json/package.myon"), "shorthand: package promoted");
+    CHECK(file_contains("myon.toml", SHA_A), "shorthand: manifest pins resolved sha");
+
+    /* A shorthand not present in any registry -> usage error (exit 64). */
+    int rc2 = pkg_ops_install_shorthand("nope/missing");
+    CHECK(rc2 == 64, "shorthand: unknown package -> usage error 64");
+
+    g_registry_host[0] = '\0'; g_registry_path[0]='\0'; g_registry_json[0]='\0';
+    project_leave();
+}
+
+/* Shorthand install with no packages.list at all -> clear usage error. */
+static void test_install_shorthand_no_list(void) {
+    project_enter("nolist");
+    repos_reset();
+    int rc = pkg_ops_install_shorthand("acme/json");
+    CHECK(rc == 64, "shorthand: missing packages.list -> usage error 64");
+    project_leave();
+}
+
 int main(void) {
     pkg_ops_set_transport(&g_mock);
 
@@ -550,6 +707,9 @@ int main(void) {
     test_missing_module_file();
     test_name_mismatch();
     test_ref_not_found();
+    test_git_protocol_resolution();
+    test_install_shorthand();
+    test_install_shorthand_no_list();
 
     pkg_ops_set_transport(NULL);
     repos_reset();
