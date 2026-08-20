@@ -1,0 +1,12 @@
+system myon.useversion=1
+module myon.stdio
+
+// The test harness runs `myon <script>` with no trailing arguments, so
+// myon.argv() must return an empty (but non-nil) str array.
+args = myon.argv()
+myon.print("argc=", args.length())
+// is_tty() is false because the harness pipes stdout to a file.
+myon.print("tty=", myon.is_tty())
+// eprint goes to stderr; the harness compares stdout only, so it must not
+// appear in the golden output below.
+myon.eprint("diagnostic on stderr")

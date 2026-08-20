@@ -17,6 +17,10 @@ Myon は C 実装のツリーウォーク型インタプリタと、バイトコ
 - **豊富な標準ライブラリ** — `myon.math` / `myon.string` / `myon.array` /
   `myon.map` / `myon.time` / `myon.random` / `myon.file` など。文字列は UTF-8
   文字数ベースで扱えます。
+- **CLI ツール制作支援** — 改行なし出力 `myon.write`（`\r` 上書き・プログレスバー
+  向け）、改行付き `myon.println`、明示フラッシュ `myon.flush`、標準エラー出力
+  `myon.eprint`、端末判定 `myon.is_tty`、コマンドライン引数 `myon.argv()`
+  （詳細は [`docs/myon_spec.md`](docs/myon_spec.md) §10.1）。
 - **async/await** — シングルスレッドの協調的イベントループによる非同期処理
   （OS スレッドは使いません）。
 - **ネットワーク** — 低水準ソケット `myon.net`（TCP/UDP、DNS 名前解決対応）と
@@ -99,6 +103,10 @@ Windows ビルドでは Makefile が自動的に出力名を `myon.exe` とし�
 # --- 実行 ---
 ./myon examples/hello.myon          # .myon をツリーウォークで実行
 ./myon examples/hello.myc           # .myc（MVM バイトコード）を VM で実行
+
+# --- スクリプトへ引数を渡す（myon.argv() で受け取る）---
+./myon script.myon --foo bar        # スクリプトパスの後ろは全部スクリプト用引数
+./myon script.myon -- --help -v     # `--` 以降は先頭が `-` でも素通し
 
 # --- MVM バイトコードの生成・確認 ---
 ./myon --compile examples/hello.myon              # hello.myc を書き出す（実行はしない）
@@ -237,6 +245,7 @@ Git 管理する運用を推奨します（本リポジトリの [`.gitignore`](
 | ファイル | 内容 |
 |---|---|
 | `hello.myon` | 変数と `myon.print` の基本 |
+| `cli_progress.myon` | `myon.write`/`flush`/`is_tty`/`eprint`/`argv` を使った進捗バー CLI |
 | `control_flow.myon` | if/elif/else・while・for・break/continue |
 | `http_static_server.myon` | 静的ファイルサーバー（`python -m http.server` 相当） |
 | `http_router_server.myon` | パスに応じて分岐するルーティング＋404 |

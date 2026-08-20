@@ -81,6 +81,7 @@ system module myon ret str char int float bool void error
 myon.if myon.elif myon.else then
 myon.while myon.for myon.in myon.break myon.continue range
 myon.func myon.struct myon.array myon.map myon.print myon.input
+myon.println myon.write myon.eprint myon.flush myon.is_tty myon.argv
 myon.and myon.or myon.not myon.nil myon.expose
 myon.lambda myon.extends self myon.async myon.await
 true false as
@@ -459,6 +460,48 @@ myon.print(y)       // pair() の第2返り値
 ```myon
 name = myon.input("お名前は？")   // str型で受け取る
 myon.print("Hello Worlddd! ", x + "!")
+```
+
+`module myon.stdio` を宣言すると、以下の入出力用組み込み関数が利用できる。
+複数の引数を受け取る出力関数（`print` / `println` / `write` / `eprint`）は、
+各引数を文字列化して順に連結して書き出す（名前付き引数は不可）。
+
+| 関数 | シグネチャ | 説明 |
+|------|-----------|------|
+| `myon.print`   | `myon.print(...) ret void`   | stdout へ出力し、**末尾に改行を付ける**（従来どおり） |
+| `myon.println` | `myon.println(...) ret void` | stdout へ出力し、末尾に改行を付ける（`print` の明示的な別名） |
+| `myon.write`   | `myon.write(...) ret void`   | stdout へ出力し、**改行を付けない**。`\r` による行の上書き（プログレスバー・スピナー）が可能になる |
+| `myon.eprint`  | `myon.eprint(...) ret void`  | **stderr** へ出力し、末尾に改行を付ける。診断・進捗表示を stdout（パイプ加工対象）と分離する |
+| `myon.flush`   | `myon.flush() ret void`      | stdout のバッファを即座に書き出す。`myon.write` で1行を更新し続ける場合に有用 |
+| `myon.is_tty`  | `myon.is_tty() ret bool`     | stdout が対話端末（TTY）に接続されていれば `true`。パイプ・リダイレクト時に ANSI 制御文字を抑制する判断に使う |
+| `myon.input`   | `myon.input(prompt: str) ret str` | prompt を表示して stdin から1行読み込む |
+| `myon.argv`    | `myon.argv() ret myon.array(str)` | スクリプトへ渡されたコマンドライン引数（§10.1.1）を返す。常に配列（空配列もあり得る）を返し、`nil` は返さない |
+
+```myon
+module myon.stdio
+
+// 改行なし出力＋明示フラッシュで、1行を上書きしながら進捗を表示する。
+myon.for i myon.in range(0, 101) {
+    pct = i
+    myon.if myon.is_tty() {
+        myon.write("\r進捗: " + str(pct) + "%")
+        myon.flush()
+    }
+}
+myon.println("")            // 最後に改行して行を確定
+myon.eprint("完了しました")   // ログは stderr へ
+```
+
+### 10.1.1 コマンドライン引数
+
+`myon <script.myon> [args...]` のように、スクリプトパスの後ろに続くトークンは
+そのスクリプト自身の引数として扱われ、`myon.argv()` で読み取れる（先頭が `-`
+でもインタプリタのオプションとしては解釈されない）。明示的に `--` を置くと、
+それ以降のすべてのトークンをスクリプト引数として素通しする。
+
+```sh
+myon build.myon --release out.bin       # argv() => ["--release", "out.bin"]
+myon build.myon -- --help -v            # argv() => ["--help", "-v"]
 ```
 
 ### 10.2 ファイルI/O

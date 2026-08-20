@@ -436,3 +436,30 @@ async/await・`myon.net`／`myon.http`・FFI・ジェネリクス・クロージ
 >   （高階ネイティブメソッド `array.map`/`filter`/`reduce`、`myon.ffi.make_callback`）は
 >   エンジン境界をまたげないため MVM では実行時に明示エラー。`.myon` で実行すること。
 > - 外部モジュール取り込み（`module external.* as ...`）は MVM 非対応（コンパイル時エラー）。
+
+## Phase 8（CLI ツール制作支援 — 標準出力の細分化とスクリプト引数）
+
+`myon.cli` 相当の「CLI ツールを書く」用途を実用可能にするため、標準入出力の
+組み込みとコマンドライン引数の受け渡しを拡充した。実装は `src/interpreter.c`
+（組み込み関数）と `src/main.c`（CLI 引数の素通し）に対称に加えられ、ツリー
+ウォーク実行と MVM バイトコード実行の双方で同一に動作する（ブリッジ
+`myon_bridge_call_native` 経由。`tests/run_mvm_tests.sh` で等価性を回帰確認）。
+
+| 項目 | 内容 | 状態 |
+|---|---|---|
+| 改行なし出力 | `myon.write(...)` を新設（末尾に `\n` を付けない）。`\r` による行の上書き（プログレスバー・スピナー）が可能になる。従来の `myon.print` は改行付きのまま互換維持 | ✅ 実装 |
+| 明示的な改行出力 | `myon.println(...)` を新設（`print` の明示的別名。末尾に改行） | ✅ 実装 |
+| 明示的フラッシュ | `myon.flush() ret void` を新設。stdout のバッファを即時書き出し、`write` での1行更新を確実に反映 | ✅ 実装 |
+| 標準エラー出力 | `myon.eprint(...) ret void` を新設。stderr へ改行付きで出力し、診断・進捗を stdout（パイプ加工対象）と分離 | ✅ 実装 |
+| TTY 判定 | `myon.is_tty() ret bool` を新設。stdout が端末なら true、パイプ・リダイレクト時は false。ANSI 制御文字の抑制判断に使う | ✅ 実装 |
+| スクリプト引数 | CLI 側で `myon <script> [args...]`／`myon <script> -- [args...]` の後続トークンをスクリプト用引数として素通し。言語側は `myon.argv() ret myon.array(str)` で取得（常に配列、`nil` は返さない） | ✅ 実装 |
+
+- `myon.print` の**既存の改行付き挙動は変更していない**（回帰テスト 65 ケースと
+  全 `examples/` の互換性を保つため）。「改行なし出力」は新設の `myon.write` が担う。
+- スクリプト引数はプロセス argv への借用ポインタで保持し、インタプリタ側では
+  解放しない（`interpret_set_script_args()`）。スクリプトパス確定後の全トークン、
+  または `--` 以降の全トークンを引数とし、先頭が `-` でもインタプリタの未知
+  オプションエラーにはしない。
+- 回帰ケース：`tests/cases/p_stdio_writers.*`（`write`/`println`/`print`/`flush`）、
+  `tests/cases/p_argv_empty.*`（引数なし時の空配列・`is_tty` の false・`eprint` の
+  stderr 分離）。いずれもツリーウォーク／MVM の等価性込みで検証。
