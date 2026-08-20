@@ -96,7 +96,7 @@ BINDIR  ?= $(PREFIX)/bin
 DESTDIR ?=
 INSTALL ?= install
 
-.PHONY: all clean test test-mvm test-mvm-equality win-cross asan test-asan install uninstall
+.PHONY: all clean test test-mvm test-mvm-equality test-pkg win-cross asan test-asan install uninstall
 
 all: $(BIN)
 
@@ -184,10 +184,46 @@ $(BUILD):
 # Full test suite.  The existing suites (run order and output format) are kept
 # exactly as before; Step 7-c only appends the .myon/.myc equality suite when
 # it is present (tests/run_mvm_tests.sh), so older checkouts still work.
-test: all
+test: all test-pkg
 	./tests/run_tests.sh
 	./tests/mvm_compiler_tests.sh
 	@if [ -f ./tests/run_mvm_tests.sh ]; then ./tests/run_mvm_tests.sh; fi
+
+# ------------------------------------------------------------------------- #
+# Package-manager C unit / integration tests (spec §11).
+#
+# These are standalone C test programs (not .myon scripts), so they are built
+# and run directly here rather than through the .myon test-runner scripts.
+# All three link the whole package-manager translation-unit set plus the
+# net/tls layer that the fetch layer's default transport references; the
+# resolver/install pipeline is exercised entirely offline through an injected
+# mock transport (spec §11.2), so `make test-pkg` needs no network.
+#
+#   pkg_unit_tests  - manifest / package.myon / lockfile parsers + validators
+#   pkg_zip_tests   - security-first ZIP reader + SHA-256 known-answer tests
+#   pkg_ops_tests   - resolver + `pkg lock` / `install` / `install <url>`
+#
+# A POSIX feature-test macro is defined because the tests (and pkg_fs.c) use
+# strdup / getcwd / mkdir etc.  The tests are compiled with the same strict
+# warning flags as the interpreter.
+PKG_TEST_SRCS = $(SRC_DIR)/package.c $(SRC_DIR)/common.c \
+                $(SRC_DIR)/pkg_hash.c $(SRC_DIR)/pkg_fs.c $(SRC_DIR)/pkg_zip.c \
+                $(SRC_DIR)/pkg_fetch.c $(SRC_DIR)/pkg_ops.c \
+                $(SRC_DIR)/net.c $(SRC_DIR)/tls.c
+PKG_TEST_CFLAGS = $(CFLAGS) -D_POSIX_C_SOURCE=200809L -I$(SRC_DIR)
+PKG_TEST_LDLIBS = -lssl -lcrypto
+ifeq ($(UNAME_S),Linux)
+PKG_TEST_LDLIBS += -ldl
+endif
+
+test-pkg: | $(BUILD)
+	@echo "== Myon package-manager C tests =="
+	$(CC) $(PKG_TEST_CFLAGS) tests/pkg_unit_tests.c $(PKG_TEST_SRCS) -o $(BUILD)/pkg_unit_tests $(PKG_TEST_LDLIBS)
+	$(CC) $(PKG_TEST_CFLAGS) tests/pkg_zip_tests.c  $(PKG_TEST_SRCS) -o $(BUILD)/pkg_zip_tests  $(PKG_TEST_LDLIBS)
+	$(CC) $(PKG_TEST_CFLAGS) tests/pkg_ops_tests.c  $(PKG_TEST_SRCS) -o $(BUILD)/pkg_ops_tests  $(PKG_TEST_LDLIBS)
+	$(BUILD)/pkg_unit_tests
+	$(BUILD)/pkg_zip_tests
+	$(BUILD)/pkg_ops_tests
 
 # Step 5: run only the AST -> MVM bytecode compiler unit tests.
 test-mvm: all

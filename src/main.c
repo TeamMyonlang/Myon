@@ -24,6 +24,7 @@
 #include "mvm_compiler.h"
 #include "mvm_chunk.h"
 #include "mvm_vm.h"
+#include "package.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -99,6 +100,9 @@ static void usage(const char *prog) {
         "  %s --tokens <file.myon>        print the token stream and exit\n"
         "  %s --tokens -                  read source from stdin and print the token stream\n"
         "  %s                             no argument: start the interactive REPL\n"
+        "  %s pkg <command> [args]        manage GitHub-based packages\n"
+        "                                 (install / lock / verify / tree; try\n"
+        "                                 '%s pkg --help')\n"
         "\n"
         "options:\n"
         "  -o <out>                       output path for --compile (default: <src> with .myc)\n"
@@ -116,7 +120,7 @@ static void usage(const char *prog) {
         "  * --run-mvm <src> compiles a .myon in memory and runs it on the MVM VM.\n"
         "    It is an internal cross-check used by the .myon/.myc equality test suite\n"
         "    (tests/run_mvm_tests.sh); normal execution does not need it.\n",
-        prog, prog, prog, prog, prog, prog, prog);
+        prog, prog, prog, prog, prog, prog, prog, prog, prog);
 }
 
 /*
@@ -557,6 +561,18 @@ static int check_myc_stale(const Module *m, const char *myc_path, int strict) {
 int main(int argc, char **argv) {
     /* Ensure LF stays LF on Windows (see myon_set_stdio_binary above). */
     myon_set_stdio_binary();
+
+    /*
+     * Package manager subcommand (spec §5): `myon pkg <command> [args]`.
+     * "pkg" is reserved as the first positional token.  A real file called
+     * "pkg" is vanishingly unlikely and would in any case have an extension;
+     * dispatching here keeps the existing `myon <file>` handling untouched for
+     * every other first argument.  We hand pkg_cli_main everything AFTER the
+     * "pkg" token.
+     */
+    if (argc >= 2 && strcmp(argv[1], "pkg") == 0) {
+        return pkg_cli_main(argc - 2, argv + 2);
+    }
 
     int tokens_only = 0;
     int strict_stale = 0;
