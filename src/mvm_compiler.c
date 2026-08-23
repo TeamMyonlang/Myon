@@ -1156,7 +1156,7 @@ static void compile_stmt(Compiler *c, Stmt *s) {
              * code is emitted, matching the tree-walker.  *External* modules
              * (`module external.*`), however, must actually load and inject
              * their definitions; the MVM backend does not yet implement that
-             * (see docs/known-issues.md).  Previously these were silently
+             * (see ../known-issues.md).  Previously these were silently
              * skipped, so any use of an external symbol later compiled to an
              * "undefined" error or, worse, produced a .myc that behaved
              * differently from the .myon.  Reject them explicitly instead so

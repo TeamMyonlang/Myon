@@ -15,8 +15,10 @@ Myon は C 実装のツリーウォーク型インタプリタと、バイトコ
 - **わかりやすいエラー** — 構文・実行時エラーは行番号・列番号・ソース抜粋・`^`
   マーカー付きで表示されます。
 - **豊富な標準ライブラリ** — `myon.math` / `myon.string` / `myon.array` /
-  `myon.map` / `myon.time` / `myon.random` / `myon.file` など。文字列は UTF-8
-  文字数ベースで扱えます。
+  `myon.map` / `myon.time` / `myon.random` / `myon.file` など。文字列の
+  `substring` / `index_of` など索引系は UTF-8 文字数ベースで安全に扱えます
+  （`length` はバイト数、文字数は `length_chars`）。乱数は高速な `myon.random.int`
+  と、OS の CSPRNG を使う暗号学的に安全な `myon.random.secure_int` の 2 系統。
 - **CLI ツール制作支援** — 改行なし出力 `myon.write`（`\r` 上書き・プログレスバー
   向け）、改行付き `myon.println`、明示フラッシュ `myon.flush`、標準エラー出力
   `myon.eprint`、端末判定 `myon.is_tty`、コマンドライン引数 `myon.argv()`
@@ -25,9 +27,12 @@ Myon は C 実装のツリーウォーク型インタプリタと、バイトコ
   （OS スレッドは使いません）。
 - **ネットワーク** — 低水準ソケット `myon.net`（TCP/UDP、DNS 名前解決対応）と
   簡易 HTTP モジュール `myon.http`（静的配信・ルーティング・HTTP/HTTPS クライアント）。
-- **C FFI** — `dlopen`/`LoadLibrary` 経由で外部の共有ライブラリ（`.so`/`.dll`）の
-  C 関数を呼び出せます。構造体レイアウト DSL やコールバックにも対応。
+- **C FFI** — `dlopen`/`LoadLibrary` 経由で外部の共有ライブラリ
+  （`.so`/`.dylib`/`.dll`）の C 関数を呼び出せます。構造体レイアウト DSL や
+  コールバックにも対応。
 - **2 つの実行経路** — ツリーウォーク実行と、`.myc` バイトコードの MVM VM 実行。
+- **クロスプラットフォーム** — Linux / macOS / Windows で実機ビルド・テスト済み。
+  プラットフォーム判定は `src/platform.h` に一元化しています。
 
 各機能の詳細な実装状況・開発の歩みは [`docs/features.md`](docs/features.md) を、
 言語仕様の正式な定義は [`docs/myon_spec.md`](docs/myon_spec.md)（言語仕様）と
@@ -280,14 +285,27 @@ Git 管理する運用を推奨します（本リポジトリの [`.gitignore`](
 make test
 ```
 
-`tests/cases/` 以下の `*.myon` を実行し、`*.out`（期待出力）または `*.err`
-（エラー終了を期待）と比較します。あわせて `.myon`／`.myc` の等価性検証スイート
-（`tests/run_mvm_tests.sh`）も実行され、ツリーウォーク実行と MVM バイトコード実行の
-出力一致を確認します。
+`make test` は次の 4 つのスイートを順に実行します。
+
+| スイート | 内容 |
+|---|---|
+| パッケージマネージャの C 単体テスト | `tests/pkg_unit_tests.c` / `pkg_zip_tests.c` / `pkg_ops_tests.c` |
+| メインスイート | `tests/cases/` 以下の `*.myon` を実行し、`*.out`（期待出力）または `*.err`（エラー終了を期待）と比較 |
+| MVM コンパイラテスト | バイトコード生成の検証 |
+| 等価性スイート | ツリーウォーク実行と MVM バイトコード実行の出力一致を確認 |
+
+個別に実行したい場合は次のターゲットが使えます。
+
+```sh
+make test-pkg           # パッケージマネージャの C 単体テストのみ
+make test-mvm           # MVM コンパイラテストのみ
+make test-mvm-equality  # `.myon`／`.myc` 等価性スイートのみ
+```
 
 > FFI（`libm`/`libz` 等を要する）やネットワーク（ソケットを開く）を伴う一部ケースは、
 > 実行環境によってはテストハーネスが自動的に除外します。除外は失敗ではなく、対応
-> ライブラリ・権限のある環境ではパスします。
+> ライブラリ・権限のある環境ではパスします。また `.so` 名を直書きしている FFI
+> ケースは Linux 以外ではスキップされます。
 
 ### Sanitizer（ASan/UBSan）テスト
 
@@ -312,13 +330,16 @@ GitHub Actions で以下のワークフローを用意しています（`.github
 | ワークフロー | トリガー | 内容 |
 |---|---|---|
 | `ci.yml` | push(main) / PR | gcc・clang の 2 系統で `make` + `make test`（軽量な毎コミットチェック） |
-| `heavy-checks.yml` | push(main) / 手動 | sanitizer（`make test-asan`）、Windows クロスビルド、ベンチマーク、macOS ビルド確認 |
-| `release.yml` | 手動のみ | Linux `myon` と Windows `myon.exe` を配布リリースとして公開 |
+| `heavy-checks.yml` | push(main) / 手動 | sanitizer（`make test-asan`）、Windows クロスビルド、Windows 実機ビルド＋テスト、macOS 実機ビルド＋テスト、ベンチマーク |
+| `release.yml` | 手動のみ | Linux / Windows / macOS の 3 種のバイナリを配布リリースとして公開 |
 
-- **heavy-checks** は重いジョブ群です。Windows クロスビルドは MinGW-w64 で
-  Windows 版 OpenSSL をソースからクロスビルド（`actions/cache` でキャッシュ）し、
-  `-lcrypt32` を含めてリンクします。macOS ジョブは、現状 `src/ffi_platform.c` の
-  macOS 分岐が FFI 未対応スタブのため**ビルド確認のみ**です。
+- **heavy-checks** は重いジョブ群です。
+  - **win-cross**：MinGW-w64 で Windows 版 OpenSSL をソースからクロスビルド
+    （`actions/cache` でキャッシュ）し、`-lcrypt32` を含めてリンクします。
+  - **win-native**：`windows-latest` ランナー上の MSYS2 で実機ビルドし、
+    テストスイートを実行します。
+  - **macos-native**：`macos-15`（Apple Silicon）で実機ビルドし、`make test` を
+    実行します（ビルド確認だけではありません）。
 - **benchmark** ジョブはリリース公開に依存しない独立ジョブで、計測結果を
   artifact として保存します。
 
@@ -330,8 +351,13 @@ GitHub Actions で以下のワークフローを用意しています（`.github
 - **開発版**（タグに `-dev.` を含む 例: `v1.3.0-dev.20260818.1`）は
   開発中のスナップショットで、既知バグを含む・不安定な可能性があります。
 
-各リリースには Linux 版 `myon-linux-x86_64` と Windows 版
-`myon-windows-x86_64.exe` の両方が添付され、ログイン不要でダウンロードできます。
+各リリースには次の 3 つのバイナリが添付され、ログイン不要でダウンロードできます。
+
+| ファイル名 | 対象 |
+|---|---|
+| `myon-linux-x86_64` | Linux (x86_64) |
+| `myon-windows-x86_64.exe` | Windows (x86_64) |
+| `myon-macos-arm64` | macOS (Apple Silicon) |
 
 リリースはメンテナが `release.yml` を手動実行し、`pre`／`stable` とバージョン番号
 （`X.Y.Z`）を指定して発行します。`pre` はタグに日付＋連番が付与され、
@@ -341,6 +367,7 @@ GitHub 上で pre-release バッジが付きます。
 
 ```
 src/
+  platform.h         プラットフォーム判定・機能マクロの一元管理（MYON_OS_* / MYON_HAVE_*）
   token.{h,c}        トークン定義
   lexer.{h,c}        字句解析器
   types.{h,c}        型システム
@@ -351,33 +378,47 @@ src/
   interpreter.{h,c}  ツリーウォーク型インタプリタ
   common.{h,c}       共通ユーティリティ（メモリ確保・文字列複製）
   diag.{h,c}         診断ヘルパー（ソース抜粋・列番号・トークン名変換）
-  ffi_platform.{h,c} C FFI プラットフォーム抽象化層（dlopen ｜ Windows: LoadLibrary）
+  ffi_platform.{h,c} C FFI プラットフォーム抽象化層（POSIX: dlopen ｜ Windows: LoadLibrary）
   ffi.{h,c}          C FFI 型・ハンドル管理レイヤ
   ffi_call.{h,c}     C FFI 呼び出しディスパッチ（libffi 不使用）
   ffi_callback.{h,c} C FFI コールバック（静的トランポリン）
-  event_loop.{h,c}   協調的イベントループ（Linux: ucontext ｜ Windows: Win32 Fiber）
-  net.{h,c}          低水準ソケット myon.net（Linux ｜ Windows: Winsock2）
+  event_loop.{h,c}   協調的イベントループ（POSIX: ucontext ｜ Windows: Win32 Fiber）
+  net.{h,c}          低水準ソケット myon.net（POSIX ソケット ｜ Windows: Winsock2）
   http.{h,c}         簡易 HTTP モジュール myon.http
-  tls.{h,c}          HTTPS/TLS ラッパ（OpenSSL）
+  tls.{h,c}          HTTPS/TLS クライアント（OpenSSL、フェイルクローズ検証）
+  package.{h,c}      パッケージマニフェスト（myon.toml / myon.lock / package.myon）
+  pkg_fetch.{h,c}    GitHub からの archive 取得（myon.http とは独立した HTTPS GET）
+  pkg_fs.{h,c}       インストール先のファイル操作（staging → atomic 反映）
+  pkg_hash.{h,c}     SHA-256（OpenSSL EVP）
+  pkg_ops.{h,c}      install / lock / verify / tree の依存解決ロジック
+  pkg_zip.{h,c}      安全性優先の ZIP 展開（ZIP Slip・symlink・展開爆弾を拒否）
   mvm_bytecode.h     MVM オペコード定義
   mvm_chunk.{h,c}    MVM チャンク・定数プール・`.myc` シリアライズ
   mvm_compiler.{h,c} AST→MVM バイトコードコンパイラ
   mvm_vm.{h,c}       MVM バイトコード VM ランタイム
-  main.c             エントリポイント（CLI 解析・.myon/.myc 振り分け・REPL）
+  main.c             エントリポイント（CLI 解析・.myon/.myc 振り分け・REPL・myon pkg）
 examples/            サンプルプログラム
 docs/                言語仕様・機能一覧
   myon_spec.md       言語仕様
   mvm_spec.md        MVM バイトコード仕様
   features.md        機能一覧・実装状況・開発の歩み
+  package_manager.md パッケージ管理の仕様・内部実装
+  package_development.md  パッケージ開発者向けガイド
 tests/               回帰テスト（`make test`）
   cases/             `.myon`／`.out`／`.err` の回帰ケース
-  run_tests.sh       ケース実行ハーネス
-  run_mvm_tests.sh   `.myon`／`.myc` 等価性検証スイート
-  bench_mvm.sh       ベンチマーク（`BENCH_FIB` / `BENCH_LOOP` で負荷調整）
+  fixtures/          テスト用の C ソース・パッケージ雛形
+  run_tests.sh          メインのケース実行ハーネス
+  mvm_compiler_tests.sh MVM コンパイラ（バイトコード生成）テスト
+  run_mvm_tests.sh      `.myon`／`.myc` 等価性検証スイート
+  pkg_unit_tests.c      パッケージマニフェスト・パースの C 単体テスト
+  pkg_zip_tests.c       ZIP 展開の安全性テスト
+  pkg_ops_tests.c       依存解決ロジックのテスト
+  bench_mvm.sh          ベンチマーク（`BENCH_FIB` / `BENCH_LOOP` で負荷調整）
+known-issues.md      既知の制限事項
 .github/workflows/   GitHub Actions
   ci.yml             push(main)/PR の gcc・clang ビルド＋テスト
-  heavy-checks.yml   sanitizer／Windows クロス／ベンチ／macOS ビルド
-  release.yml        手動リリース（Linux/Windows バイナリを Releases に公開）
+  heavy-checks.yml   sanitizer／Windows クロス・実機／macOS 実機／ベンチ
+  release.yml        手動リリース（Linux/Windows/macOS バイナリを Releases に公開）
 ```
 
 ## ドキュメント

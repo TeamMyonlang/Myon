@@ -82,7 +82,7 @@ struct Task {
     void       *ud;
 
     TaskState   state;
-    myon_fd_t   waiting_fd;        /* WAITING_IO fd being watched (known-issue #5) */
+    myon_fd_t   waiting_fd;        /* WAITING_IO fd being watched (native-width fd) */
     int         waiting_for_write; /* 0=read, 1=write                  */
     long long   wake_at_ms;        /* absolute wake time, 0 if unused  */
     Task       *waiting_on;        /* WAITING_TASK target              */
@@ -370,7 +370,7 @@ int event_loop_run_once(EventLoop *loop) {
     for (Task *t = loop->tasks; t; t = t->next) {
         if (t->state != TASK_WAITING_IO) continue;
         if (t->waiting_fd >= 0) {
-            /* known-issue #5: waiting_fd is myon_fd_t; a POSIX fd fits in int,
+            /* fd width: waiting_fd is myon_fd_t; a POSIX fd fits in int,
              * which is what FD_SET/select() require. */
             int wfd = (int)t->waiting_fd;
             if (t->waiting_for_write) FD_SET(wfd, &wfds);
@@ -415,7 +415,7 @@ int event_loop_run_once(EventLoop *loop) {
     /* Mark tasks whose fd is ready as READY. */
     for (Task *t = loop->tasks; t; t = t->next) {
         if (t->state != TASK_WAITING_IO || t->waiting_fd < 0) continue;
-        int rfd = (int)t->waiting_fd; /* known-issue #5: POSIX fd fits in int */
+        int rfd = (int)t->waiting_fd; /* fd width: POSIX fd fits in int */
         int ready_now = t->waiting_for_write ? FD_ISSET(rfd, &wfds)
                                              : FD_ISSET(rfd, &rfds);
         if (ready_now) t->state = TASK_READY;
@@ -511,7 +511,7 @@ struct Task {
     void       *ud;
 
     TaskState   state;
-    myon_fd_t   waiting_fd;        /* WAITING_IO fd being watched (known-issue #5) */
+    myon_fd_t   waiting_fd;        /* WAITING_IO fd being watched (native-width fd) */
     int         waiting_for_write; /* 0=read, 1=write                  */
     long long   wake_at_ms;        /* absolute wake time, 0 if unused  */
     Task       *waiting_on;        /* WAITING_TASK target              */
@@ -550,7 +550,7 @@ struct EventLoop {
  * fd to Winsock (FD_SET and FD_ISSET).
  */
 static SOCKET fd_to_socket(myon_fd_t fd) {
-    /* known-issue #5: fd is now intptr_t-wide, so the full SOCKET value is
+    /* fd width: fd is now intptr_t-wide, so the full SOCKET value is
      * present -- no zero-extension-from-int reconstruction is needed. */
     return (SOCKET)(UINT_PTR)fd;
 }

@@ -126,14 +126,13 @@ static void usage(const char *prog) {
 }
 
 /*
- * Step 5 helper: parse a .myon source file into a Program.  Shared by the
- * --compile and --dump-bytecode paths.  Returns a Program (caller frees with
- * program_free) plus the TokenList (out param, caller frees) and the source
- * buffer (out param, caller frees).  Returns NULL on error.
+ * Parse a .myon source file into a Program.  Shared by the --compile and
+ * --dump-bytecode paths.  Returns a Program (caller frees with program_free)
+ * plus the TokenList (out param, caller frees) and the source buffer
+ * (out param, caller frees).  Returns NULL on error.
  *
  * NOTE: this is an additive path; it does not touch the tree-walking
- * interpreter used for `.myon` execution (docs/mvm_spec.md §9.2 defers the
- * final CLI wiring to Step 7).
+ * interpreter used for `.myon` execution.
  */
 static Program *load_program(const char *path, char **out_source, TokenList *out_tokens) {
     char *source = read_file(path);
@@ -155,7 +154,7 @@ static Program *load_program(const char *path, char **out_source, TokenList *out
     return program;
 }
 
-/* Derive a default output name: foo.myon -> foo.myc (Step 5 / spec §9.2). */
+/* Derive a default output name: foo.myon -> foo.myc (mvm_spec.md §9.2). */
 static char *default_myc_name(const char *src) {
     size_t n = strlen(src);
     const char *dot = strrchr(src, '.');
@@ -239,7 +238,7 @@ static int cmd_dump_bytecode(const char *src) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Step 6: run a compiled .myc through the MVM bytecode VM.            */
+/* Run a compiled .myc through the MVM bytecode VM.                    */
 /* ------------------------------------------------------------------ */
 
 /*
@@ -265,7 +264,7 @@ static int looks_like_myc(const char *path) {
  * A reloaded .myc carries no struct/method declarations (those live in the
  * AST, not the bytecode), so `program` is NULL here and any struct opcode
  * raises a clear runtime error — matching the limitation documented in
- * mvm_vm.h / the Step 6 report.  Source snippets are unavailable for a
+ * mvm_vm.h.  Source snippets are unavailable for a
  * reloaded module, so runtime errors show the line number only.
  */
 static int check_myc_stale(const Module *m, const char *myc_path, int strict);
@@ -289,7 +288,7 @@ static int cmd_run_myc(const char *path, int strict_stale) {
 }
 
 /*
- * Step 7-b: compile a .myon in memory and immediately execute it on the MVM
+ * Compile a .myon in memory and immediately execute it on the MVM
  * bytecode VM, keeping the parsed Program (and thus struct/method
  * declarations, plus the source text for diagnostics) available to the VM.
  *
@@ -579,7 +578,7 @@ int main(int argc, char **argv) {
     int tokens_only = 0;
     int strict_stale = 0;
     const char *path = NULL;
-    /* Step 5 (additive): MVM compile / disassemble subcommands. */
+    /* MVM compile / disassemble subcommands (additive). */
     const char *compile_src = NULL;
     const char *compile_out = NULL;
     const char *dump_src = NULL;
@@ -660,7 +659,7 @@ int main(int argc, char **argv) {
     if (!path) { usage(argv[0]); return 64; }
 
     /*
-     * Step 6: a compiled .myc runs on the MVM bytecode VM; a .myon (or any
+     * A compiled .myc runs on the MVM bytecode VM; a .myon (or any
      * other source) keeps the unchanged tree-walking path below.  stdin ("-")
      * is always treated as source.
      */
