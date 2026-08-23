@@ -1961,7 +1961,7 @@ static void random_ensure_seeded(Interp *it) {
 /* Fill `buf` with `n` cryptographically-secure random bytes from the OS CSPRNG.
  * Returns 0 on success, -1 on failure.  This backs myon.random.secure_int,
  * which (unlike the srand/rand-based helpers above) is safe for tokens/keys
- * (addresses known-issue.md "myon.random is not cryptographically safe").
+ * (addresses the historical known-issue "myon.random is not cryptographically safe").
  * macOS/BSD: arc4random_buf() (the OS CSPRNG; cannot fail, no fd needed).
  * Linux and other POSIX targets: read from /dev/urandom (portable across
  * kernels without pulling in <sys/random.h>/getrandom feature-test macros).
@@ -2040,7 +2040,7 @@ static int call_random(Interp *it, Env *env, const char *name, Expr *call, Value
     /* myon.random.secure_int(lo, hi) ret int, error — inclusive on both ends.
      * Crypto-safe (OS CSPRNG) counterpart to myon.random.int; uses unbiased
      * rejection sampling so every value in [lo, hi] is equiprobable.  Suitable
-     * for tokens/keys/nonces (known-issue.md #6). */
+     * for tokens/keys/nonces (OS CSPRNG). */
     if (strcmp(name, "myon.random.secure_int") == 0) {
         Value lo = eval_arg(it, env, call, 0), hi = eval_arg(it, env, call, 1);
         if (lo.type != TYPE_INT || hi.type != TYPE_INT) {
@@ -2106,7 +2106,7 @@ static void net_wait_fd(Interp *it, myon_fd_t fd, int for_write) {
     }
     /* synchronous fallback: block on just this fd */
 #if defined(MYON_OS_POSIX)
-    /* known-issue #5: fd is myon_fd_t; a POSIX fd fits back into int for
+    /* fd width: fd is myon_fd_t; a POSIX fd fits back into int for
      * FD_SET/select() (widening was lossless, so this narrowing is safe). */
     int ifd = (int)fd;
     fd_set fds; FD_ZERO(&fds); FD_SET(ifd, &fds);
@@ -2175,7 +2175,7 @@ static int call_net(Interp *it, Env *env, const char *name, Expr *call, Value *o
     if (strcmp(name, "myon.net.accept") == 0) {
         Value a = eval_arg(it, env, call, 0);
         int lid = (int)a.as.i; value_free(&a);
-        myon_fd_t lfd = net_raw_fd(st, lid); /* known-issue #5 */
+        myon_fd_t lfd = net_raw_fd(st, lid); /* native-width fd */
         for (;;) {
             char *peer = NULL, *err = NULL;
             int cid = net_try_accept(st, lid, &peer, &err);
@@ -2190,7 +2190,7 @@ static int call_net(Interp *it, Env *env, const char *name, Expr *call, Value *o
     if (strcmp(name, "myon.net.connect") == 0) {
         Value a = eval_arg(it, env, call, 0), b = eval_arg(it, env, call, 1), c = eval_arg(it, env, call, 2);
         int sid = (int)a.as.i; const char *host = b.as.obj ? b.as.obj->as.str : ""; int port = (int)c.as.i;
-        myon_fd_t fd = net_raw_fd(st, sid); /* known-issue #5 */
+        myon_fd_t fd = net_raw_fd(st, sid); /* native-width fd */
         char *err = NULL;
         int rc = net_connect(st, sid, host, port, &err);
         while (rc == -2) {
@@ -2206,7 +2206,7 @@ static int call_net(Interp *it, Env *env, const char *name, Expr *call, Value *o
     if (strcmp(name, "myon.net.send") == 0) {
         Value a = eval_arg(it, env, call, 0), b = eval_arg(it, env, call, 1);
         int sid = (int)a.as.i; const char *data = b.as.obj ? b.as.obj->as.str : "";
-        long long len = (long long)strlen(data); myon_fd_t fd = net_raw_fd(st, sid); /* known-issue #5 */
+        long long len = (long long)strlen(data); myon_fd_t fd = net_raw_fd(st, sid); /* native-width fd */
         char *err = NULL; long long n;
         for (;;) {
             n = net_send(st, sid, data, len, &err);
@@ -2221,7 +2221,7 @@ static int call_net(Interp *it, Env *env, const char *name, Expr *call, Value *o
 
     if (strcmp(name, "myon.net.recv") == 0) {
         Value a = eval_arg(it, env, call, 0), b = eval_arg(it, env, call, 1);
-        int sid = (int)a.as.i; long long maxlen = b.as.i; myon_fd_t fd = net_raw_fd(st, sid); /* known-issue #5 */
+        int sid = (int)a.as.i; long long maxlen = b.as.i; myon_fd_t fd = net_raw_fd(st, sid); /* native-width fd */
         value_free(&a); value_free(&b);
         if (maxlen <= 0) maxlen = 4096;
         char *buf = (char *)myon_xmalloc((size_t)maxlen + 1);
@@ -2245,7 +2245,7 @@ static int call_net(Interp *it, Env *env, const char *name, Expr *call, Value *o
         int sid = (int)a.as.i; const char *data = b.as.obj ? b.as.obj->as.str : "";
         long long len = (long long)strlen(data);
         const char *host = c.as.obj ? c.as.obj->as.str : ""; int port = (int)d.as.i;
-        myon_fd_t fd = net_raw_fd(st, sid); /* known-issue #5 */
+        myon_fd_t fd = net_raw_fd(st, sid); /* native-width fd */
         char *err = NULL; long long n;
         for (;;) { n = net_sendto(st, sid, data, len, host, port, &err); if (n == -2) { net_wait_fd(it, fd, 1); continue; } break; }
         value_free(&a); value_free(&b); value_free(&c); value_free(&d);
@@ -2256,7 +2256,7 @@ static int call_net(Interp *it, Env *env, const char *name, Expr *call, Value *o
 
     if (strcmp(name, "myon.net.recv_from") == 0) {
         Value a = eval_arg(it, env, call, 0), b = eval_arg(it, env, call, 1);
-        int sid = (int)a.as.i; long long maxlen = b.as.i; myon_fd_t fd = net_raw_fd(st, sid); /* known-issue #5 */
+        int sid = (int)a.as.i; long long maxlen = b.as.i; myon_fd_t fd = net_raw_fd(st, sid); /* native-width fd */
         value_free(&a); value_free(&b);
         if (maxlen <= 0) maxlen = 4096;
         char *buf = (char *)myon_xmalloc((size_t)maxlen + 1);
@@ -3619,7 +3619,7 @@ static Value await_task(Interp *it, int line, Value taskv) {
  * Returns 0 and fills *req on success; -1 on error/EOF (req untouched). */
 static int http_read_request(Interp *it, NetState *st, int sock_id,
                              HttpRequest *req) {
-    myon_fd_t fd = net_raw_fd(st, sock_id); /* known-issue #5 */
+    myon_fd_t fd = net_raw_fd(st, sock_id); /* native-width fd */
     size_t cap = 4096, len = 0;
     char *buf = (char *)myon_xmalloc(cap);
     size_t header_end = 0;
@@ -3683,7 +3683,7 @@ static int http_read_request(Interp *it, NetState *st, int sock_id,
 /* Send all `len` bytes on a socket, yielding on EWOULDBLOCK. */
 static void http_send_all(Interp *it, NetState *st, int sock_id,
                           const char *data, size_t len) {
-    myon_fd_t fd = net_raw_fd(st, sock_id); /* known-issue #5 */
+    myon_fd_t fd = net_raw_fd(st, sock_id); /* native-width fd */
     size_t off = 0;
     while (off < len) {
         char *err = NULL;
@@ -3698,7 +3698,7 @@ static void http_send_all(Interp *it, NetState *st, int sock_id,
 /* Like http_send_all, but over a TLS session.  `fd` is the underlying raw
  * socket fd, used only to wait for writability when the TLS layer would
  * block. */
-static void tls_send_all(Interp *it, TlsConn *tls, myon_fd_t fd, /* known-issue #5 */
+static void tls_send_all(Interp *it, TlsConn *tls, myon_fd_t fd, /* native-width fd */
                          const char *data, size_t len) {
     size_t off = 0;
     while (off < len) {
@@ -3727,7 +3727,7 @@ static void http_serve_static_conn(Interp *it, NetState *st, int conn_id,
         int is_regular = 1;
 #if defined(MYON_OS_POSIX)
         /* Only serve regular files: fopen("rb") on a directory or special
-         * file makes ftell() indeterminate (known-issue.md #3).  stat() +
+         * file makes ftell() indeterminate (historical bug).  stat() +
          * S_ISREG() rejects directories/FIFOs/devices up front. */
         {
             struct stat sb;
@@ -3784,7 +3784,7 @@ static void http_conn_task_entry(void *ud) {
     if (http_read_request(it, c->st, c->conn_id, &req) == 0) {
         char *body_out = NULL;
         /* Response status/content-type are controllable by the handler
-         * (known-issue.md #2).  A plain str return keeps the historical
+         * (bounded handler output).  A plain str return keeps the historical
          * 200 OK / text/plain default; returning an array lets the handler
          * override them:
          *   [body]                        -> 200, text/plain
@@ -3888,7 +3888,7 @@ static void http_accept_loop_entry(void *ud) {
     Task *prev = it->current_task;
     it->current_task = sc->task;
 
-    myon_fd_t lfd = net_raw_fd(st, sc->lsock); /* known-issue #5 */
+    myon_fd_t lfd = net_raw_fd(st, sc->lsock); /* native-width fd */
     for (;;) {
         char *peer = NULL, *aerr = NULL;
         int cid = net_try_accept(st, sc->lsock, &peer, &aerr);
@@ -4007,7 +4007,7 @@ static int http_parse_url(const char *url, char **host_out, int *port_out,
     const char *port_str = NULL; size_t port_len = 0;
 
     if (p < hostend && *p == '[') {
-        /* IPv6 literal: "[::1]" or "[::1]:8080" (known-issue.md #4).  The host
+        /* IPv6 literal: "[::1]" or "[::1]:8080" (historical bug).  The host
          * is everything between the brackets; a ':' inside must not be treated
          * as the port separator. */
         const char *rb = memchr(p, ']', (size_t)(hostend - p));
@@ -4114,7 +4114,7 @@ static Value http_client_request(Interp *it, int line, const char *url,
         free(host); free(path);
         return tup;
     }
-    myon_fd_t fd = net_raw_fd(st, sock); /* known-issue #5 */
+    myon_fd_t fd = net_raw_fd(st, sock); /* native-width fd */
 
     /* connect (non-blocking, yield/loop until complete) */
     int rc = net_connect(st, sock, host, port, &err);

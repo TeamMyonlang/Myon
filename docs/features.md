@@ -8,15 +8,27 @@
 
 ## 実装状況の検証方法
 
-`make test` により、下表の各ステップ・項目に対応する回帰テスト（`tests/cases/`
-以下の `.myon` ケース群。現在 59 ケース）がすべてパスします。加えて Phase 7 で
-`.myon`／`.myc` の等価性検証スイート（`tests/run_mvm_tests.sh`）も `make test` に
-統合されており、ツリーウォーク実行と MVM バイトコード実行の出力一致を確認します。
+`make test` により、下表の各ステップ・項目に対応する回帰テストがすべてパスします。
+`make test` は次の 4 つのスイートを順に実行します。
+
+| スイート | 内容 |
+|---|---|
+| パッケージマネージャの C 単体テスト | `tests/pkg_unit_tests.c` / `pkg_zip_tests.c` / `pkg_ops_tests.c` |
+| メインスイート（`tests/run_tests.sh`） | `tests/cases/` 以下の `.myon` ケース群（現在 73 ファイル）＋ CLI・パッケージ取り込みの検証 |
+| MVM コンパイラテスト（`tests/mvm_compiler_tests.sh`） | バイトコード生成の検証 |
+| `.myon`／`.myc` 等価性スイート（`tests/run_mvm_tests.sh`） | ツリーウォーク実行と MVM バイトコード実行の出力一致 |
+
+> **正確なケース数は環境で変わります**：ハーネスは 1 ファイルから複数の
+> アサーションを走らせたり、環境依存ケースを除外したりするため、
+> 「合格件数」はファイル数と一致しません。最新の数値は手元で `make test` を
+> 実行して確認してください。
 
 > **環境依存ケースの扱い**：FFI（`libm`/`libz` 等の共有ライブラリを要する）や
 > ネットワーク（ソケットを開く）を伴う一部ケースは、実行環境によってはテスト
 > ハーネスが自動的に除外（excluded）します。除外されたケースは失敗ではなく、
-> 対応ライブラリ・権限のある環境で実行するとパスします。
+> 対応ライブラリ・権限のある環境で実行するとパスします。また `.so` 名を
+> ハードコードした FFI ケースは Linux 以外ではスキップされます
+> （`tests/run_tests.sh` の `LINUX_ONLY_SO_CASES`）。
 
 ## Step 0〜18（コア実装）
 
@@ -98,8 +110,11 @@ Phase 3.1 では、Myon 側から C に渡すための生メモリ領域を確�
 
 `module myon.ffi` を宣言すると、ビルド済みの共有ライブラリ（Linux の `.so` など）に
 含まれる C 関数を実行時に呼び出せます。対応する値の型は `int` / `float` / ポインタ（`int`
-として表現）/ `str` の4種類で、構造体の値渡し・値返しは対象外です。対応 OS は Linux
-（macOS / Windows は `myon.ffi.load` 時に「未対応」の `error` を返すスタブ）。詳細と制約は
+として表現）/ `str` の4種類で、構造体の値渡し・値返しは対象外です。
+対応 OS は **Linux / macOS / \*BSD（`dlopen` 系）と Windows（`LoadLibraryA` 系）**
+で、それ以外では `myon.ffi.load` が「FFI is not supported on this platform」の
+`error` を返すスタブになります（当初は Linux のみで、Windows は Phase 6、
+macOS / \*BSD は `src/platform.h` 導入時に対応しました）。詳細と制約は
 仕様書 [`myon_spec.md`](myon_spec.md) の「10.3 C FFI」節を参照してください。
 テストは環境非依存の `libm`（数学ライブラリ）を用います（`tests/cases/p_ffi_basic`,
 `tests/cases/p_ffi_load_fail`, `tests/cases/p_ffi_close`）。SDL2 を使った非対話デモは
@@ -113,7 +128,7 @@ Step 16 で最小実装した標準ライブラリ `myon.math` / `myon.string` �
 | ステップ | 内容 | 状態 |
 |---|---|---|
 | Step 1 | 数値型保持ルールの統一（`max`/`min`/`floor`/`ceil` を int/float パスへ分岐、`both_int` ヘルパー、2^53超の int64 を正確に扱う） | ✅ 実装 |
-| Step 2 | `myon.string.length` を UTF-8 文字数（コードポイント数）へ修正、`byte_length` を新設（`utf8_char_count`） | ✅ 実装 |
+| Step 2 | UTF-8 文字数（コードポイント数）を返す `myon.string.length_chars` を新設（`utf8_char_count`）。`length` は後方互換のためバイト数のまま維持 | ✅ 実装 |
 | Step 3 | `myon.math` フルセット（三角/逆三角/`atan2`・`log`/`log2`/`log10`/`exp`・`round`/`trunc`/`mod`/`sign`/`clamp`・`pi`/`e`） | ✅ 実装 |
 | Step 4 | `myon.string` フルセット（`substring`/`split`/`join`/`trim`/`replace`/`index_of`/`starts_with`/`ends_with`/`repeat`/`to_int`/`to_float`/`from_int`/`from_float`、`utf8_byte_offset`） | ✅ 実装 |
 | Step 5 | 回帰テスト・ドキュメント整備 | ✅ 実装 |
@@ -121,8 +136,9 @@ Step 16 で最小実装した標準ライブラリ `myon.math` / `myon.string` �
 数値関数は「全引数が int なら int、1つでも float なら float」という暗黙昇格ルールに
 統一しました。整数のまま意味が保たれる関数（`abs`/`max`/`min`/`floor`/`ceil`/`round`/
 `trunc`/`mod`/`sign`/`clamp`）は `double` を経由せず、`2^53` を超える `int64` 値でも
-丸め誤差なく扱えます。文字列関数の `length` は **文字数**、`byte_length` は **バイト数**
-を返し、`substring` / `index_of` など索引系は全て **文字数ベース**（UTF-8 マルチバイト
+丸め誤差なく扱えます。文字列関数の `length` は **バイト数**（`strlen` 相当。既存動作を
+維持）、`length_chars` は **文字数**（Unicode コードポイント数）を返し、
+`substring` / `index_of` など索引系は全て **文字数ベース**（UTF-8 マルチバイト
 安全）です。`mod` / `substring` / `repeat` / `to_int` / `to_float` はゼロ除算・範囲外・
 パース失敗を `(value, error)` の2値で返します。回帰テストは
 `tests/cases/p35_math_int_precision`（境界値精度）、`p35_math_full`（数学フルセット）、
@@ -270,13 +286,14 @@ Phase 5.1 では加えて、`myon.net`／`myon.http` の実用性を高める2�
 薄いラッパ（`SSL_CTX_new`→`SSL_new`→`SSL_set_fd`→`SSL_connect`→
 `SSL_read`/`SSL_write`→`SSL_shutdown`）を実装し、`myon.http.get`/`post` が
 `https://` URL に対して TLS ハンドシェイクを行うよう分岐させました。SNI と、
-システム既定の証明書ストアに対する証明書検証・ホスト名照合をベストエフォート
-で有効にしています（詳細・セキュリティ上の注意は
-[`myon_spec.md`](myon_spec.md) の 10.7／10.8 節を参照）。
+システム既定の証明書ストアに対する証明書検証・ホスト名照合を有効にしています
+（詳細は [`myon_spec.md`](myon_spec.md) の 10.7／10.8 節を参照）。
 
-> **セキュリティ**：TLS の証明書検証は簡略化されており、堅牢化された TLS
-> クライアントではありません。中間者攻撃に対して脆弱な可能性があるため、
-> 信頼できないネットワーク上での機密情報の送受信には使用しないでください。
+> **セキュリティ（後の堅牢化で更新済み）**：Phase 5.1 当初の TLS クライアントは
+> 「ベストエフォートの検証」でしたが、その後の堅牢化フェーズで
+> **フェイルクローズ（検証に失敗したら接続を閉じる）** に変更されました。
+> 現在の保証内容は後述の「ネットワーク層の堅牢化」節と
+> [`myon_spec.md`](myon_spec.md) 10.8 節を参照してください。
 
 Phase 5.1 ではさらにゲーム制作支援として、**(3) SDL_Event の読み取り**
 （`myon.ffi.read_i32` の追加による out 方向構造体読み取り、
@@ -347,7 +364,8 @@ include していなかったため、ヘッダの暗黙依存に頼れないク
   信頼できない証明書チェーン・ホスト名不一致で `SSL_connect` が失敗します。
   エラーを握りつぶしてハンドシェイク成功扱いにする分岐は無く、検証ロジックに
   論理バグは見当たりませんでした（IP／空ホスト時にホスト名照合を省くのは
-  仕様どおりの挙動）。TLS 実装の全面的な堅牢化は引き続きスコープ外です。
+  仕様どおりの挙動）。（TLS 実装の全面的な堅牢化は本フェーズではスコープ外としたが、
+  後の「ネットワーク層の堅牢化」フェーズで実施済み。）
 - **エラーパスでのリソースリーク**：`ffi.c` の `load`/`close`（失敗時にハンドルを
   残さず、`close` 済みスロットは NULL 化して二重 close/use-after-free を防止）、
   `net.c` のソケット生成失敗パス（`getaddrinfo` の `freeaddrinfo`、登録失敗時の
@@ -366,10 +384,11 @@ include していなかったため、ヘッダの暗黙依存に頼れないク
   各フレームに登録ベースのクリーンアップ（デストラクタチェーン／アリーナ
   アロケータ）を導入する設計変更が必要で規模が大きいため、Phase 2 の P6/P7 と
   同様に **本フェーズでは着手しない**と判断しました。
-- **TLS クライアントの堅牢化**：`tls.c` は README 既述のとおりベストエフォート
-  実装です。証明書検証の論理バグは無いことを確認しましたが、失効確認（OCSP/CRL）
-  やピンニング等の本格的な強化は設計判断を要するため、引き続きスコープ外
-  （信頼できないネットワークでの機密送受信には使用しない、という注意を継続）。
+- **TLS クライアントの堅牢化**（→ **後のフェーズで実施済み**）：
+  Phase 5.2 時点では `tls.c` はベストエフォート実装で、失効確認（OCSP/CRL）や
+  ピンニング等の強化はスコープ外としていました。その後の
+  「ネットワーク層の堅牢化」フェーズでフェイルクローズな検証へ置き換え済みです
+  （下記参照）。OCSP/CRL・ピンニング・クライアント証明書は引き続き非対応です。
 
 ## Phase 6（Windows 対応 — FFI / ネットワーク / イベントループのクロスプラットフォーム化）
 
@@ -454,7 +473,7 @@ async/await・`myon.net`／`myon.http`・FFI・ジェネリクス・クロージ
 | TTY 判定 | `myon.is_tty() ret bool` を新設。stdout が端末なら true、パイプ・リダイレクト時は false。ANSI 制御文字の抑制判断に使う | ✅ 実装 |
 | スクリプト引数 | CLI 側で `myon <script> [args...]`／`myon <script> -- [args...]` の後続トークンをスクリプト用引数として素通し。言語側は `myon.argv() ret myon.array(str)` で取得（常に配列、`nil` は返さない） | ✅ 実装 |
 
-- `myon.print` の**既存の改行付き挙動は変更していない**（回帰テスト 65 ケースと
+- `myon.print` の**既存の改行付き挙動は変更していない**（既存の回帰テスト全ケースと
   全 `examples/` の互換性を保つため）。「改行なし出力」は新設の `myon.write` が担う。
 - スクリプト引数はプロセス argv への借用ポインタで保持し、インタプリタ側では
   解放しない（`interpret_set_script_args()`）。スクリプトパス確定後の全トークン、
@@ -463,3 +482,87 @@ async/await・`myon.net`／`myon.http`・FFI・ジェネリクス・クロージ
 - 回帰ケース：`tests/cases/p_stdio_writers.*`（`write`/`println`/`print`/`flush`）、
   `tests/cases/p_argv_empty.*`（引数なし時の空配列・`is_tty` の false・`eprint` の
   stderr 分離）。いずれもツリーウォーク／MVM の等価性込みで検証。
+
+## macOS 対応（`src/platform.h` によるプラットフォーム判定の一元化）
+
+それまでのコードは `#if defined(__linux__)` を各所に散らし、**Linux のみを POSIX
+として扱っていました**。このため macOS ではネットワーク・非同期イベントループ・
+FFI・暗号学的乱数が黙って無効化されていました。これを `src/platform.h` の
+一元的な OS 判定・機能マクロへ置き換え、macOS を正式サポートしました。
+
+| マクロ | 意味 |
+|---|---|
+| `MYON_OS_LINUX` / `MYON_OS_MACOS` / `MYON_OS_BSD` / `MYON_OS_WINDOWS` | OS ファミリの判定 |
+| `MYON_OS_POSIX` | 上記 POSIX 系の総称 |
+| `MYON_HAVE_UCONTEXT` | `ucontext` コルーチンが使えるか（イベントループ） |
+| `MYON_HAVE_DLOPEN` | `dlopen` 系が使えるか（FFI） |
+| `MYON_HAVE_POSIX_SOCKETS` | BSD ソケットが使えるか（`myon.net`） |
+| `MYON_HAVE_ARC4RANDOM` / `MYON_HAVE_DEV_URANDOM` | OS CSPRNG の入手経路（`myon.random.secure_int`） |
+| `MYON_HAVE_MSG_NOSIGNAL` / `MYON_HAVE_SO_NOSIGPIPE` | SIGPIPE 抑止の方法（Linux / macOS・BSD で異なる） |
+
+| 対象 | 変更内容 | 状態 |
+|---|---|---|
+| `interpreter.c` | `select()`/`stat()` のガードを POSIX 全体へ。`secure_int` は macOS/BSD で `arc4random_buf()`、Linux で `/dev/urandom` | ✅ 実装 |
+| `net.c` | BSD ソケットを **全 POSIX ターゲット**で有効化（従来は Linux 限定）。SIGPIPE 抑止は macOS/BSD が `SO_NOSIGPIPE`、Linux が `MSG_NOSIGNAL` | ✅ 実装 |
+| `event_loop.c` | macOS/BSD でも `ucontext` バックエンドを有効化 | ✅ 実装 |
+| `ffi_platform.c` | macOS で実際に `dlopen`/`dlsym`/`dlclose` を使うようにし、**Phase3 の「macOS 未対応」スタブを削除** | ✅ 実装 |
+| `Makefile` | Darwin 分岐（`-ldl` 不要、Homebrew の `openssl@3` を Apple Silicon / Intel 双方で自動探索）。ASan ビルドを Linux 限定からネイティブ全般へ | ✅ 実装 |
+| `tests/run_tests.sh` | Linux 以外では「`.so` 名を直書きした FFI ケース」だけをスキップ（`LINUX_ONLY_SO_CASES`）。ネット/async/http/メモリ FFI のケースは全 OS で実行 | ✅ 実装 |
+| CI | `heavy-checks.yml` に **Windows 実機（MSYS2）** と **macOS 実機（`macos-15` Apple Silicon）** のビルド＋テストジョブを追加。`release.yml` に `myon-macos-arm64` 成果物を追加 | ✅ 実装 |
+
+## ネットワーク層の堅牢化（TLS クライアント・URL サニタイズ）
+
+Phase 5.1 の TLS クライアントは「ベストエフォートの検証」でしたが、OpenSSL 3.x の
+TLS クライアントガイド・RFC 8996（TLS 1.0/1.1 の非推奨）・RFC 6066（SNI）に沿って
+**フェイルクローズ**な実装へ置き換えました。
+
+| 項目 | 内容 | 状態 |
+|---|---|---|
+| 最低プロトコル版 | TLS 1.2 を強制。SSLv3 / TLS 1.0 / 1.1 を拒否（RFC 8996） | ✅ 実装 |
+| レガシー機能の無効化 | TLS 圧縮（CRIME 対策）・再ネゴシエーションを無効化、security level 2 | ✅ 実装 |
+| ホスト名の必須化 | 検証対象のホスト名が空の場合は「無条件許可」せず拒否 | ✅ 実装 |
+| DNS 名 / IP リテラルの分離 | DNS 名は SNI＋`SSL_set1_host()`、IP リテラルは `X509_VERIFY_PARAM_set1_ip_asc()`（iPAddress SAN、SNI は送らない）。部分ワイルドカードは禁止 | ✅ 実装 |
+| 失敗理由の可視化 | `SSL_get_verify_result()` / `X509_verify_cert_error_string()` を使い「期限切れ」「ホスト名不一致」「自己署名」等を明示。ハンドシェイク後に再確認 | ✅ 実装 |
+| ハンドシェイクのタイムアウト | 応答しないピアでインタプリタが固まらないよう期限を設定（既定 30 秒） | ✅ 実装 |
+| 読み書き API | `SSL_read_ex` / `SSL_write_ex` へ移行し、負の長さを拒否 | ✅ 実装 |
+| URL サニタイズ | `myon.http.get`/`post` の URL でホスト・ポート・パスの制御文字（CR/LF）と範囲外ポートを拒否し、ヘッダ／リクエストインジェクションを防止 | ✅ 実装 |
+
+未対応（意図的なスコープ外）：OCSP/CRL による失効確認・証明書ピンニング・
+クライアント証明書（mTLS）・TLS サーバー（`serve` の HTTPS 化）。
+
+## パッケージ管理（`myon pkg` — GitHub ベースのパッケージマネージャ）
+
+GitHub の public repository を配布元とする、プロジェクトローカルなパッケージ管理を
+C ネイティブで実装しました（既存のインタプリタ／MVM の挙動は変更していません）。
+仕様と内部実装は [`package_manager.md`](package_manager.md)、パッケージを作る側の
+作法は [`package_development.md`](package_development.md) を参照してください。
+
+```sh
+myon pkg install https://github.com/owner/repository   # URL 指定で導入
+myon pkg lock       # 依存を解決して myon.lock を（再）生成
+myon pkg install    # myon.lock だけを信頼して再現インストール
+myon pkg verify     # myon.toml / myon.lock / 展開物の整合性を検査
+myon pkg tree       # ロック済み依存グラフを表示（ネットワーク不要）
+```
+
+| レイヤ | ファイル | 内容 | 状態 |
+|---|---|---|---|
+| データモデル・パーサ | `src/package.{h,c}` | `myon.toml` / `package.myon` / `myon.lock` の厳格サブセット TOML パーサ、識別子バリデータ、`github:<owner>/<repo>@<40-hex-sha>` 形式、決定的なロックファイル書き出し、`PkgError`→終了コード対応 | ✅ 実装 |
+| ハッシュ | `src/pkg_hash.{h,c}` | OpenSSL EVP による SHA-256 と定数時間 hex 比較 | ✅ 実装 |
+| ファイルシステム | `src/pkg_fs.{h,c}` | project root の探索、`mkdir -p`、symlink 安全な rmtree、パス要素の検証、CSPRNG 名の staging ディレクトリ、バックアップ＋ロールバック付きの atomic promote | ✅ 実装 |
+| ZIP 展開 | `src/pkg_zip.{h,c}` | zlib 非依存の自前 DEFLATE 展開（RFC 1951）＋安全性優先の ZIP リーダ。ZIP Slip／絶対パス／ドライブレター／バックスラッシュ／symlink エントリ／複数ルート／重複／制御バイトを拒否し、エントリ・総量・圧縮率・件数の上限で展開爆弾を防止。エントリ毎に CRC-32 を検証 | ✅ 実装 |
+| ネットワーク | `src/pkg_fetch.{h,c}` | `myon.http` とは独立したバイナリ安全な HTTPS GET。HTTPS のみ許可、GitHub host の allow-list、`https`→`http` ダウングレード拒否、`Location` の CRLF 拒否、redirect 最大 5 回、`Content-Length`／総量の上限（64 MiB）、chunked デコード。差し替え可能な `PkgTransport` 継ぎ目によりオフラインで単体テスト可能 | ✅ 実装 |
+| 解決ロジック | `src/pkg_ops.{h,c}` | `install` / `lock` / `verify` / `tree` の依存解決 | ✅ 実装 |
+| module 取り込み | `src/interpreter.c` | 宣言 module namespace の最長一致で所属パッケージを決定。alias 必須、`myon.lock` 外のパッケージは拒否、循環 import は検出。project root は**実行スクリプトのディレクトリ**から上方向に `myon.toml` を探して決定（cwd 非依存） | ✅ 実装 |
+| テスト | `tests/pkg_unit_tests.c` / `pkg_zip_tests.c` / `pkg_ops_tests.c` | `make test` / `make test-pkg` で実行される C 単体テスト。加えて `tests/run_tests.sh` がパッケージ取り込みの fixture テストを実行 | ✅ 実装 |
+
+- 実体は `<project-root>/.myon/packages/<package-name>/` にプロジェクトローカルで
+  配置され、グローバルキャッシュや PATH 変更は行いません。
+- バージョンは**フルコミット SHA でピン留め**されます（タグの付け替えに影響されない）。
+- 運用上は `.myon/packages/` を `.gitignore` に入れ、`myon.toml` と `myon.lock` を
+  Git 管理することを推奨します。
+- **⚠️ パッケージのコードは sandbox されません。** module を import することは
+  任意の Myon コード（file I/O・network・FFI を含む）を実行することと同じです。
+- **MVM 非対応**：`--compile`／`--run-mvm`／`.myc` 実行ではパッケージ module 取り込みは
+  未対応で、曖昧にフォールバックせず明示的なエラーになります（仕様 §6.3）。
+  詳細は [`../known-issues.md`](../known-issues.md) を参照。

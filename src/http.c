@@ -152,7 +152,7 @@ const char *http_content_type_for_path(const char *path) {
 /* ------------------------------------------------------------------ */
 
 /* Map a status code to its reason phrase.  Covers the codes a Myon HTTP
- * handler is realistically going to return (known-issue.md #2); anything
+ * handler is realistically going to return (bounded handler output); anything
  * unrecognised falls back to a generic per-class phrase, then "OK". */
 const char *http_status_text(int status) {
     switch (status) {

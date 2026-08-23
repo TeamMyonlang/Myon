@@ -98,7 +98,7 @@ long long net_recvfrom(NetState *st, int sock_id, char *buf, long long buf_len,
 
 /* Raw fd/socket (for the interpreter to register with the event loop's select).
  * Returns MYON_INVALID_FD for an invalid socket id.  See myon_fd_t above for
- * why this is intptr_t-sized rather than int (known-issue #5). */
+ * why this is intptr_t-sized rather than int (native-width fd). */
 myon_fd_t net_raw_fd(NetState *st, int sock_id);
 
 /*

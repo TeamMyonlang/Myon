@@ -6,7 +6,7 @@
 `myon.` プレフィックスによる名前空間の明示、`str()`/`char()`/`int()` のような値コンストラクタ風の型構文、
 そして独自のスコープ公開機構 `myon.expose` を特徴とする。
 
-### (0.1and)0.2 設計方針まとめ
+### 0.1 設計方針まとめ
 
 | 項目 | 方針 |
 |---|---|
@@ -652,9 +652,15 @@ myon.print(myon.file.exists("/tmp/does_not_exist.txt"))  // false
 
 **対応プラットフォーム**
 
-Linux と Windows で本実装済み。
+Linux・macOS・\*BSD・Windows で本実装済み（実装は `src/ffi_platform.c`）。
+どのプラットフォームの実装を使うかは `src/platform.h` の機能マクロ
+（`MYON_HAVE_DLOPEN` など）で決まる。
 
-- **Linux**: `dlopen`/`dlsym`/`dlclose` を用いて `.so` を読み込む。
+- **POSIX 系（Linux / macOS / \*BSD、`MYON_HAVE_DLOPEN`）**:
+  `dlopen`/`dlsym`/`dlclose` を用いて共有ライブラリを読み込む。
+  エラーメッセージは `dlerror()` の文字列をそのまま用いる。
+  （リンク時に `-ldl` が必要なのは Linux のみ。macOS / \*BSD では
+  これらの関数は libc に含まれる。）
 - **Windows**: `LoadLibraryA`/`GetProcAddress`/`FreeLibrary`（`kernel32`）を
   用いて `.dll` を読み込む。読み込み失敗時のエラーメッセージは
   `GetLastError()` + `FormatMessageA`（`FORMAT_MESSAGE_FROM_SYSTEM |
@@ -663,9 +669,17 @@ Linux と Windows で本実装済み。
   `myon.ffi.load(str("xxx.dll"))` のようにパスを明示する
   （Windows の DLL 検索順序については各自の配布形態に従うこと）。
 
-macOS では引き続きスタブで、`myon.ffi.load` を呼んだ時点で
-「FFI is not supported on macOS yet (Phase3 stub)」という `error` を返す
-（コンパイル自体は3OSとも通る）。
+上記以外のプラットフォームでは `myon.ffi.load` が
+「FFI is not supported on this platform」という `error` を返すスタブになる
+（コンパイル自体はどの環境でも通る）。
+
+> **注意（ライブラリ名の可搬性）**：FFI 機構自体は可搬だが、
+> 渡す**ライブラリ名は可搬ではない**（Linux は `libm.so.6`、
+> macOS は `libm.dylib` / `libSystem.B.dylib`、Windows は `xxx.dll`）。
+> このため回帰テストでは、`.so` 名をハードコードしたケースを
+> Linux 以外ではスキップしている（`tests/run_tests.sh` の
+> `LINUX_ONLY_SO_CASES`）。移植性が必要なコードでは、
+> ライブラリ名を OS ごとに切り替えること。
 
 ```myon
 module myon.ffi
@@ -1306,15 +1320,21 @@ OSのスケジューラに依存するため、多少の誤差は許容される
 
 ### 10.6 myon.random（Phase4）
 
-乱数生成のための最小限のモジュール。C標準の `srand` / `rand` を薄く
-ラップしたものであり、**暗号学的に安全な乱数ではない**（`rand()`ベース）。
-セキュリティ用途には使用しないこと。
+乱数生成のためのモジュール。用途に応じて **2 系統** の関数を持つ。
 
 | 関数 | シグネチャ | 説明 |
 |------|-----------|------|
 | `seed` | `(n: int) ret void` | 乱数生成器を`srand((unsigned)n)`で初期化する |
 | `int` | `(lo: int, hi: int) ret int, error` | lo以上hi以下（両端含む）の一様乱数。`lo>hi`は`error` |
 | `float` | `() ret float` | 0.0以上1.0未満の一様乱数 |
+| `secure_int` | `(lo: int, hi: int) ret int, error` | **暗号学的に安全**な lo以上hi以下（両端含む）の乱数。OS の CSPRNG を使用。`lo>hi` は `error` |
+
+#### 高速・再現可能な系統（`seed` / `int` / `float`）
+
+C標準の `srand` / `rand` を薄くラップしたもので、**暗号学的に安全ではない**。
+シミュレーションやゲームなど、再現性・速度が重要で秘密性が不要な用途に使う。
+トークン・鍵・パスワード・nonce などのセキュリティ用途には使わず、
+後述の `secure_int` を使うこと。
 
 `seed()` を一度も呼ばずに `int()` / `float()` を呼んだ場合、初回のみ
 `srand((unsigned)time(NULL))` 相当の自動初期化を行う（毎回シードし直すと
@@ -1322,19 +1342,36 @@ OSのスケジューラに依存するため、多少の誤差は許容される
 `seed()` すれば同じ乱数列が再現される（`srand`+`rand`の決定的性質に依存）。
 
 `rand()` は `RAND_MAX` までの範囲しか返さないため、`hi-lo` が `RAND_MAX` を
-超える広い範囲では分布に偏りが生じうる（このPhaseでは均一性は要求しない）。
+超える広い範囲では分布に偏りが生じうる（この系統では均一性は要求しない）。
+
+#### 暗号学的に安全な系統（`secure_int`）
+
+`secure_int` は OS の CSPRNG から直接バイト列を取得する。
+`seed()` の影響を受けず、シードによる再現もできない（意図的な仕様）。
+
+- **macOS / \*BSD**（`MYON_HAVE_ARC4RANDOM`）: `arc4random_buf()`
+- **Linux ほかの POSIX**（`MYON_HAVE_DEV_URANDOM`）: `/dev/urandom` から読み出し
+- **上記以外**: 弱い値を返さず
+  `myon.random.secure_int: OS CSPRNG unavailable` という `error` を返す
+
+分布は**剰余バイアスを排除**してある（上位の余り分を捨てる棄却サンプリング）
+ため、`[lo, hi]` の各値は等確率で出現する。
 
 ```myon
 module myon.random
 
 myon.random.seed(42)
-v, err = myon.random.int(1, 6)       // 1〜6のいずれか
+v, err = myon.random.int(1, 6)       // 1〜6のいずれか（再現可能・非セキュア）
 myon.print(v >= 1)                    // true
 
 f = myon.random.float()              // 0.0 <= f < 1.0
 myon.print(f >= 0.0)                  // true
 
 bad, berr = myon.random.int(5, 1)    // berr != myon.nil（lo > hi）
+
+// セキュリティ用途はこちら（OS CSPRNG・バイアスなし）
+s, serr = myon.random.secure_int(1, 6)
+myon.print(s >= 1)                    // true
 ```
 
 ---
@@ -1343,10 +1380,11 @@ bad, berr = myon.random.int(5, 1)    // berr != myon.nil（lo > hi）
 
 IPv4 の TCP / UDP ソケットを直接扱うための低水準モジュール。POSIX
 ソケットAPI（`socket`/`bind`/`listen`/`accept`/`connect`/`send`/`recv`/
-`sendto`/`recvfrom`）の薄いラッパである。**Linux と Windows で本実装済み**で、
-それ以外のプラットフォームでは全関数が即座に `error` を返す（後述）。
-Windows では同等のソケット機能を **Winsock2**（`ws2_32`）で提供する
-（下記「Windows 実装（Winsock2）」を参照）。
+`sendto`/`recvfrom`）の薄いラッパである。**POSIX 系（Linux / macOS / \*BSD）と
+Windows で本実装済み**で、それ以外のプラットフォームでは全関数が即座に
+`error` を返す（後述）。どちらの実装を使うかは `src/platform.h` の
+`MYON_HAVE_POSIX_SOCKETS` で切り替わる。Windows では同等のソケット機能を
+**Winsock2**（`ws2_32`）で提供する（下記「Windows 実装（Winsock2）」を参照）。
 
 ソケットは整数の**ソケットID**で識別する。IDは内部テーブル（最大256個）の
 インデックスであり、生のfdではない。全関数は非ブロッキングfdで動作し、
@@ -1511,21 +1549,38 @@ HTTP/1.0リクエストを自力で組み立てる自己完結実装である。
 ステータス `0`・`error` を返す。ホスト名はDNS解決される（→ 10.7）。
 
 **HTTPS/TLS（Phase5.1）**：`https://` で始まるURLに対応した。通常のTCP接続を
-確立した上で、OpenSSL を用いたネイティブTLSハンドシェイクを行う（`src/tls.c`。
-`SSL_CTX_new` → `SSL_new` → `SSL_set_fd` → `SSL_connect` → `SSL_read`/
-`SSL_write` → `SSL_shutdown` の薄いラッパ）。SNI（Server Name Indication）と、
-システムの既定証明書ストア（`SSL_CTX_set_default_verify_paths`）に対する
-証明書検証・ホスト名照合（`SSL_set1_host`）をベストエフォートで有効にしている。
+確立した上で、OpenSSL を用いたネイティブTLSハンドシェイクを行う（`src/tls.c`）。
 デフォルトポートは `https` が `443`、`http` が `80`。
 
+TLS クライアントは**フェイルクローズ**（検証に失敗したら接続を閉じる）で
+設計されている。具体的には以下を強制する。
+
+| 項目 | 内容 |
+|------|------|
+| 証明書チェーン検証 | `SSL_VERIFY_PEER`。システム既定の信頼ストア（`SSL_CTX_set_default_verify_paths`）に対して検証する。検証失敗時はハンドシェイクを中断 |
+| ホスト名照合 | DNS 名は `SSL_set1_host()`、IP リテラルは `X509_VERIFY_PARAM_set1_ip_asc()`（証明書の iPAddress SAN）で照合 |
+| 最低プロトコル版 | TLS 1.2（`TLS1_2_VERSION`）。TLS 1.0/1.1 は拒否（RFC 8996） |
+| SNI | DNS 名のときのみ送信。IP リテラルでは送らない（RFC 6066） |
+| 無効化するレガシー機能 | TLS 圧縮・再ネゴシエーション（`SSL_OP_NO_COMPRESSION \| SSL_OP_NO_RENEGOTIATION`） |
+| ハンドシェイクのタイムアウト | 既定 30 秒（`MYON_TLS_HANDSHAKE_TIMEOUT_SECS`）。無応答のピアで無限待ちしない |
+
+証明書が失効・ホスト名不一致・自己署名などの場合は、理由付きの `error` を
+返して接続を中断する（中間者攻撃に対する基本的な保護を提供する）。
+
+> **実装の限界**：コンパクトな実装であり、以下は**非対応**である。
+> 高保証が必要な用途ではこの制限を考慮すること。
+>
+> - OCSP / CRL による失効確認
+> - 証明書ピンニング
+> - クライアント証明書（mTLS）
+>
+> **URL のサニタイズ**：`myon.http.get`/`post` に渡す URL は、ホスト・ポート・
+> パスに含まれる制御文字（CR/LF 等）や範囲外のポート番号を拒否し、
+> HTTP ヘッダ／リクエストインジェクションを防ぐ。
+>
 > **ビルド依存**：この機能により、Myon本体のビルドに OpenSSL 開発パッケージ
 > （`libssl-dev` 相当）が**必須**となった。Makefile は常に `-lssl -lcrypto` を
 > リンクする。
->
-> **セキュリティ上の注意**：TLSの証明書検証は簡略化されており、本実装は
-> 堅牢化された（hardened）TLSクライアントではない。中間者攻撃に対して脆弱な
-> 可能性があるため、信頼できないネットワーク上での機密情報の送受信には
-> 使用しないこと。
 
 ```myon
 module myon.http
@@ -1552,13 +1607,31 @@ myon.print(status2)                     // 200
 
 ## 11. モジュールシステム
 
+`module` 宣言には次の 3 種類がある。
+
 ```myon
-system myon.useversion=1     // 使用するMyonバージョンの宣言
-module myon.stdio               // 組み込みモジュール
-module external.util.math as m  // 外部モジュール（./util/math.myon）をmとして読み込み
+system myon.useversion=1        // 使用するMyonバージョンの宣言
+module myon.stdio               // (1) 組み込みモジュール
+module external.util.math as m  // (2) 外部モジュール（./util/math.myon）をmとして読み込み
+module mylib.text as t          // (3) インストール済みパッケージのモジュール
 ```
 
-ドット区切りはファイルパス階層に対応する（`.myon` 拡張子を想定）。
+| 種類 | 接頭辞 | 解決先 |
+|------|--------|--------|
+| (1) 組み込み | `myon.*` | インタプリタ内蔵の標準ライブラリ（§10） |
+| (2) 外部ファイル | `external.*` | スクリプトからの相対パス。ドット区切りがディレクトリ階層に対応（`external.util.math` → `./util/math.myon`） |
+| (3) パッケージ | 上記以外 | `myon pkg install` で導入したパッケージ（`.myon/packages/` 以下）。パッケージ名の後ろがパッケージ内の相対パスになる |
+
+ドット区切りはいずれの場合もファイルパス階層に対応する（`.myon` 拡張子を想定）。
+`as` による別名付けは (2)(3) で使える。
+
+パッケージの導入手順・`myon.toml` / `myon.lock` の書式は
+[`package_manager.md`](./package_manager.md)、
+パッケージを作る側の作法は
+[`package_development.md`](./package_development.md) を参照。
+
+> **注意**：MVM（バイトコード VM）でのパッケージ由来モジュールの取り扱いには
+> 制限がある。[`known-issues.md`](../known-issues.md) を参照。
 
 ---
 
@@ -1924,10 +1997,12 @@ I/O 待ち地点で `swapcontext` によりループ本体へ制御を返す。
 侵襲が大きすぎるため（Phase2 P6 の判断を継続）。プリエンプティブなタスク切り替えも
 行わない。
 
-**対応プラットフォーム**：イベントループは Linux（glibc）と Windows の双方で
-本実装済みである。`ucontext`／Fiber のいずれも欠くプラットフォームでは未対応
+**対応プラットフォーム**：イベントループは **POSIX 系（`ucontext` を持つ
+Linux / macOS / \*BSD、`MYON_HAVE_UCONTEXT`）と Windows（Fiber API）の双方で
+本実装済み**である。`ucontext`／Fiber のいずれも欠くプラットフォームでは未対応
 スタブ（`event_loop_supported()` が `0` を返す）としてコンパイルされる
-（FFI サブシステムと同じポリシー）。
+（FFI サブシステムと同じポリシー）。以下の表で「Linux」とあるものは
+`MYON_EVENT_LOOP_UCONTEXT` 分岐（= POSIX 系全体）を指す。
 
 **Windows 実装（Win32 Fiber、Phase5 Step3）**：`ucontext` は Windows に存在
 しないため、Windows では同等のユーザーモード・スタック切り替え機構である
@@ -1978,8 +2053,8 @@ Phase5（`myon.net`/`myon.http`）で今回スコープ外とし、今後の検�
 残した事項：
 
 - **IPv6対応**：現状の `myon.net` はIPv4のみ。`AF_INET6` の追加をどう表現するか
-- **TLS/HTTPS対応**：`myon.http.get`/`post` の `https://`、およびTLSサーバー。
-  自前実装は非現実的なため外部ライブラリ（OpenSSL等）への依存をどう扱うか
+- **TLSサーバー**：クライアント側の `https://` は Phase5.1 で実装済み（10.8節）。
+  サーバー側の TLS 終端（`serve` の HTTPS 化）は未対応
 - **HTTPサーバーのKeep-Alive対応**：現状はHTTP/1.0・1コネクション1リクエスト
   固定。`Connection: keep-alive` / HTTP/1.1 chunked をサポートするか
 - **レスポンスヘッダ・ステータスコードのカスタマイズ**：`serve` のハンドラは
@@ -1987,10 +2062,17 @@ Phase5（`myon.net`/`myon.http`）で今回スコープ外とし、今後の検�
   ステータス・ヘッダを返せるAPI形状（構造体を返す等）をどうするか
 - **本物のマルチスレッド化**：現状の並行処理は単一スレッドの協調的コルーチン
   （14.9節）。OSスレッド/マルチコア並列をどう表現するか（当面は導入しない）
+- **クロスエンジンの関数値受け渡し**：MVM で生成した関数値を、ツリーウォーク側
+  実装のネイティブ関数（`array.map`/`filter`/`reduce`、`myon.ffi.make_callback`）
+  へ渡すことは現状できず、実行時エラーになる（`mvm_spec.md` 参照）
 
+> 以下は Phase 5.1 で確定・実装済みのため本リストから除外した。
+> - **TLS/HTTPS クライアント対応** → OpenSSL への依存を必須とし、
+>   フェイルクローズな検証付きクライアントとして実装（10.8節）
+>
 > 以下は Phase 5 で確定済みのため本リストから除外した。
 > - `myon.async`/`myon.await` の実行モデル → 単一スレッドの協調的イベント
->   ループ（ucontextベースのコルーチン）に確定（14.9節）
+>   ループ（POSIX は ucontext、Windows は Fiber ベースのコルーチン）に確定（14.9節）
 > - ジェネリクスの型制約 → 導入しないことに確定（14.8節）
 >
 > 以下は Phase 3.5 で確定済みのため本リストから除外した。

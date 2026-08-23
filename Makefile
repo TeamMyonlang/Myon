@@ -120,8 +120,9 @@ $(BIN): $(OBJECTS)
 # ------------------------------------------------------------------------- #
 # Sanitizer build (AddressSanitizer + UndefinedBehaviorSanitizer).
 #
-# This mirrors the ASan/UBSan build documented in flaw-and-Add.md
-# ("検証方法（再現手順）") that was used to find A-1..A-6.  It is a single
+# This mirrors the ASan/UBSan build that was originally used to hunt down a
+# batch of memory/UB defects (see README "Sanitizer（ASan/UBSan）テスト" and
+# docs/features.md Phase 5.2).  It is a single
 # self-contained link of all sources (no build/ objects reuse) at -O0 -g so
 # stack traces stay readable, and it always produces a binary named
 # `myon_asan` so it never clobbers the real `myon` binary.
