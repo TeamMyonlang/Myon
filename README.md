@@ -59,7 +59,7 @@ x = str("人間")
 myon.print("Hello Worlddd! ", x + "!")
 ```
 
-GitHub の package を使いたい場合は [パッケージ管理（`myon pkg`）](#パッケージ管理myon-pkg)
+Myon の package を使いたい場合は [パッケージ管理（`myon pkg`）](#パッケージ管理myon-pkg)
 を参照してください（詳細な仕様は [`docs/package_manager.md`](docs/package_manager.md)、
 package を自作したい場合は [`docs/package_development.md`](docs/package_development.md)）。
 
