@@ -1,0 +1,13 @@
+# Regression test for known-issues #6 (fixed): parse_module() built the dotted
+# module path with `len += snprintf(buf + len, sizeof(buf) - len, ...)`.
+# Because snprintf() returns the length it *would* have written, `len` could
+# grow past the 256-byte buffer; `sizeof(buf) - len` then wrapped around
+# (size_t) into a huge value and `buf + len` pointed outside the buffer, so the
+# next segment was written out of bounds.
+#
+# That was reachable at *parse* time -- merely syntax-checking untrusted source
+# (`--compile`, no execution) could corrupt memory.  An over-long module path
+# must now be a plain syntax error (non-zero exit), never a buffer overflow.
+#
+# Only the non-zero exit is pinned, not the exact message text (same convention
+# as step12_overflow.err / p52_recursion_limit.err).

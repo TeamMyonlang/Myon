@@ -71,6 +71,35 @@ static void perror_at(Parser *p, const Token *t, const char *msg) {
     longjmp(p->escape, 1);
 }
 
+/*
+ * Bounded append into a fixed-size dotted-path buffer.
+ *
+ * C-2 fix (known-issues #6 / #7): the dotted-path builders in parse_module()
+ * and parse_primary() used to accumulate `len += snprintf(buf + len,
+ * sizeof(buf) - len, ...)`.  Because snprintf() returns the length it *would*
+ * have written, `len` can grow past the buffer size; `sizeof(buf) - len` then
+ * wraps around (size_t) into a huge value and `buf + len` points outside the
+ * buffer, so the next segment is written out of bounds -- memory corruption
+ * triggered by merely parsing untrusted source (`--compile`, no execution).
+ *
+ * This helper never advances `*len` past the buffer and reports whether the
+ * append fit, so callers can raise a proper syntax error instead of
+ * overflowing.  Returns 1 on success, 0 if the path does not fit.
+ */
+static int path_append(char *buf, size_t cap, size_t *len,
+                       const char *sep, const char *seg) {
+    if (*len >= cap) return 0; /* defensive: already full */
+    size_t seplen = sep ? strlen(sep) : 0;
+    size_t seglen = seg ? strlen(seg) : 0;
+    size_t need = seplen + seglen;
+    if (need > cap - 1 - *len) return 0; /* would not fit (incl. NUL) */
+    if (seplen) memcpy(buf + *len, sep, seplen);
+    if (seglen) memcpy(buf + *len + seplen, seg, seglen);
+    *len += need;
+    buf[*len] = '\0';
+    return 1;
+}
+
 static const Token *expect(Parser *p, TokenType t, const char *msg) {
     if (check(p, t)) return advance(p);
     /* P5: if the caller passed a bare/short message, still surface the
@@ -333,7 +362,9 @@ static Expr *parse_primary(Parser *p) {
              * dotted identifier so the interpreter can resolve it. */
             advance(p);
             char buf[128];
-            size_t len = (size_t)snprintf(buf, sizeof(buf), "myon");
+            size_t len = 0;
+            buf[0] = '\0';
+            path_append(buf, sizeof(buf), &len, NULL, "myon");
             /* A dotted segment is normally an identifier, but some stdlib
              * members reuse type-name keywords as function names
              * (e.g. myon.random.int / myon.random.float).  Accept those
@@ -341,7 +372,10 @@ static Expr *parse_primary(Parser *p) {
             while (check(p, TOK_DOT) && seg_is_name(peek_type(p, 1))) {
                 advance(p); /* '.' */
                 const Token *seg = advance(p);
-                len += (size_t)snprintf(buf + len, sizeof(buf) - len, ".%s", seg->lexeme);
+                /* Bounds-checked append: an over-long qualified name is a
+                 * syntax error, never a buffer overflow (known-issues #7). */
+                if (!path_append(buf, sizeof(buf), &len, ".", seg->lexeme))
+                    perror_at(p, seg, "qualified name is too long");
             }
             return expr_ident(myon_strdup(buf), line);
         }
@@ -508,14 +542,18 @@ static Stmt *parse_module(Parser *p) {
 
     const Token *head = peek(p);
     if (head->type == TOK_KW_MYON || head->type == TOK_IDENT) {
-        len += (size_t)snprintf(buf + len, sizeof(buf) - len, "%s", head->lexeme);
+        if (!path_append(buf, sizeof(buf), &len, NULL, head->lexeme))
+            perror_at(p, head, "module path is too long");
         advance(p);
     } else {
         perror_at(p, head, "expected module path");
     }
     while (match(p, TOK_DOT)) {
         const Token *seg = expect(p, TOK_IDENT, "expected identifier in module path");
-        len += (size_t)snprintf(buf + len, sizeof(buf) - len, ".%s", seg->lexeme);
+        /* Bounds-checked append: an over-long module path is a syntax error,
+         * never a buffer overflow (known-issues #6). */
+        if (!path_append(buf, sizeof(buf), &len, ".", seg->lexeme))
+            perror_at(p, seg, "module path is too long");
     }
 
     char *alias = NULL;
