@@ -1,0 +1,10 @@
+# Regression test for known-issues #7 (fixed): parse_primary() built the
+# `myon.*` qualified-name path with the same unchecked accumulation pattern as
+# #6, but into a 128-byte buffer -- so a long `myon.a.b.c...` chain wrote out of
+# bounds while parsing.
+#
+# Like #6 this triggered at *parse* time (`--compile`, no execution).  An
+# over-long qualified name must now be a plain syntax error (non-zero exit),
+# never a buffer overflow.
+#
+# Only the non-zero exit is pinned, not the exact message text.

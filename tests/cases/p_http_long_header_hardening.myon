@@ -1,0 +1,29 @@
+# Regression test for known-issues #5 (fixed): a request header longer than the
+# 1024-byte stack buffer in http_client_request() must never make us send more
+# bytes than that buffer actually holds.
+#
+# Before the fix, the send length came straight from snprintf()'s return value,
+# which is the length that *would* have been written -- so a long URL path made
+# us pass `hn > sizeof(head)` to send() and stream ~1 KB of adjacent stack
+# memory to the peer (out-of-bounds read + information disclosure).
+#
+# This case is CI-safe and needs no network: the header is now built and
+# length-checked *before* any socket is created, so a request header above the
+# 64 KiB cap is rejected pre-connect and returns deterministically as
+# (empty body, status 0, error).
+module myon.stdio
+module myon.string
+module myon.http
+
+# ~70 KB request-target -> header exceeds the 64 KiB cap -> rejected pre-connect.
+long_path, rerr = myon.string.repeat(str("b"), 70000)
+url = myon.string.concat(str("http://127.0.0.1:19099/"), long_path)
+
+b1, s1, e1 = myon.http.get(url)
+myon.print(s1)
+myon.print(e1)
+
+# Same for POST (the Content-Type / Content-Length variant of the header).
+b2, s2, e2 = myon.http.post(url, str("payload=1"), str("text/plain"))
+myon.print(s2)
+myon.print(e2)

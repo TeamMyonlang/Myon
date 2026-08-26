@@ -4104,6 +4104,65 @@ static Value http_client_request(Interp *it, int line, const char *url,
         return tup;
     }
 
+    /* Build the request header up-front, before any socket is created.
+     *
+     * C-2 fix (known-issues #5): snprintf() returns the length it *would* have
+     * written, not the length that actually fit.  Passing that return value to
+     * send() as the payload length meant a request header longer than the
+     * 1024-byte stack buffer (a long URL path, host or content type) made us
+     * hand `hn > sizeof(head)` to send(), which read past the buffer and
+     * streamed adjacent stack memory to the peer -- an out-of-bounds read *and*
+     * an information-disclosure channel (the same pattern already guarded in
+     * src/http.c and src/pkg_fetch.c).
+     *
+     * Instead of truncating (which would silently send a corrupt request) or
+     * rejecting every long-but-legitimate URL, keep a stack fast path and fall
+     * back to an exactly-sized heap buffer when the header does not fit.  The
+     * total is still capped so an absurd URL cannot drive a huge allocation,
+     * and the check happens before connect() so it costs no network traffic. */
+    size_t blen = body ? strlen(body) : 0;
+    #define MYON_HTTP_CLIENT_MAX_HEAD (64UL << 10) /* 64 KiB */
+    #define MYON_BUILD_HEAD(dst, cap)                                          \
+        (blen ? snprintf((dst), (cap),                                         \
+                    "%s %s HTTP/1.0\r\nHost: %s\r\nContent-Type: %s\r\n"       \
+                    "Content-Length: %zu\r\nConnection: close\r\n\r\n",        \
+                    method, path, host,                                        \
+                    content_type ? content_type : "application/octet-stream",  \
+                    blen)                                                      \
+              : snprintf((dst), (cap),                                         \
+                    "%s %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n", \
+                    method, path, host))
+    char   headbuf[1024];
+    char  *head = headbuf;
+    char  *head_heap = NULL;
+    int    hn = MYON_BUILD_HEAD(headbuf, sizeof(headbuf));
+    if (hn < 0 || (size_t)hn >= MYON_HTTP_CLIENT_MAX_HEAD) {
+        /* encoding error, or a header too large to be a plausible request */
+        free(host); free(path);
+        array_push(&tup, value_str(myon_strdup("")));
+        array_push(&tup, value_int(0));
+        array_push(&tup, value_error(myon_strdup(
+            "HTTP request header exceeds 64 KiB limit")));
+        return tup;
+    }
+    if ((size_t)hn >= sizeof(headbuf)) {
+        /* truncated in the stack buffer: rebuild at full size on the heap */
+        size_t headcap = (size_t)hn + 1;
+        head_heap = (char *)myon_xmalloc(headcap);
+        head = head_heap;
+        int hn2 = MYON_BUILD_HEAD(head, headcap);
+        /* Defensive: never send more bytes than the buffer actually holds. */
+        if (hn2 < 0 || (size_t)hn2 >= headcap) {
+            free(head_heap); free(host); free(path);
+            array_push(&tup, value_str(myon_strdup("")));
+            array_push(&tup, value_int(0));
+            array_push(&tup, value_error(myon_strdup("HTTP request build failed")));
+            return tup;
+        }
+        hn = hn2;
+    }
+    #undef MYON_BUILD_HEAD
+
     NetState *st = ensure_net(it);
     char *err = NULL;
     int sock = net_socket_create(st, 0, &err);
@@ -4111,7 +4170,7 @@ static Value http_client_request(Interp *it, int line, const char *url,
         array_push(&tup, value_str(myon_strdup("")));
         array_push(&tup, value_int(0));
         array_push(&tup, value_error(err ? err : myon_strdup("socket failed")));
-        free(host); free(path);
+        free(head_heap); free(host); free(path);
         return tup;
     }
     myon_fd_t fd = net_raw_fd(st, sock); /* native-width fd */
@@ -4123,7 +4182,7 @@ static Value http_client_request(Interp *it, int line, const char *url,
         array_push(&tup, value_str(myon_strdup("")));
         array_push(&tup, value_int(0));
         array_push(&tup, value_error(err ? err : myon_strdup("connect failed")));
-        net_close(st, sock); free(host); free(path);
+        net_close(st, sock); free(head_heap); free(host); free(path);
         return tup;
     }
 
@@ -4136,24 +4195,12 @@ static Value http_client_request(Interp *it, int line, const char *url,
             array_push(&tup, value_str(myon_strdup("")));
             array_push(&tup, value_int(0));
             array_push(&tup, value_error(terr ? terr : myon_strdup("TLS handshake failed")));
-            net_close(st, sock); free(host); free(path);
+            net_close(st, sock); free(head_heap); free(host); free(path);
             return tup;
         }
     }
 
-    /* build request */
-    size_t blen = body ? strlen(body) : 0;
-    char head[1024];
-    int hn;
-    if (blen)
-        hn = snprintf(head, sizeof(head),
-            "%s %s HTTP/1.0\r\nHost: %s\r\nContent-Type: %s\r\n"
-            "Content-Length: %zu\r\nConnection: close\r\n\r\n",
-            method, path, host, content_type ? content_type : "application/octet-stream", blen);
-    else
-        hn = snprintf(head, sizeof(head),
-            "%s %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n",
-            method, path, host);
+    /* send the pre-built request (header length is now guaranteed in-bounds) */
     if (tls) {
         tls_send_all(it, tls, fd, head, (size_t)hn);
         if (blen) tls_send_all(it, tls, fd, body, blen);
@@ -4161,6 +4208,8 @@ static Value http_client_request(Interp *it, int line, const char *url,
         http_send_all(it, st, sock, head, (size_t)hn);
         if (blen) http_send_all(it, st, sock, body, blen);
     }
+    free(head_heap);
+    head_heap = NULL; head = NULL;
 
     /* read the whole response.
      *
