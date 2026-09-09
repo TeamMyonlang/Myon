@@ -1,0 +1,4 @@
+Node(name=a, next=Node<cycle>, kids=[])
+Node(name=b, next=Node(name=c, next=Node<cycle>, kids=[]), kids=[])
+Node(name=d, next=myon.nil, kids=[Node<cycle>])
+Node(name=shared, next=Node(name=leaf, next=myon.nil, kids=[]), kids=[Node(name=leaf, next=myon.nil, kids=[])])

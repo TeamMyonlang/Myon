@@ -161,6 +161,44 @@ check_version_flag --version
 check_version_flag -v
 
 # ---------------------------------------------------------------------------
+# Known-issues #9: the call-depth guard must fire on a SMALL stack too.
+#
+# The cap used to be the fixed constant 4000, sized for an 8 MiB stack.  Under
+# `ulimit -s 1024` / `2048` the real capacity is well below that, so the OS
+# killed the process with SIGSEGV (exit 139) before the guard could report
+# "call stack too deep" -- silently defeating what p52_recursion_limit exists
+# to verify (and, per known-issues #22, the harness even reported that crash as
+# "ok").  The cap is now derived from getrlimit(RLIMIT_STACK), so runaway
+# recursion must exit gracefully (exit 1 + diagnostic) at any stack size.
+#
+# Unlike check_error, this pins the exit code exactly: 139 (or any signal death,
+# >= 128) is the failure being guarded against, so "non-zero" is not enough.
+# ---------------------------------------------------------------------------
+check_recursion_limit_at_stack() {
+    local kb="$1" src="tests/cases/p52_recursion_limit.myon"
+    local out rc name="recursion_limit_stack_${kb}k"
+
+    # Skip where the shell cannot lower the stack limit (e.g. MSYS/Windows).
+    if ! ( ulimit -s "$kb" ) 2>/dev/null; then
+        echo "  skip $name (shell cannot set 'ulimit -s $kb' here)"
+        skip=$((skip + 1))
+        return
+    fi
+
+    out=$( ulimit -s "$kb"; "$MYON" "$src" 2>&1 >/dev/null ); rc=$?
+    if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "call stack too deep"; then
+        echo "  ok   $name (guard fired gracefully, exit 1)"
+        pass=$((pass + 1))
+    else
+        echo "  FAIL $name (expected exit 1 + 'call stack too deep', got exit $rc)"
+        printf '%s\n' "$out" | sed 's/^/    /'
+        fail=$((fail + 1))
+    fi
+}
+check_recursion_limit_at_stack 1024
+check_recursion_limit_at_stack 2048
+
+# ---------------------------------------------------------------------------
 # Installed-package module import (spec §6).
 #
 # These fixtures are self-contained mini-projects under tests/cases/<proj>/

@@ -82,6 +82,9 @@
 #if defined(MYON_OS_POSIX)
 #include <sys/select.h>
 #include <sys/stat.h>
+/* Known-issues #9: the call-depth cap is derived from the stack limit the
+ * process actually runs with (getrlimit(RLIMIT_STACK)). */
+#include <sys/resource.h>
 #endif
 /* Windows lacks nanosleep; Sleep() (Win32, in kernel32) is the blocking
  * millisecond primitive used by the synchronous myon.time.sleep_ms fallback.
@@ -144,14 +147,82 @@ static long long myon_wallclock_ms(void) {
  * runtime error instead (same graceful path as the Step12 integer-overflow
  * checks).
  *
- * Sizing: the default thread/main C stack is 8 MiB on Linux and macOS.  Each
- * Myon frame chains several C frames (call_function + exec_block + a few
- * eval_expr levels) which empirically measured well under ~2 KiB per Myon
- * frame in an -O2 build, but debug/ASan builds and heavier expressions use
- * considerably more.  A cap of 4000 keeps us comfortably inside 8 MiB with a
- * wide safety margin while still allowing genuinely deep (non-pathological)
- * recursion.  Tail-call optimisation is intentionally out of scope. */
+ * Known-issues #9: the cap used to be the fixed constant 4000, sized for the
+ * 8 MiB default stack of Linux/macOS.  That is *not* what programs actually
+ * run with:
+ *
+ *   * `ulimit -s 1024` / `2048` (containers, CI images, some distros' service
+ *     managers) give 1-2 MiB, where the real capacity measured 1710 / 3421
+ *     frames for a trivial recursion -- below 4000, so the OS killed the
+ *     process with SIGSEGV *before* the guard could fire.
+ *   * A sanitizer / debug build spends far more stack per frame (measured
+ *     ~4.1 KiB vs ~0.6-0.8 KiB at -O2), so even an 8 MiB stack overflows at
+ *     ~2050 frames.
+ *
+ * So the cap is now derived from the stack limit the process actually has
+ * (getrlimit(RLIMIT_STACK) on POSIX), using a conservative per-frame budget
+ * and leaving a quarter of the stack unused as headroom.  MYON_MAX_CALL_DEPTH
+ * remains the upper bound (so a huge/unlimited stack does not allow unbounded
+ * nesting), and MYON_MIN_CALL_DEPTH keeps a usable floor on tiny stacks.
+ * Tail-call optimisation is intentionally out of scope.
+ */
 #define MYON_MAX_CALL_DEPTH 4000
+#define MYON_MIN_CALL_DEPTH 64
+
+/* Conservative stack budget per Myon call frame (call_function + exec_block +
+ * a few eval_expr levels).  Measured worst cases: ~0.8 KiB at -O2, ~4.1 KiB
+ * for an ASan/-O0 build; the estimates below keep a ~2x margin on top. */
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
+#  define MYON_CALL_FRAME_BYTES (8 * 1024)
+#elif defined(__has_feature)
+#  if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
+#    define MYON_CALL_FRAME_BYTES (8 * 1024)
+#  else
+#    define MYON_CALL_FRAME_BYTES (2 * 1024)
+#  endif
+#else
+#  define MYON_CALL_FRAME_BYTES (2 * 1024)
+#endif
+
+/* Assumed stack size when the OS will not tell us (Windows, or an unlimited
+ * RLIMIT_STACK).  8 MiB is the Linux/macOS default; Windows links a 1 MiB
+ * main-thread stack by default, so assume that there. */
+#if defined(_WIN32)
+#  define MYON_ASSUMED_STACK_BYTES (1024u * 1024u)
+#else
+#  define MYON_ASSUMED_STACK_BYTES (8u * 1024u * 1024u)
+#endif
+
+/*
+ * Effective call-depth cap for this process, computed once on first use.
+ *
+ * Note this deliberately describes only the *main* C stack.  Coroutines run on
+ * their own, much smaller stacks and reset call_depth on entry (see
+ * async_task_entry); sizing that budget is known-issues #10 and is not
+ * addressed here.
+ */
+static int myon_max_call_depth(void) {
+    static int cached = 0;
+    if (cached) return cached;
+
+    unsigned long long stack_bytes = MYON_ASSUMED_STACK_BYTES;
+#if defined(MYON_OS_POSIX)
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_STACK, &rl) == 0 &&
+        rl.rlim_cur != RLIM_INFINITY && rl.rlim_cur > 0)
+        stack_bytes = (unsigned long long)rl.rlim_cur;
+#endif
+
+    /* Leave a quarter of the stack unused: the guard has to fire while there
+     * is still room for the error path (diag snippet printing, longjmp). */
+    unsigned long long usable = stack_bytes / 4 * 3;
+    unsigned long long depth  = usable / MYON_CALL_FRAME_BYTES;
+
+    if (depth > (unsigned long long)MYON_MAX_CALL_DEPTH) depth = MYON_MAX_CALL_DEPTH;
+    if (depth < (unsigned long long)MYON_MIN_CALL_DEPTH) depth = MYON_MIN_CALL_DEPTH;
+    cached = (int)depth;
+    return cached;
+}
 
 typedef enum { FLOW_NORMAL, FLOW_BREAK, FLOW_CONTINUE, FLOW_RETURN } Flow;
 
@@ -3389,11 +3460,12 @@ static Value call_function(Interp *it, int line, Value fn, Value *args, int argc
      * than letting the OS kill us with SIGSEGV.  Note: it->call_depth has not
      * yet been incremented for this frame, so comparing >= against the cap makes
      * the (depth+1)-th nested call the one that fails. */
-    if (it->call_depth >= MYON_MAX_CALL_DEPTH)
+    int max_depth = myon_max_call_depth();
+    if (it->call_depth >= max_depth)
         runtime_error(it, line,
             "call stack too deep: recursion exceeded %d nested calls "
             "(possible infinite recursion in '%s')",
-            MYON_MAX_CALL_DEPTH, fd->name ? fd->name : "<lambda>");
+            max_depth, fd->name ? fd->name : "<lambda>");
     it->call_depth++;
 
     Env *call_env = env_new(fn.as.obj->as.fn.closure);

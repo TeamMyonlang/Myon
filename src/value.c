@@ -263,7 +263,61 @@ static char *append(char *dst, const char *src) {
     return dst;
 }
 
-char *value_to_cstr(const Value *v) {
+/* ------------------------------------------------------------------ */
+/* Rendering guard (known-issues #8)                                   */
+/* ------------------------------------------------------------------ */
+
+/*
+ * value_to_cstr() recurses through arrays / maps / structs.  Reference
+ * counting lets a container reach itself (`a.next = a`, a map holding the
+ * array that holds it, ...), and without a guard that recursion never
+ * terminates: the C stack is exhausted and the process dies with SIGSEGV
+ * before anything is printed.  Both engines share this renderer (the MVM
+ * reaches it through the bridge), so the guard fixes both at once.
+ *
+ * Two independent limits:
+ *
+ *   * A *path* set of the container objects currently being rendered.  A value
+ *     that is already on the path is a genuine cycle and renders as
+ *     MYON_TOSTR_CYCLE instead of recursing.  This is a path set, not a global
+ *     "seen" set, so a DAG (the same array appearing twice side by side) still
+ *     prints in full both times -- only real back-edges are cut.
+ *
+ *   * A depth cap, so a legitimately (but pathologically) deep acyclic nesting
+ *     -- 100k nested arrays built in a loop -- cannot exhaust the C stack
+ *     either.  Beyond the cap the subtree renders as MYON_TOSTR_DEPTH.
+ */
+#define MYON_TOSTR_MAX_DEPTH 256
+#define MYON_TOSTR_CYCLE     "<cycle>"
+#define MYON_TOSTR_DEPTH     "<...>"
+
+typedef struct {
+    const Obj **items;   /* containers on the current recursion path */
+    int          count;
+    int          cap;
+    int          depth;
+} ToStrPath;
+
+static int tostr_path_contains(const ToStrPath *p, const Obj *o) {
+    for (int i = 0; i < p->count; i++)
+        if (p->items[i] == o) return 1;
+    return 0;
+}
+
+static void tostr_path_push(ToStrPath *p, const Obj *o) {
+    if (p->count == p->cap) {
+        p->cap = p->cap ? p->cap * 2 : 16;
+        p->items = (const Obj **)myon_xrealloc((void *)p->items,
+                                               sizeof(const Obj *) * (size_t)p->cap);
+    }
+    p->items[p->count++] = o;
+}
+
+static void tostr_path_pop(ToStrPath *p) {
+    if (p->count > 0) p->count--;
+}
+
+static char *value_to_cstr_rec(const Value *v, ToStrPath *path) {
     char buf[64];
     switch (v->type) {
         case TYPE_INT:
@@ -284,44 +338,73 @@ char *value_to_cstr(const Value *v) {
         case TYPE_VOID:
             return myon_strdup("void");
         case TYPE_ARRAY: {
+            const Obj *o = v->as.obj;
+            if (!o) return myon_strdup("[]");
+            if (tostr_path_contains(path, o)) return myon_strdup(MYON_TOSTR_CYCLE);
+            if (path->depth >= MYON_TOSTR_MAX_DEPTH) return myon_strdup(MYON_TOSTR_DEPTH);
+            tostr_path_push(path, o);
+            path->depth++;
             char *s = myon_strdup("[");
-            ArrayData *a = &v->as.obj->as.arr;
+            const ArrayData *a = &o->as.arr;
             for (int i = 0; i < a->count; i++) {
                 if (i) s = append(s, ", ");
-                char *e = value_to_cstr(&a->items[i]);
+                char *e = value_to_cstr_rec(&a->items[i], path);
                 s = append(s, e);
                 free(e);
             }
             s = append(s, "]");
+            path->depth--;
+            tostr_path_pop(path);
             return s;
         }
         case TYPE_MAP: {
+            const Obj *o = v->as.obj;
+            if (!o) return myon_strdup("{}");
+            if (tostr_path_contains(path, o)) return myon_strdup(MYON_TOSTR_CYCLE);
+            if (path->depth >= MYON_TOSTR_MAX_DEPTH) return myon_strdup(MYON_TOSTR_DEPTH);
+            tostr_path_push(path, o);
+            path->depth++;
             char *s = myon_strdup("{");
             int first = 1;
-            for (MapEntry *e = v->as.obj->as.map.head; e; e = e->next) {
+            for (MapEntry *e = o->as.map.head; e; e = e->next) {
                 if (!first) s = append(s, ", ");
                 first = 0;
-                char *k = value_to_cstr(&e->key);
-                char *val = value_to_cstr(&e->val);
+                char *k = value_to_cstr_rec(&e->key, path);
+                char *val = value_to_cstr_rec(&e->val, path);
                 s = append(s, k); s = append(s, ": "); s = append(s, val);
                 free(k); free(val);
             }
             s = append(s, "}");
+            path->depth--;
+            tostr_path_pop(path);
             return s;
         }
         case TYPE_STRUCT: {
-            StructData *st = &v->as.obj->as.st;
-            char *s = myon_strdup(st->type_name);
+            const Obj *o = v->as.obj;
+            if (!o) return myon_strdup("<struct>");
+            const StructData *st = &o->as.st;
+            if (tostr_path_contains(path, o)) {
+                /* Keep the type name so the output still identifies the value
+                 * that closed the cycle: `Node(next=Node<cycle>)`. */
+                char *s = myon_strdup(st->type_name ? st->type_name : "struct");
+                return append(s, MYON_TOSTR_CYCLE);
+            }
+            if (path->depth >= MYON_TOSTR_MAX_DEPTH) return myon_strdup(MYON_TOSTR_DEPTH);
+            tostr_path_push(path, o);
+            path->depth++;
+            char *s = myon_strdup(st->type_name ? st->type_name : "struct");
             s = append(s, "(");
             for (int i = 0; i < st->field_count; i++) {
                 if (i) s = append(s, ", ");
                 s = append(s, st->field_names[i]);
                 s = append(s, "=");
-                char *fv = value_to_cstr(&st->field_vals[i]);
+                char *fv = value_to_cstr_rec(&st->field_vals[i], path);
                 s = append(s, fv);
                 free(fv);
             }
             s = append(s, ")");
+            path->depth--;
+            tostr_path_pop(path);
             return s;
         }
         case TYPE_FUNC:
@@ -331,6 +414,17 @@ char *value_to_cstr(const Value *v) {
         default:
             return myon_strdup("");
     }
+}
+
+char *value_to_cstr(const Value *v) {
+    ToStrPath path;
+    path.items = NULL;
+    path.count = 0;
+    path.cap   = 0;
+    path.depth = 0;
+    char *s = value_to_cstr_rec(v, &path);
+    free((void *)path.items);
+    return s;
 }
 
 int value_truthy(const Value *v) {

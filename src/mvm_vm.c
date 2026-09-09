@@ -43,10 +43,11 @@
 
 /*
  * Call-frame cap (spec §3.4 suggests ~1024).  The tree-walk interpreter caps
- * native C recursion at MYON_MAX_CALL_DEPTH (4000); the VM keeps its own
- * (heap) frame stack so it cannot blow the C stack, but we still bound it so a
- * runaway recursion turns into a clean Myon error rather than eating memory
- * until the OS kills the process (spec §3.4, task item 6).
+ * native C recursion at a stack-derived depth (MYON_MAX_CALL_DEPTH is only its
+ * upper bound -- see myon_max_call_depth() in interpreter.c, known-issues #9);
+ * the VM keeps its own (heap) frame stack so it cannot blow the C stack, but we
+ * still bound it so a runaway recursion turns into a clean Myon error rather
+ * than eating memory until the OS kills the process (spec §3.4, task item 6).
  */
 #define MVM_MAX_FRAMES 1024
 /*
