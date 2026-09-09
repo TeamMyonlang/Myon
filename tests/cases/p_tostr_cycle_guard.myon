@@ -1,0 +1,40 @@
+# Regression test for known-issues #8 (fixed): value_to_cstr() recursed through
+# struct / array / map children with neither a visited set nor a depth limit, so
+# rendering a value that (transitively) contains itself recursed forever and the
+# process died with SIGSEGV (exit 139) -- in both engines, since the MVM shares
+# this renderer through the bridge.
+#
+# Printing a cyclic value must now terminate: the back-edge renders as
+# "<cycle>" instead of recursing.  Acyclic sharing (the same object appearing
+# twice side by side) must still print in full at every occurrence -- the guard
+# tracks the current recursion *path*, not every object ever seen.
+module myon.stdio
+
+myon.struct Node {
+    name: str
+    next: Node
+    kids: myon.array(Node)
+}
+
+# 1. Direct self-reference: a.next == a
+a = Node(name=str("a"), next=myon.nil, kids=myon.array(Node))
+a.next = a
+myon.print(str(a))
+
+# 2. Two-node cycle: b.next == c, c.next == b
+b = Node(name=str("b"), next=myon.nil, kids=myon.array(Node))
+c = Node(name=str("c"), next=b, kids=myon.array(Node))
+b.next = c
+myon.print(str(b))
+
+# 3. Cycle through an array field (the array container is on the path too)
+d = Node(name=str("d"), next=myon.nil, kids=myon.array(Node))
+d.kids.push(d)
+myon.print(str(d))
+
+# 4. Acyclic sharing is NOT a cycle: leaf appears twice and prints in full both
+#    times (a path-based guard, not a global "already seen" one).
+leaf = Node(name=str("leaf"), next=myon.nil, kids=myon.array(Node))
+shared = Node(name=str("shared"), next=leaf, kids=myon.array(Node))
+shared.kids.push(leaf)
+myon.print(str(shared))
