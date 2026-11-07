@@ -178,6 +178,8 @@ test-asan: $(ASAN_BIN)
 	export ASAN_OPTIONS="abort_on_error=1:halt_on_error=1:detect_leaks=0"; \
 	export UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=1:abort_on_error=1"; \
 	bash tests/runtime_regressions.sh ./myon; \
+	bash tests/diagnostic_regressions.sh ./myon; \
+	bash tests/harness_regressions.sh; \
 	./tests/run_tests.sh; \
 	./tests/mvm_compiler_tests.sh; \
 	if [ -f ./tests/run_mvm_tests.sh ]; then ./tests/run_mvm_tests.sh; fi
@@ -279,3 +281,5 @@ test-runtime: all | $(BUILD)
 	$(CC) $(CFLAGS) -Isrc $(RUNTIME_TEST_SRCS) $(LDLIBS) -o $(BUILD)/runtime_memory_tests
 	$(BUILD)/runtime_memory_tests
 	bash tests/runtime_regressions.sh ./$(BIN)
+	bash tests/diagnostic_regressions.sh ./$(BIN)
+	bash tests/harness_regressions.sh

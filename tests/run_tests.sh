@@ -17,6 +17,7 @@
 # Regression tests for Myon Steps 0-5.
 
 set -u
+set -o pipefail
 cd "$(dirname "$0")/.."
 
 MYON=./myon
@@ -96,29 +97,30 @@ strip_cr() { tr -d '\r'; }
 # check_output <name> <myon-file> <expected-file>
 check_output() {
     local name="$1" src="$2" expected="$3"
-    local got expected_txt
-    got=$("$MYON" "$src" 2>/dev/null | strip_cr)
+    local got expected_txt rc
+    got=$("$MYON" "$src" 2>/dev/null | strip_cr); rc=$?
     expected_txt=$(strip_cr < "$expected")
-    if [ "$got" == "$expected_txt" ]; then
+    if [ "$rc" -eq 0 ] && [ "$got" == "$expected_txt" ]; then
         echo "  ok   $name"
         pass=$((pass + 1))
     else
-        echo "  FAIL $name"
+        echo "  FAIL $name (exit $rc)"
         echo "    --- expected ---"; printf '%s\n' "$expected_txt" | sed 's/^/    /'
         echo "    --- got ---";      printf '%s\n' "$got" | sed 's/^/    /'
         fail=$((fail + 1))
     fi
 }
 
-# check_error <name> <myon-file>  (expects a non-zero exit)
+# check_error <name> <myon-file> (language errors: runtime=1, source=65)
 check_error() {
     local name="$1" src="$2"
-    "$MYON" "$src" >/dev/null 2>&1
-    if [ $? -ne 0 ]; then
+    local rc
+    "$MYON" "$src" >/dev/null 2>&1; rc=$?
+    if [ "$rc" -eq 1 ] || [ "$rc" -eq 65 ]; then
         echo "  ok   $name (errored as expected)"
         pass=$((pass + 1))
     else
-        echo "  FAIL $name (expected an error, but exit was 0)"
+        echo "  FAIL $name (expected language error exit 1 or 65, got $rc)"
         fail=$((fail + 1))
     fi
 }
@@ -140,7 +142,8 @@ for t in tests/cases/*.myon; do
     elif [ -f "$base.err" ]; then
         check_error "$name" "$t"
     else
-        echo "  ??   $name (no .out or .err fixture)"
+        echo "  FAIL $name (no .out or .err fixture)"
+        fail=$((fail + 1))
     fi
 done
 
@@ -226,13 +229,13 @@ check_error  pkg_module_cycle          tests/cases/pkgproj_cycle/main.myon
 # Drive the positive fixture from an unrelated CWD using absolute paths.
 check_pkg_cwd_independent() {
     local name="$1"
-    local myon_abs src_abs exp_abs got exp
+    local myon_abs src_abs exp_abs got exp rc
     myon_abs="$(pwd)/myon"
     src_abs="$(pwd)/tests/cases/pkgproj/main.myon"
     exp_abs="$(pwd)/tests/cases/pkgproj/main.out"
-    got=$(cd / && "$myon_abs" "$src_abs" 2>/dev/null | strip_cr)
+    got=$(cd / && "$myon_abs" "$src_abs" 2>/dev/null | strip_cr); rc=$?
     exp=$(strip_cr < "$exp_abs")
-    if [ "$got" == "$exp" ]; then
+    if [ "$rc" -eq 0 ] && [ "$got" == "$exp" ]; then
         echo "  ok   $name (package root resolved from a foreign CWD)"
         pass=$((pass + 1))
     else

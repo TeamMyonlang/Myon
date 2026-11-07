@@ -86,6 +86,25 @@ static void emit(Lexer *lx, TokenType type, char *lexeme, int line, int col) {
     tl_push(lx->out, t);
 }
 
+/* Validate just the rejected code point for diagnostics. Never print an
+ * isolated high byte: malformed/truncated UTF-8 gets a byte-only message. */
+static int diagnostic_utf8(const unsigned char *s, unsigned int *cp) {
+    int n;
+    unsigned int code;
+    if (s[0] >= 0xc2 && s[0] <= 0xdf) { n = 2; code = s[0] & 0x1f; }
+    else if (s[0] >= 0xe0 && s[0] <= 0xef) { n = 3; code = s[0] & 0x0f; }
+    else if (s[0] >= 0xf0 && s[0] <= 0xf4) { n = 4; code = s[0] & 7; }
+    else return 0;
+    for (int i = 1; i < n; i++) {
+        if ((s[i] & 0xc0) != 0x80) return 0; /* includes NUL at end */
+        code = (code << 6) | (s[i] & 0x3f);
+    }
+    if ((n == 3 && code < 0x800) || (n == 4 && code < 0x10000) ||
+        (code >= 0xd800 && code <= 0xdfff) || code > 0x10ffff) return 0;
+    *cp = code;
+    return n;
+}
+
 static void lex_error(Lexer *lx, const char *msg) {
     fprintf(stderr, "myon: lexical error at line %d, col %d: %s\n",
             lx->line, lx->col, msg);
@@ -335,7 +354,17 @@ static void scan_operator(Lexer *lx) {
         case '}': emit(lx, TOK_RBRACE, myon_strdup("}"), line, col); return;
         default: {
             char buf[64];
-            snprintf(buf, sizeof(buf), "unexpected character '%c' (0x%02x)", c, (unsigned char)c);
+            if ((unsigned char)c < 0x80) {
+                snprintf(buf, sizeof(buf), "unexpected character '%c' (0x%02x)", c, (unsigned char)c);
+            } else {
+                const unsigned char *start = (const unsigned char *)lx->src + lx->pos - 1;
+                unsigned int cp = 0;
+                int nbytes = diagnostic_utf8(start, &cp);
+                if (nbytes)
+                    snprintf(buf, sizeof(buf), "unexpected character '%.*s' (U+%04X)", nbytes, (const char *)start, cp);
+                else
+                    snprintf(buf, sizeof(buf), "unexpected byte 0x%02x (invalid UTF-8)", (unsigned char)c);
+            }
             lex_error(lx, buf);
             return;
         }

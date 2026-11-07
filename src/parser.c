@@ -541,7 +541,9 @@ static Stmt *parse_module(Parser *p) {
     buf[0] = '\0';
 
     const Token *head = peek(p);
-    if (head->type == TOK_KW_MYON || head->type == TOK_IDENT) {
+    /* array/map are lexed as compound keywords even in module declarations. */
+    if (head->type == TOK_KW_MYON || head->type == TOK_IDENT ||
+        head->type == TOK_MYON_ARRAY || head->type == TOK_MYON_MAP) {
         if (!path_append(buf, sizeof(buf), &len, NULL, head->lexeme))
             perror_at(p, head, "module path is too long");
         advance(p);

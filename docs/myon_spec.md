@@ -1608,6 +1608,7 @@ myon.print(status2)                     // 200
 ## 11. モジュールシステム
 
 `module` 宣言には次の 3 種類がある。
+組み込みモジュールには `myon.file`・`myon.array`・`myon.map` も指定できる。
 
 ```myon
 system myon.useversion=1        // 使用するMyonバージョンの宣言

@@ -1,0 +1,11 @@
+module myon.stdio
+module myon.file
+module myon.array
+module myon.map
+xs = myon.array(int)
+xs.push(7)
+m = myon.map(str, int)
+m.set(str("answer"), 42)
+myon.print(xs)
+myon.print(m.get(str("answer")))
+myon.print(myon.file.exists(str("")))

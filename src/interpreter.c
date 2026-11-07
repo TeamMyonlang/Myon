@@ -5168,7 +5168,8 @@ static Flow exec_block(Interp *it, Env *env, StmtList *body) {
 
 static const char *BUILTIN_MODULES[] = {
     "myon.stdio", "myon.math", "myon.string", "myon.ffi",
-    "myon.time", "myon.random", "myon.net", "myon.http", NULL
+    "myon.time", "myon.random", "myon.net", "myon.http",
+    "myon.file", "myon.array", "myon.map", NULL
 };
 
 static int is_builtin_module(const char *path) {
