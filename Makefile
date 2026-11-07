@@ -179,6 +179,7 @@ test-asan: $(ASAN_BIN)
 	export UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=1:abort_on_error=1"; \
 	bash tests/runtime_regressions.sh ./myon; \
 	bash tests/diagnostic_regressions.sh ./myon; \
+	bash tests/numeric_regressions.sh ./myon; \
 	bash tests/harness_regressions.sh; \
 	./tests/run_tests.sh; \
 	./tests/mvm_compiler_tests.sh; \
@@ -282,4 +283,5 @@ test-runtime: all | $(BUILD)
 	$(BUILD)/runtime_memory_tests
 	bash tests/runtime_regressions.sh ./$(BIN)
 	bash tests/diagnostic_regressions.sh ./$(BIN)
+	bash tests/numeric_regressions.sh ./$(BIN)
 	bash tests/harness_regressions.sh

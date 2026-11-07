@@ -1,0 +1,23 @@
+module myon.stdio
+# Adjacent int64 values collapse to the same double above 2^53.
+a = 9007199254740992
+b = 9007199254740993
+myon.print(a == b)
+myon.print(a != b)
+myon.print(a < b)
+myon.print(a > b)
+myon.print(a <= b)
+myon.print(a >= b)
+myon.print(-b < -a)
+myon.print(-b == -a)
+maximum = 9223372036854775807
+minimum = -9223372036854775807 - 1
+myon.print(maximum > maximum - 1)
+myon.print(maximum != maximum - 1)
+myon.print(minimum < minimum + 1)
+myon.print(minimum == minimum + 1)
+# Reversing operands must reverse the order, without subtracting/overflowing.
+myon.print(b > a)
+myon.print(b <= a)
+myon.print(minimum < maximum)
+myon.print(maximum > minimum)

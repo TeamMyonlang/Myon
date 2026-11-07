@@ -449,20 +449,31 @@ static Value cast_to_str(Interp *it, int line, Value v) {
     return value_str(s);
 }
 
+/* double(LLONG_MAX) rounds up to 2^63, so the upper bound must be
+ * exclusive. Compare before the C cast: nonfinite/out-of-range casts are UB. */
+static Value checked_float_to_int(Interp *it, int line, double n, const char *operation) {
+    if (!isfinite(n) || n < (double)LLONG_MIN || n >= -(double)LLONG_MIN)
+        runtime_error(it, line, "%s: numeric value out of range for int", operation);
+    return value_int((long long)n);
+}
+
 static Value cast_to_int(Interp *it, int line, Value v) {
     switch (v.type) {
         case TYPE_INT: return v;
-        case TYPE_FLOAT: { long long r = (long long)v.as.f; return value_int(r); }
+        case TYPE_FLOAT: return checked_float_to_int(it, line, v.as.f, "int()");
         case TYPE_BOOL: { long long r = v.as.b; return value_int(r); }
         case TYPE_STR: {
             char *end = NULL;
+            errno = 0;
             long long r = strtoll(v.as.obj->as.str, &end, 10);
+            int range_error = errno == ERANGE;
             if (end == v.as.obj->as.str || *end != '\0') {
                 char *bad = myon_strdup(v.as.obj->as.str);
                 value_free(&v);
                 runtime_error(it, line, "int(): cannot parse '%s' as integer", bad);
             }
             value_free(&v);
+            if (range_error) runtime_error(it, line, "int(): integer string out of range");
             return value_int(r);
         }
         case TYPE_CHAR: {
@@ -528,6 +539,30 @@ static long long int_arith(Interp *it, int line, OpKind op, long long a, long lo
     }
 }
 
+static Value negate_value(Interp *it, int line, Value v) {
+    if (v.type == TYPE_INT) {
+        if (v.as.i == LLONG_MIN) runtime_error(it, line, "integer overflow in negation");
+        return value_int(-v.as.i);
+    }
+    if (v.type == TYPE_FLOAT) return value_float(-v.as.f);
+    Type t = v.type;
+    value_free(&v);
+    runtime_error(it, line, "unary '-' requires int or float, got %s", type_name(t));
+    return value_nil();
+}
+
+static int compare_ints(long long a, long long b, OpKind op) {
+    switch (op) {
+        case OP_LT: return a < b;
+        case OP_GT: return a > b;
+        case OP_LE: return a <= b;
+        case OP_GE: return a >= b;
+        case OP_EQ: return a == b;
+        case OP_NEQ: return a != b;
+        default: return 0;
+    }
+}
+
 static int compare_ordered(double a, double b, OpKind op) {
     switch (op) {
         case OP_LT: return a < b;
@@ -575,7 +610,7 @@ static Value eval_binary(Interp *it, int line, OpKind op, Value l, Value r) {
                 case OP_ADD: case OP_SUB: case OP_MUL: case OP_DIV:
                     return value_int(int_arith(it, line, op, a, b));
                 default:
-                    return value_bool(compare_ordered((double)a, (double)b, op));
+                    return value_bool(compare_ints(a, b, op));
             }
         }
         case TYPE_FLOAT: {
@@ -2419,7 +2454,10 @@ static int call_stdlib(Interp *it, Env *env, const char *name, Expr *call, Value
     }
     if (strcmp(name, "myon.math.abs") == 0) {
         Value a = eval_arg(it, env, call, 0);
-        if (a.type == TYPE_INT) { long long v = a.as.i < 0 ? -a.as.i : a.as.i; *out = value_int(v); }
+        if (a.type == TYPE_INT) {
+            if (a.as.i == LLONG_MIN) runtime_error(it, line, "integer overflow in myon.math.abs");
+            *out = value_int(a.as.i < 0 ? -a.as.i : a.as.i);
+        }
         else *out = value_float(fabs(as_number(it, line, a)));
         value_free(&a); return 1;
     }
@@ -2427,13 +2465,13 @@ static int call_stdlib(Interp *it, Env *env, const char *name, Expr *call, Value
         Value a = eval_arg(it, env, call, 0);
         /* floor(int) == int: skip the lossy double round-trip (Step1). */
         if (a.type == TYPE_INT) { *out = value_int(a.as.i); value_free(&a); return 1; }
-        *out = value_int((long long)floor(as_number(it, line, a))); value_free(&a); return 1;
+        *out = checked_float_to_int(it, line, floor(as_number(it, line, a)), "myon.math.floor"); value_free(&a); return 1;
     }
     if (strcmp(name, "myon.math.ceil") == 0) {
         Value a = eval_arg(it, env, call, 0);
         /* ceil(int) == int: skip the lossy double round-trip (Step1). */
         if (a.type == TYPE_INT) { *out = value_int(a.as.i); value_free(&a); return 1; }
-        *out = value_int((long long)ceil(as_number(it, line, a))); value_free(&a); return 1;
+        *out = checked_float_to_int(it, line, ceil(as_number(it, line, a)), "myon.math.ceil"); value_free(&a); return 1;
     }
     if (strcmp(name, "myon.math.max") == 0) {
         Value a = eval_arg(it, env, call, 0), b = eval_arg(it, env, call, 1);
@@ -2513,12 +2551,12 @@ static int call_stdlib(Interp *it, Env *env, const char *name, Expr *call, Value
     if (strcmp(name, "myon.math.round") == 0) {
         Value a = eval_arg(it, env, call, 0);
         if (a.type == TYPE_INT) { *out = value_int(a.as.i); value_free(&a); return 1; }
-        *out = value_int((long long)round(as_number(it, line, a))); value_free(&a); return 1;
+        *out = checked_float_to_int(it, line, round(as_number(it, line, a)), "myon.math.round"); value_free(&a); return 1;
     }
     if (strcmp(name, "myon.math.trunc") == 0) {
         Value a = eval_arg(it, env, call, 0);
         if (a.type == TYPE_INT) { *out = value_int(a.as.i); value_free(&a); return 1; }
-        *out = value_int((long long)trunc(as_number(it, line, a))); value_free(&a); return 1;
+        *out = checked_float_to_int(it, line, trunc(as_number(it, line, a)), "myon.math.trunc"); value_free(&a); return 1;
     }
 
     /* mod: int% for two ints, fmod otherwise; division by zero returns a
@@ -2607,8 +2645,11 @@ static int call_stdlib(Interp *it, Env *env, const char *name, Expr *call, Value
         unsigned long long y = (b.as.i < 0) ? -(unsigned long long)b.as.i
                                             :  (unsigned long long)b.as.i;
         while (y != 0) { unsigned long long t = x % y; x = y; y = t; }
+        value_free(&a); value_free(&b);
+        if (x > (unsigned long long)LLONG_MAX)
+            runtime_error(it, line, "integer overflow in myon.math.gcd");
         *out = value_int((long long)x);
-        value_free(&a); value_free(&b); return 1;
+        return 1;
     }
 
     /* lcm(a, b) ret int, error: abs(a / gcd(a,b) * b), dividing first to
@@ -4660,10 +4701,7 @@ static Value eval_expr(Interp *it, Env *env, Expr *e) {
         case EXPR_UNARY: {
             Value v = eval_expr(it, env, e->as.unary.operand);
             if (e->as.unary.op == OP_NEG) {
-                if (v.type == TYPE_INT)   return value_int(-v.as.i);
-                if (v.type == TYPE_FLOAT) return value_float(-v.as.f);
-                Type t = v.type; value_free(&v);
-                runtime_error(it, e->line, "unary '-' requires int or float, got %s", type_name(t));
+                return negate_value(it, e->line, v);
             } else {
                 if (v.type != TYPE_BOOL) {
                     Type t = v.type; value_free(&v);
@@ -5753,11 +5791,7 @@ Value myon_bridge_binary(Interp *it, int line, int op, Value l, Value r) {
 }
 
 Value myon_bridge_neg(Interp *it, int line, Value v) {
-    if (v.type == TYPE_INT)   { long long x = v.as.i; value_free(&v); return value_int(-x); }
-    if (v.type == TYPE_FLOAT) { double x = v.as.f;   value_free(&v); return value_float(-x); }
-    Type t = v.type; value_free(&v);
-    runtime_error(it, line, "unary '-' requires int or float, got %s", type_name(t));
-    return value_nil();
+    return negate_value(it, line, v);
 }
 
 Value myon_bridge_not(Interp *it, int line, Value v) {

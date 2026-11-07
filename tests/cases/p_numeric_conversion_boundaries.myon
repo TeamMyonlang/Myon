@@ -1,0 +1,27 @@
+module myon.stdio
+module myon.math
+minimum = -9223372036854775807 - 1
+maximum = 9223372036854775807
+myon.print(int("9223372036854775807"))
+myon.print(int("-9223372036854775808"))
+myon.print(int(9223372036854774784.0))
+myon.print(int(-9223372036854775808.0))
+myon.print(int(1.9))
+myon.print(int(-1.9))
+myon.print(myon.math.floor(minimum))
+myon.print(myon.math.ceil(maximum))
+myon.print(myon.math.round(maximum))
+myon.print(myon.math.trunc(minimum))
+myon.print(myon.math.floor(-9223372036854775808.0))
+myon.print(myon.math.ceil(9223372036854774784.0))
+myon.print(myon.math.round(-1.5))
+myon.print(myon.math.trunc(-1.9))
+myon.print(myon.math.floor(-1.1))
+myon.print(myon.math.ceil(-1.1))
+myon.print(myon.math.abs(-9223372036854775807))
+myon.print(-(-9223372036854775807))
+myon.print(-0)
+myon.print(myon.math.gcd(minimum, 2))
+myon.print(myon.math.gcd(1, minimum))
+myon.print(myon.math.gcd(-42, 28))
+myon.print(myon.math.gcd(0, 0))
