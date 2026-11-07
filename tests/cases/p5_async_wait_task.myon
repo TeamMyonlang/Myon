@@ -9,8 +9,8 @@
 #   * cooperative sleep ordering works (early finishes before producer),
 #   * awaiting a not-yet-finished task suspends the awaiter and later resumes
 #     it correctly once the target reaches TASK_DONE,
-#   * a finished task's result survives until awaited (its fiber/stack stays
-#     parked, not freed, which is the delicate part of the Fiber lifecycle).
+#   * a finished task's result survives until awaited, even after its
+#     fiber/stack has been reclaimed by the scheduler.
 module myon.stdio
 module myon.time
 

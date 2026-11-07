@@ -1,0 +1,15 @@
+# Each suspended coroutine retains its own recursion budget and current task.
+module myon.stdio
+module myon.time
+myon.func recurse(n: int) ret int {
+    myon.if n <= 0 then {
+        myon.await myon.time.sleep_ms(0)
+        ret 0
+    }
+    ret recurse(n - 1) + 1
+}
+myon.async myon.func worker(n: int) ret int { ret recurse(n) }
+a = worker(8)
+b = worker(12)
+myon.print(myon.await a)
+myon.print(myon.await b)

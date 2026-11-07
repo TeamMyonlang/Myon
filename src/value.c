@@ -16,6 +16,7 @@
 
 #include "value.h"
 #include "ast.h"
+#include "event_loop.h"
 #include "common.h"
 
 #include <stdio.h>
@@ -59,11 +60,41 @@ Value value_void(void)         { Value x; x.type = TYPE_VOID;  x.as.i = 0; retur
 /* Object allocation                                                   */
 /* ------------------------------------------------------------------ */
 
+static ValueGC *gc_head;
+static size_t gc_live, gc_since_collect, gc_threshold = 256;
+static int gc_collecting;
+
+static void gc_register(ValueGC *g, void *owner, int *refs, int is_cell) {
+    memset(g, 0, sizeof(*g));
+    g->owner = owner; g->refs = refs; g->is_cell = is_cell;
+    g->next = gc_head;
+    if (gc_head) gc_head->prev = g;
+    gc_head = g;
+    gc_live++;
+}
+static void gc_unregister(ValueGC *g) {
+    if (g->prev) g->prev->next = g->next;
+    else gc_head = g->next;
+    if (g->next) g->next->prev = g->prev;
+    gc_live--;
+}
+static void gc_before_alloc(void) {
+    /* Amortize full graph scans over allocation volume, including live heaps. */
+    if (++gc_since_collect >= gc_threshold) {
+        value_collect_cycles();
+        gc_since_collect = 0;
+        gc_threshold = gc_live + 256;
+    }
+}
+size_t value_live_allocations(void) { return gc_live; }
+
 static Obj *obj_new(ObjKind kind) {
+    gc_before_alloc();
     Obj *o = (Obj *)myon_xmalloc(sizeof(Obj));
     memset(o, 0, sizeof(Obj));
     o->kind = kind;
     o->refcount = 1;
+    gc_register(&o->gc, o, &o->refcount, 0);
     return o;
 }
 
@@ -132,9 +163,11 @@ Value value_func(FuncDecl *decl, Env *closure) {
 
 /* ---- MVM upvalue cells (boxed captured variables, spec §7.3) ---- */
 UpvalueCell *upvalue_cell_new(Value initial) {
+    gc_before_alloc();
     UpvalueCell *c = (UpvalueCell *)myon_xmalloc(sizeof(UpvalueCell));
     c->value = initial;   /* takes ownership */
     c->refcount = 1;
+    gc_register(&c->gc, c, &c->refcount, 1);
     return c;
 }
 
@@ -144,8 +177,9 @@ UpvalueCell *upvalue_cell_ref(UpvalueCell *c) {
 }
 
 void upvalue_cell_unref(UpvalueCell *c) {
-    if (!c) return;
+    if (!c || (gc_collecting && !c->gc.marked)) return;
     if (--c->refcount <= 0) {
+        gc_unregister(&c->gc);
         value_free(&c->value);
         free(c);
     }
@@ -153,6 +187,7 @@ void upvalue_cell_unref(UpvalueCell *c) {
 
 Value value_task(void *task) {
     Obj *o = obj_new(OBJ_TASK);
+    event_loop_task_ref((Task *)task);
     o->as.task.task = task;
     return obj_value(TYPE_TASK, o);
 }
@@ -178,7 +213,7 @@ Value value_copy(const Value *v) {
     return out;
 }
 
-static void obj_free(Obj *o) {
+static void obj_destroy_payload(Obj *o) {
     switch (o->kind) {
         case OBJ_STR:
             free(o->as.str);
@@ -231,19 +266,117 @@ static void obj_free(Obj *o) {
             /* decl and closure are not owned by the function value */
             break;
         case OBJ_TASK:
-            /* the event-loop Task is owned by the loop, not by this handle */
+            event_loop_task_unref((Task *)o->as.task.task);
             break;
     }
+}
+
+static void obj_free(Obj *o) {
+    gc_unregister(&o->gc);
+    obj_destroy_payload(o);
     free(o);
 }
 
 void value_free(Value *v) {
     if (!v) return;
     if (is_obj(v) && v->as.obj) {
-        if (--v->as.obj->refcount == 0)
+        if (!(gc_collecting && !v->as.obj->gc.marked) &&
+            --v->as.obj->refcount == 0)
             obj_free(v->as.obj);
         v->as.obj = NULL;
     }
+}
+
+/* Visit strong edges only: ASTs and tree-walk closure environments are borrowed.
+ * Upvalue cells are graph nodes themselves so shared cells are counted once. */
+static void gc_value_edge(Value *v, void (*visit)(ValueGC *, void *), void *ud) {
+    if (is_obj(v) && v->as.obj) visit(&v->as.obj->gc, ud);
+}
+static void gc_edges(ValueGC *g, void (*visit)(ValueGC *, void *), void *ud) {
+    if (g->is_cell) {
+        gc_value_edge(&((UpvalueCell *)g->owner)->value, visit, ud);
+        return;
+    }
+    Obj *o = (Obj *)g->owner;
+    switch (o->kind) {
+    case OBJ_ARRAY:
+        for (int i = 0; i < o->as.arr.count; i++)
+            gc_value_edge(&o->as.arr.items[i], visit, ud);
+        break;
+    case OBJ_MAP:
+        for (MapEntry *e = o->as.map.head; e; e = e->next) {
+            gc_value_edge(&e->key, visit, ud);
+            gc_value_edge(&e->val, visit, ud);
+        }
+        break;
+    case OBJ_STRUCT:
+        for (int i = 0; i < o->as.st.field_count; i++)
+            gc_value_edge(&o->as.st.field_vals[i], visit, ud);
+        break;
+    case OBJ_FUNC:
+        if (o->as.fn.bound_self) gc_value_edge(o->as.fn.bound_self, visit, ud);
+        for (int i = 0; i < o->as.fn.upvalue_count; i++)
+            if (o->as.fn.upvalues[i]) visit(&o->as.fn.upvalues[i]->gc, ud);
+        break;
+    case OBJ_TASK: {
+        Task *t = (Task *)o->as.task.task;
+        /* Active tasks and C waiters root their result independently. Once
+         * only this language handle owns it, its result is an internal edge. */
+        if (event_loop_task_result_exclusive(t)) {
+            Value *result = (Value *)event_loop_task_result(t);
+            if (result) gc_value_edge(result, visit, ud);
+        }
+        break;
+    }
+    default: break;
+    }
+}
+static void gc_subtract(ValueGC *g, void *ud) { (void)ud; g->trial--; }
+static void gc_mark(ValueGC *g, void *ud) {
+    ValueGC **work = (ValueGC **)ud;
+    if (g->marked) return;
+    g->marked = 1;
+    g->work = *work;
+    *work = g;
+}
+void value_collect_cycles(void) {
+    if (gc_collecting) return;
+    gc_collecting = 1;
+    for (ValueGC *g = gc_head; g; g = g->next) {
+        g->trial = *g->refs;
+        g->marked = 0;
+    }
+    for (ValueGC *g = gc_head; g; g = g->next) gc_edges(g, gc_subtract, NULL);
+    ValueGC *work = NULL;
+    for (ValueGC *g = gc_head; g; g = g->next)
+        if (g->trial > 0) gc_mark(g, &work);
+    while (work) {
+        ValueGC *g = work;
+        work = g->work;
+        gc_edges(g, gc_mark, &work);
+    }
+    /* Detach dead nodes from the registry while their storage remains valid. */
+    ValueGC *dead = NULL;
+    for (ValueGC *g = gc_head; g;) {
+        ValueGC *next = g->next;
+        if (!g->marked) {
+            gc_unregister(g);
+            g->work = dead; dead = g;
+        }
+        g = next;
+    }
+    /* Suppress decrements between dead nodes during payload destruction, and
+     * delay freeing node storage until every edge has been released. */
+    for (ValueGC *g = dead; g; g = g->work) {
+        if (g->is_cell) value_free(&((UpvalueCell *)g->owner)->value);
+        else obj_destroy_payload((Obj *)g->owner);
+    }
+    while (dead) {
+        ValueGC *next = dead->work;
+        free(dead->owner);
+        dead = next;
+    }
+    gc_collecting = 0;
 }
 
 /* ------------------------------------------------------------------ */

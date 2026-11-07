@@ -20,6 +20,8 @@
 #include <stddef.h>
 #include "net.h"   /* myon_fd_t (fd width: raw fds carried at native width) */
 
+#define MYON_TASK_STACK_SIZE (256u * 1024u)
+
 /*
  * Phase5, Step1: a single-threaded, cooperative event loop.
  *
@@ -56,10 +58,17 @@ void       event_loop_destroy(EventLoop *loop);
 /*
  * Spawn a new task.  `entry` is the C function run first on the task's own
  * stack; `ud` is passed straight through to it.  The returned handle stays
- * valid until event_loop_destroy() (tasks are not individually freed while the
- * loop is alive, because their C stacks may still be referenced).
+ * valid while active. Retain it explicitly to keep its result after completion.
+ * Completed stacks are released from the scheduler core, never from the task.
  */
 Task *event_loop_spawn(EventLoop *loop, void (*entry)(void *ud), void *ud);
+
+/* Handles own only metadata/results, independently of coroutine stacks. */
+/* Per-coroutine runtime nesting counter; survives suspension. */
+int *event_loop_task_call_depth(Task *task);
+void event_loop_task_ref(Task *task);
+void event_loop_task_unref(Task *task);
+void event_loop_set_result_cleanup(EventLoop *loop, void (*cleanup)(void *));
 
 /* From the running task: suspend until `fd` is readable/writable.  Returns
  * >=0 on readiness, <0 on select() error.  `fd` is a myon_fd_t so a Windows
@@ -79,6 +88,8 @@ int event_loop_task_done(Task *target);
 /* Accessors for a finished task's payload (set by the task's entry via
  * event_loop_task_set_result). */
 void *event_loop_task_result(Task *target);
+/* True when a finished task is owned by just one value handle (no loop/waiter). */
+int event_loop_task_result_exclusive(Task *target);
 int   event_loop_task_has_error(Task *target);
 
 /* Called from within a task's entry to record its outcome before returning. */

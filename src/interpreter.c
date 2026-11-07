@@ -196,10 +196,8 @@ static long long myon_wallclock_ms(void) {
 /*
  * Effective call-depth cap for this process, computed once on first use.
  *
- * Note this deliberately describes only the *main* C stack.  Coroutines run on
- * their own, much smaller stacks and reset call_depth on entry (see
- * async_task_entry); sizing that budget is known-issues #10 and is not
- * addressed here.
+ * This describes the main C stack. call_function uses the coroutine stack
+ * size and a per-task nesting counter when executing in the event loop.
  */
 static int myon_max_call_depth(void) {
     static int cached = 0;
@@ -265,12 +263,9 @@ struct Interp {
     /* Phase4 myon.random: 1 once the PRNG has been seeded (either explicitly
      * via myon.random.seed() or auto-seeded on first int()/float() use). */
     int          random_seeded;
-    /* Phase5: cooperative event loop + the task currently executing.  The
-     * loop is created lazily on first async/await/net use so plain scripts
-     * pay nothing.  current_task is the running coroutine (including the
-     * implicit top-level task) or NULL when no loop is active. */
+    /* Cooperative event loop, created lazily. Query its current task at use
+     * sites: a cached interpreter pointer becomes stale across suspension. */
     EventLoop   *loop;
-    Task        *current_task;
     /* Phase5 myon.net: socket table (lazily created on first myon.net use). */
     NetState    *net;
     /* Phase5.2: current interpreter-level call-nesting depth, used to guard
@@ -412,8 +407,17 @@ static Value call_function(Interp *it, int line, Value fn, Value *args, int argc
                            char **arg_names);
 
 /* Phase5: ensure the event loop exists (lazy). */
+static void task_result_free(void *payload) {
+    Value *v = (Value *)payload;
+    value_free(v);
+    free(v);
+}
+
 static EventLoop *ensure_loop(Interp *it) {
-    if (!it->loop) it->loop = event_loop_create();
+    if (!it->loop) {
+        it->loop = event_loop_create();
+        event_loop_set_result_cleanup(it->loop, task_result_free);
+    }
     return it->loop;
 }
 
@@ -1938,7 +1942,7 @@ static int call_time(Interp *it, Env *env, const char *name, Expr *call, Value *
              * other tasks instead of blocking the whole process.  Outside any
              * coroutine (plain synchronous scripts) fall back to the classic
              * blocking nanosleep so pre-Phase5 semantics are preserved. */
-            if (it->current_task && it->loop) {
+            if (it->loop && event_loop_current(it->loop)) {
                 event_loop_sleep_ms(it->loop, ms);
             } else {
                 /* Synchronous (non-coroutine) fallback: block the process.
@@ -1993,7 +1997,7 @@ static int call_time(Interp *it, Env *env, const char *name, Expr *call, Value *
             long long target_ms = 1000 / target_fps;
             long long remaining = target_ms - elapsed;
             if (remaining > 0) {
-                if (it->current_task && it->loop) {
+                if (it->loop && event_loop_current(it->loop)) {
                     event_loop_sleep_ms(it->loop, remaining);
                 } else {
 #if defined(_WIN32)
@@ -2170,7 +2174,7 @@ static NetState *ensure_net(Interp *it) {
 /* Wait until `fd` is readable/writable.  Inside a coroutine this suspends
  * cooperatively; outside one it drives the loop / blocks on the single fd. */
 static void net_wait_fd(Interp *it, myon_fd_t fd, int for_write) {
-    if (it->current_task && it->loop) {
+    if (it->loop && event_loop_current(it->loop)) {
         if (for_write) event_loop_wait_writable(it->loop, fd);
         else           event_loop_wait_readable(it->loop, fd);
         return;
@@ -3460,13 +3464,20 @@ static Value call_function(Interp *it, int line, Value fn, Value *args, int argc
      * than letting the OS kill us with SIGSEGV.  Note: it->call_depth has not
      * yet been incremented for this frame, so comparing >= against the cap makes
      * the (depth+1)-th nested call the one that fails. */
+    Task *running = it->loop ? event_loop_current(it->loop) : NULL;
+    int *call_depth = running ? event_loop_task_call_depth(running) : &it->call_depth;
     int max_depth = myon_max_call_depth();
-    if (it->call_depth >= max_depth)
+    if (running) {
+        /* The coroutine has its own 256 KiB stack, regardless of RLIMIT_STACK.
+         * Do not apply the main-stack minimum (64) to sanitizer stacks. */
+        max_depth = (int)(MYON_TASK_STACK_SIZE / 4 * 3 / MYON_CALL_FRAME_BYTES);
+    }
+    if (*call_depth >= max_depth)
         runtime_error(it, line,
             "call stack too deep: recursion exceeded %d nested calls "
             "(possible infinite recursion in '%s')",
             max_depth, fd->name ? fd->name : "<lambda>");
-    it->call_depth++;
+    (*call_depth)++;
 
     Env *call_env = env_new(fn.as.obj->as.fn.closure);
     /* Known-issue #1: register this frame so a runtime_error() longjmp from any
@@ -3538,7 +3549,7 @@ static Value call_function(Interp *it, int line, Value fn, Value *args, int argc
     /* Phase5.2: pop this frame's depth on the normal (return/void) exit path.
      * The runtime_error paths above intentionally skip this because they
      * longjmp past here to the top-level barrier, which resets call_depth. */
-    it->call_depth--;
+    (*call_depth)--;
     return result;
 }
 
@@ -3566,9 +3577,6 @@ typedef struct {
 static void async_task_entry(void *ud) {
     AsyncCtx *ctx = (AsyncCtx *)ud;
     Interp *it = ctx->it;
-
-    Task *prev_task = it->current_task;
-    it->current_task = ctx->task;
 
     /* Install a local error barrier: a runtime_error inside the body must not
      * longjmp across the coroutine boundary.  On error we finish the task with
@@ -3601,7 +3609,6 @@ static void async_task_entry(void *ud) {
 
     it->call_depth = saved_depth;
     memcpy(&it->on_error, &saved, sizeof(jmp_buf));
-    it->current_task = prev_task;
 
     /* release the captured fn/args now that the body has finished */
     value_free(&ctx->fn);
@@ -3640,7 +3647,7 @@ static Value await_task(Interp *it, int line, Value taskv) {
     }
 
     if (!event_loop_task_done(target)) {
-        if (it->current_task) {
+        if (event_loop_current(it->loop)) {
             /* cooperative: suspend this coroutine until target finishes */
             event_loop_wait_task(it->loop, target);
         } else {
@@ -3846,9 +3853,6 @@ static void http_conn_task_entry(void *ud) {
     HttpConnCtx *c = (HttpConnCtx *)ud;
     Interp *it = c->it;
 
-    Task *prev = it->current_task;
-    it->current_task = c->task;
-
     jmp_buf saved;
     memcpy(&saved, &it->on_error, sizeof(jmp_buf));
 
@@ -3929,7 +3933,6 @@ static void http_conn_task_entry(void *ud) {
     }
 
     memcpy(&it->on_error, &saved, sizeof(jmp_buf));
-    it->current_task = prev;
 
     net_close(c->st, c->conn_id);
     value_free(&c->handler);
@@ -3957,9 +3960,6 @@ static void http_accept_loop_entry(void *ud) {
     Interp *it = sc->it;
     NetState *st = sc->st;
 
-    Task *prev = it->current_task;
-    it->current_task = sc->task;
-
     myon_fd_t lfd = net_raw_fd(st, sc->lsock); /* native-width fd */
     for (;;) {
         char *peer = NULL, *aerr = NULL;
@@ -3981,7 +3981,6 @@ static void http_accept_loop_entry(void *ud) {
         }
     }
 
-    it->current_task = prev;
     net_close(st, sc->lsock);
     value_free(&sc->handler);
     free(sc->root_dir);
@@ -4028,7 +4027,7 @@ static Value http_run_server(Interp *it, int line, int port,
                                          http_accept_loop_entry, sc);
     sc->task = server_task;
 
-    if (it->current_task) {
+    if (event_loop_current(it->loop)) {
         /* Inside another coroutine (e.g. a test that also runs a client task):
          * the server is background work.  Mark it a daemon so it does not keep
          * the program alive once the foreground tasks finish, and yield to the
@@ -4038,7 +4037,7 @@ static Value http_run_server(Interp *it, int line, int port,
         /* The task that is blocked serving (this coroutine) is likewise
          * background work — mark it a daemon too so awaiting the endless
          * accept loop does not count as foreground and hang program exit. */
-        event_loop_set_daemon(it->current_task, 1);
+        event_loop_set_daemon(event_loop_current(it->loop), 1);
         event_loop_wait_task(it->loop, server_task);
     } else {
         /* Top level: this is the whole program's purpose (like
@@ -5671,6 +5670,7 @@ void interp_free(Interp *it) {
     free(it->cleanup_stack);
     free(it->script_dir);
     free(it);
+    value_collect_cycles();
 }
 
 /*
@@ -5901,9 +5901,6 @@ static void bridge_task_entry(void *ud) {
     BridgeTaskCtx *ctx = (BridgeTaskCtx *)ud;
     Interp *it = ctx->it;
 
-    Task *prev_task = it->current_task;
-    it->current_task = ctx->task;
-
     Value *res = (Value *)myon_xmalloc(sizeof(Value));
     *res = value_nil();
     int has_error = 0;
@@ -5928,7 +5925,6 @@ static void bridge_task_entry(void *ud) {
 
     it->call_depth = saved_depth;
     memcpy(&it->on_error, &saved, sizeof(jmp_buf));
-    it->current_task = prev_task;
 
     event_loop_task_set_result(ctx->task, res, has_error);
     free(ctx);
@@ -5999,5 +5995,6 @@ int interpret(Program *program) {
     free(it.programs);
     free(it.cleanup_stack); /* Known-issue #1: backing array (see interp_free) */
     free(it.script_dir);
+    value_collect_cycles();
     return rc;
 }
