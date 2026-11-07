@@ -15,11 +15,11 @@
 | 型チェックと明示キャスト | `interpreter.c` | `p_numeric_conversion_boundaries`、`numeric_regressions.sh` |
 | 整数演算と比較 | `interpreter.c` | `step12_overflow`、`p_int_comparison_precision`。比較は double を経由しない |
 | if / elif / else、while、for、break / continue | `parser.c`、`interpreter.c` | `step5_logic`、`examples/control_flow.myon` |
-| ブロックスコープ、`myon.expose` | `env.c`、`interpreter.c` | `step8_shadow`、`step8_expose`。MVM とのエラー発生段階の差は既知の問題26 |
+| ブロックスコープ、`myon.expose` | `env.c`、`interpreter.c` | `step8_shadow`、`step8_expose`。エラー発生段階の差は `.mvm-exit` で明示 |
 | 関数・複数戻り値・ラムダ | `interpreter.c`、`mvm_compiler.c`、`mvm_vm.c` | 関数型・捕捉・ネイティブ境界の制約は MVM 仕様7節 |
 | 構造体・継承・メソッド | `types.c`、`interpreter.c` | `step9_struct`。C FFI の構造体レイアウトとは別機能 |
 | ジェネリクス | `parser.c`、`interpreter.c`、`mvm_compiler.c` | `step15_generics`。型制約構文はない |
-| 文字列補間 | `interpreter.c`、`mvm_compiler.c` | `{expr}` を評価する。バックスラッシュエスケープは既知の問題14 |
+| 文字列補間 | `interpreter.c`、`mvm_compiler.c` | `{expr}` を評価する。エスケープのバイト検査は `string_regressions.sh` |
 
 `value_copy` / `value_free` は参照カウントを操作します。到達不能な循環は、
 Obj と MVM の UpvalueCell を対象とするコレクタで回収します。
@@ -137,7 +137,8 @@ OS 判定と機能マクロは `src/platform.h` にあります。Linux・macOS�
 
 メインスイートの `.out` は出力と終了コード0、`.err` は終了コード1/65を検査します。
 等価性スイートは両エンジンを1回ずつ実行し、未対応診断を除外として記録します。
-エラーの発生段階や全文が一致することまでは全ケースで検査していません。
+エラーケースは終了コード1/65の段階一致を要求します。既知の段階差がある3件は
+`.mvm-exit` で両エンジンの期待コードを指定します。診断全文の一致は要求しません。
 
 ## 変更記録の参照
 

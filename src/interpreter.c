@@ -691,6 +691,11 @@ static Value interpolate_string(Interp *it, Env *env, int line, const char *raw)
 
     const char *s = raw;
     while (*s) {
+        char escaped;
+        if (myon_string_escape(&s, &escaped)) {
+            if (len + 1 >= cap) { cap *= 2; out = myon_xrealloc(out, cap); }
+            out[len++] = escaped; out[len] = '\0'; continue;
+        }
         if (s[0] == '{' && s[1] == '{') { /* literal { */
             if (len + 1 >= cap) { cap *= 2; out = myon_xrealloc(out, cap); }
             out[len++] = '{'; out[len] = '\0'; s += 2; continue;

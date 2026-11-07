@@ -94,9 +94,23 @@ for t in tests/cases/*.myon; do
             FAILED_NAMES="$FAILED_NAMES $name"
         fi
     elif [ -f "$base.err" ]; then
-        # Both engines must report a language error; signals/timeouts fail.
+        # Require the same error stage, unless a fixture pins both exit codes.
+        expected_tw=$tw_rc
+        expected_vm=$tw_rc
+        if [ -f "$base.mvm-exit" ]; then
+            expected=$(tr -d '\r' < "$base.mvm-exit")
+            case "$expected" in
+                '1 1'|'1 65'|'65 1'|'65 65')
+                    read -r expected_tw expected_vm <<< "$expected" ;;
+                *)
+                    echo "  FAIL $name (invalid .mvm-exit; expected two codes: 1 or 65)"
+                    fail=$((fail + 1))
+                    FAILED_NAMES="$FAILED_NAMES $name"
+                    continue ;;
+            esac
+        fi
         if { [ "$tw_rc" -eq 1 ] || [ "$tw_rc" -eq 65 ]; } &&
-           { [ "$vm_rc" -eq 1 ] || [ "$vm_rc" -eq 65 ]; }; then
+           [ "$tw_rc" -eq "$expected_tw" ] && [ "$vm_rc" -eq "$expected_vm" ]; then
             echo "  ok   $name (both errored: tree-walk=$tw_rc, MVM=$vm_rc)"
             pass=$((pass + 1))
         else

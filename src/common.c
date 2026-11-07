@@ -27,3 +27,18 @@ char *myon_strndup(const char *s, size_t n) {
 char *myon_strdup(const char *s) {
     return myon_strndup(s, strlen(s));
 }
+
+bool myon_string_escape(const char **raw, char *out) {
+    const char *s = *raw;
+    if (s[0] != '\\') return false;
+    switch (s[1]) {
+        case 'n': *out = '\n'; break;
+        case 'r': *out = '\r'; break;
+        case 't': *out = '\t'; break;
+        case '\\': *out = '\\'; break;
+        case '"': *out = '"'; break;
+        default: return false;
+    }
+    *raw += 2;
+    return true;
+}

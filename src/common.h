@@ -66,4 +66,7 @@ static inline void *myon_xrealloc(void *ptr, size_t n) {
 char *myon_strndup(const char *s, size_t n);
 char *myon_strdup(const char *s);
 
+/* Decode a supported escape and advance the raw string; leave unknown escapes intact. */
+bool myon_string_escape(const char **raw, char *out);
+
 #endif /* MYON_COMMON_H */

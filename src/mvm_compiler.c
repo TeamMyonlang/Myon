@@ -403,8 +403,9 @@ static Program *parse_interp_expr(Compiler *c, int line, const char *src);
  * PUSH_CONST / <expr> / TO_STR / STR_CONCAT.  `{{` and `}}` are literal braces. */
 static void compile_string(Compiler *c, int line, const char *raw) {
     Chunk *ch = cur_chunk(c);
-    /* Fast path: no interpolation -> single str constant (spec §1.3). */
-    if (strchr(raw, '{') == NULL && strchr(raw, '}') == NULL) {
+    /* Fast path: no interpolation or escapes -> single str constant. */
+    if (strchr(raw, '{') == NULL && strchr(raw, '}') == NULL &&
+        strchr(raw, '\\') == NULL) {
         int idx = module_add_const_str(c->module, raw);
         chunk_emit_op_u16(ch, MOP_PUSH_CONST, (uint16_t)idx, line);
         return;
@@ -429,6 +430,8 @@ static void compile_string(Compiler *c, int line, const char *raw) {
 
     const char *s = raw;
     while (*s) {
+        char escaped;
+        if (myon_string_escape(&s, &escaped)) { lit[li++] = escaped; continue; }
         if (s[0] == '{' && s[1] == '{') { lit[li++] = '{'; s += 2; continue; }
         if (s[0] == '}' && s[1] == '}') { lit[li++] = '}'; s += 2; continue; }
         if (s[0] == '{') {
