@@ -1,52 +1,28 @@
-# Myon パッケージマネージャー仕様
+# パッケージマネージャーの規則とファイル形式
 
-この文書は Myon 内蔵のパッケージマネージャー（`myon pkg`）の**実装済み仕様**を
-まとめたものである。利用者向けの短い導入は [`README.md`](../README.md) の
-「パッケージ管理」節を、package を配布する開発者向けの手順は
-[`package_development.md`](./package_development.md) を参照すること。
+`myon pkg` は公開 GitHub リポジトリからパッケージを取得し、プロジェクト内へ配置します。
+ここでは CLI、マニフェスト、ロック、取得・展開、module 解決の規則を説明します。
+利用者向けの導入は [README](../README.md#パッケージ管理)、配布側の手順は
+[パッケージ開発](package_development.md) を参照してください。
 
-本文中のコマンド・ファイル名・import 例は実装および
-`tests/cases/pkgproj*/` の fixture と一致する。
+## 1. 処理の範囲
 
----
+依存はフルコミット SHA に固定し、取得アーカイブの SHA-256 をロックに記録します。
+配置先は `<project-root>/.myon/packages/` です。グローバルキャッシュや PATH 変更は行いません。
+パッケージマネージャーは C で実装され、取得・ZIP 展開で git/unzip/shell を起動しません。
 
-## 1. 概要と設計方針
+`install` と `lock` はパッケージのコードを実行しません。module 取り込みはコードを実行します。
+そのコードに対する権限分離はありません。13節に実行境界をまとめています。
 
-- 配布元は **GitHub public repository のみ**。
-- 依存は **full commit SHA に固定**して取得・検証する（mutable な branch／tag を
-  実行時に再解決しない）。
-- package は必ず **project-local**（`<project-root>/.myon/packages/`）に配置する。
-  global cache・PATH 変更・system-wide install は行わない。
-- package code は **sandbox しない**。package の install／import は、任意の Myon
-  code（file I/O・network・FFI 等を含む）の実行と同じ扱いになる。信頼できる
-  repository のみを導入すること。
-- パッケージマネージャーは Myon script ではなく、**C のネイティブ CLI subsystem**
-  として実装されている（`git`／`unzip` などの外部プロセスに依存しない）。
+## 2. GitHub source と URL
 
-利用者の基本操作:
-
-```sh
-myon pkg install https://github.com/owner/repository
-```
-
-```myon
-module example.tools as tools
-```
-
----
-
-## 2. GitHub source と URL 解決（実装で検証済み）
-
-内部の canonical source 形式（lockfile／manifest に現れる唯一の形式）:
+マニフェスト内の依存ソースは次の形式です。
 
 ```text
-github:<owner>/<repository>@<40桁の小文字16進 commit SHA>
+github:<owner>/<repository>@<40桁の小文字16進コミットSHA>
 ```
 
-例: `github:acme-labs/myon-json@4c2e5ad3d8e74f3f239d6b0d6c7ab2e5e7b8d910`
-
-`myon pkg install <URL>` が受け付ける利用者向け URL 形状（GitHub 公式の現行仕様を
-確認のうえ実装。確認日 2026-08-19）:
+`install <URL>` は次の形の URL を受理します。
 
 ```text
 https://github.com/<owner>/<repository>
@@ -56,31 +32,28 @@ https://github.com/<owner>/<repository>/commit/<sha>
 https://github.com/<owner>/<repository>/releases/tag/<tag>
 ```
 
-URL 検証で拒否するもの: `https` 以外の scheme、`github.com` 以外の host、埋め込み
-credentials（`user:pass@`）、query／fragment、制御文字、想定外に深い path。
-
-ref／tag／default branch は、取得時に **immutable な full commit SHA へ解決**する。
-解決には GitHub の commit API を用いる（実装で検証済みの endpoint）:
+HTTPS 以外、github.com 以外のホスト、埋め込み認証情報、query/fragment、制御文字、
+未対応のパス形状は拒否します。ブランチ・タグ・既定 ref は、取得時に GitHub の
+コミット API でフル SHA に解決します。
 
 ```text
 GET https://api.github.com/repos/<owner>/<repo>/commits/<ref>
 Accept: application/vnd.github.sha
--> 応答 body は 40 桁の commit SHA
 ```
 
-archive は解決済み SHA から package manager が生成する。利用者・開発者が
-manifest に任意 URL を書くことはできない:
+取得アーカイブの URL は解決した SHA から構築します。
 
 ```text
 https://codeload.github.com/<owner>/<repository>/zip/<commit SHA>
 ```
 
-HTTP status（404＝repo/ref なしまたは private、403＝rate limit／forbidden）は
-利用者に区別可能な形で報告する。
+利用者が任意のアーカイブ URL を依存 source に指定する形式はありません。
+404、403 などの HTTP ステータスは取得失敗として報告します。
+404 だけではリポジトリ非公開と ref 不在を区別できません。
 
----
+## 3. プロジェクトの `myon.toml`
 
-## 3. project manifest: `myon.toml`
+以下のリポジトリと SHA は形式を示す例です。
 
 ```toml
 format = 1
@@ -90,29 +63,21 @@ name = "sample-app"
 version = "0.1.0"
 
 [dependencies]
-acme.json = "github:acme-labs/myon-json@4c2e5ad3d8e74f3f239d6b0d6c7ab2e5e7b8d910"
+acme.json = "github:acme-labs/myon-json@1111111111111111111111111111111111111111"
 ```
 
-制約:
+`format = 1`、project の name/version は必須です。dependencies は省略できます。
+依存キーはパッケージ名として検証します。ASCII 小文字・数字・`.`・`-` を受理し、
+先頭・末尾の `.`/`-`、連続する `..`、パス区切り、空白・制御文字は拒否します。
 
-- `format = 1` は必須。
-- `[project]` の `name` と `version` は必須。
-- `[dependencies]` は省略可能。
-- dependency key は package name として検証する。
-- package name は ASCII の小文字・数字・`.`・`-` に限定。path separator、空白、
-  制御文字、`..`、先頭 `.`、末尾 `.` を拒否。
-- dependency source は full commit SHA 固定の GitHub source のみ。
+パーサーは TOML 全体ではなく、対応したキー・セクションと値のサブセットを扱います。
+重複キー、未知のキー/セクション、型不一致はエラーです。
+`install <URL>` はマニフェストがなければ生成し、既存ファイルではコメントなどを
+保持しながら管理対象の依存を追加します。未知の構文を受理するという意味ではありません。
 
-`myon pkg install <URL>` は、project manifest が無ければ最小の manifest を自動
-生成する。既存 manifest がある場合は、未知構文・コメント・未管理部分を保持したまま
-依存だけを追加する（汎用 TOML 全体ではなく strict subset の parser）。重複 key・
-unknown key／section・型不一致は行番号付きで拒否する。
+## 4. 配布側の `package.myon`
 
----
-
-## 4. package manifest: `package.myon`
-
-各 package archive の package root 直下に置く。
+アーカイブのルートに置きます。言語ソースとしては実行しません。
 
 ```toml
 format = 1
@@ -123,41 +88,24 @@ version = "1.2.0"
 module = "acme.json"
 
 [dependencies]
-acme.text = "github:acme-labs/myon-text@0d76ff2717d93655c5d95f00b4f0cfca0e5b0a22"
+acme.text = "github:acme-labs/myon-text@1111111111111111111111111111111111111111"
 ```
 
-制約:
+format/name/version/module は必須です。name は配置と依存解決の識別子、module は
+import の名前空間で、異なる値にできます。version は表示・診断用で、依存の選択には
+source のコミット SHA を使います。依存の形式はプロジェクトマニフェストと同じです。
 
-- `format = 1` は必須。
-- `name` は install directory の identity。
-- `module` は import namespace（`.` 区切りの dotted path、各要素は小文字・数字・
-  `-` を許容し安全性検証）。
-- `version` は表示・診断用（初版の解決根拠にはしない）。
-- dependency source は root manifest と同じ形式。
-- install／lock 中に manifest の内容を Myon code として実行しない。install hook／
-  build hook／post-install hook は存在しない。
+module の各要素は小文字で始まり、小文字・数字・`-` を受理する検証規則です。
+ただし import 文の構文はハイフンを含む識別子を扱えないため、配布時には小文字・数字の
+要素を `.` でつないだ名前を使ってください。
 
-`name`（install identity）と `module`（import identity）は異なってよい。
+## 5. アーカイブと配置
 
----
-
-## 5. package の archive layout
-
-GitHub archive の生成 root 名は信用しない。archive 内に単一の top-level directory が
-あることを検証し、その直下に以下があることを要求する。
+ZIP の最上位が単一ディレクトリであることを検査し、その下の `package.myon` と
+宣言された module のソースを確認します。最上位ディレクトリ名は配置時に取り除きます。
 
 ```text
-<generated-root>/
-  package.myon
-  modules/
-    <module path>.myon
-    <module path>/<submodule>.myon
-```
-
-展開後は generated root を除去して配置する。
-
-```text
-.myon/packages/acme.json/
+<archive-root>/
   package.myon
   modules/
     acme/
@@ -166,20 +114,18 @@ GitHub archive の生成 root 名は信用しない。archive 内に単一の to
         parser.myon
 ```
 
-`module = "acme.json"` の場合の対応:
+`name = "acme.json"`、`module = "acme.json"` の対応は次のとおりです。
 
-| import                              | 実 file                                                    |
-| ----------------------------------- | ---------------------------------------------------------- |
-| `module acme.json as json`          | `.myon/packages/acme.json/modules/acme/json.myon`          |
-| `module acme.json.parser as parser` | `.myon/packages/acme.json/modules/acme/json/parser.myon`   |
+| 取り込み | 配置済みファイル |
+|---|---|
+| `module acme.json as json` | `.myon/packages/acme.json/modules/acme/json.myon` |
+| `module acme.json.parser as parser` | `.myon/packages/acme.json/modules/acme/json/parser.myon` |
 
-`.myc` が同梱されていてもよいが、初版の import 実行対象は `.myon` のみ。
+`.myc` を同梱しても、そのファイルを package module としてリンクする機能はありません。
 
----
+## 6. ロックファイル `myon.lock`
 
-## 6. lockfile: `myon.lock`
-
-package manager が生成する。手編集は前提にしない。
+依存解決の結果として生成します。下の revision とハッシュは形式例です。
 
 ```toml
 format = 1
@@ -189,130 +135,102 @@ name = "acme.json"
 version = "1.2.0"
 module = "acme.json"
 source = "github:acme-labs/myon-json"
-revision = "4c2e5ad3d8e74f3f239d6b0d6c7ab2e5e7b8d910"
-archive = "https://codeload.github.com/acme-labs/myon-json/zip/4c2e5ad3d8e74f3f239d6b0d6c7ab2e5e7b8d910"
-sha256 = "<64桁の小文字16進 SHA-256>"
+revision = "1111111111111111111111111111111111111111"
+archive = "https://codeload.github.com/acme-labs/myon-json/zip/1111111111111111111111111111111111111111"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
 dependencies = "acme.text"
 ```
 
-必須条件:
+パッケージと依存一覧は名前順に出力します。パッケージ名は一意で、同じ名前に異なる
+revision が要求された場合と循環依存を拒否します。直接依存とロックの整合性も検査します。
 
-- deterministic に出力（package entry は name 順、dependency list も sorted）。
-- package name は一意。
-- root manifest の直接依存と lockfile の top-level package が一致。
-- 同じ package name が異なる revision を要求したら conflict。
-- 依存 cycle は cycle path を表示して拒否。
-- `archive` は `https://codeload.github.com/` 始まりであることを検証。
-- install 時、記録した `sha256` と実 archive の hash が一致しなければ install しない
-  （SHA-256 は OpenSSL EVP、比較は小文字 16 進 64 桁で統一）。
+アーカイブの SHA-256 は OpenSSL EVP で計算し、小文字16進64桁で比較します。
+ロックに記録したハッシュと取得内容が異なる場合は配置を拒否します。
+ハッシュが初めてロックに記録される取得時点の信頼性まで、これで保証するものではありません。
 
----
+## 7. CLI
 
-## 7. CLI（`src/main.c` → `src/package.c` / `src/pkg_ops.c`）
+| コマンド | 処理 |
+|---|---|
+| `myon pkg install <URL>` | URL を解決し、依存記録・ロック生成・取得・配置を行う |
+| `myon pkg lock` | 依存を解決してロックを生成。配置先は更新しない |
+| `myon pkg install` | 既存ロックに従って取得・配置。ロックがなければ失敗 |
+| `myon pkg verify` | マニフェスト・ロック・配置物の整合性を検査 |
+| `myon pkg tree` | ロック内の依存グラフを表示 |
 
-```sh
-myon pkg install https://github.com/owner/repository   # 主導入（URL 指定）
-myon pkg lock                                           # 依存解決 + myon.lock 生成
-myon pkg install                                        # lockfile から再現インストール
-myon pkg verify                                         # 整合性検査
-myon pkg tree                                           # 依存グラフ表示（ネットワーク不要）
-```
+引数なしの install は可変 ref を再解決しません。マニフェストを変更した後は lock を更新します。
+verify/tree は既存のロック・配置物を使い、ネットワークを必要としません。
 
-- `myon pkg install <URL>`: project root 検出 → 無ければ最小 manifest 生成 →
-  URL 検証・ref 解決 → archive 取得 → package manifest から name／module 取得 →
-  manifest へ依存追加（既存保持）→ full SHA と archive SHA-256 を lockfile へ保存 →
-  依存を再帰解決 → 検証・展開 → `.myon/packages/` へ atomic install。
-- `myon pkg lock`: archive を取得するが install directory は更新しない。
-- `myon pkg install`（URL なし）: 既存 lockfile だけを信頼。lockfile が無ければ失敗。
-  mutable ref の再解決はしない。manifest を手編集して lock が古い場合は
-  `myon pkg lock` を要求する。
-- exit code: `0` 成功 / `64` usage / `65` manifest・data / `66` input missing /
-  `69` network / `70` integrity。network／manifest／integrity／usage を区別。
+| 終了コード | 分類 |
+|---|---|
+| 0 | 成功 |
+| 64 | コマンドの使い方 |
+| 65 | マニフェスト・データ形式 |
+| 66 | 入力ファイル不在 |
+| 69 | ネットワーク |
+| 70 | 整合性検査 |
 
----
+## 8. ネットワーク
 
-## 8. ネットワーク層（`src/pkg_fetch.c`）
+`pkg_fetch.c` は body をバッファと長さで保持する HTTPS GET を実装しています。
+`myon.http` の文字列 API とは別経路です。
 
-`myon.http` とは独立した package manager 専用の binary HTTPS GET。応答は C の
-binary buffer + length で保持する（NUL 終端 string に丸めない）。
+- TLS の証明書・ホスト名検証は `tls.c` を使用します。
+- リダイレクトは最大5回。許可ホストは github.com / codeload.github.com / api.github.com です。
+- HTTPS から HTTP への変更と、Location 内の制御文字を拒否します。
+- 成功ステータスは200です。応答全体の上限は64 MiBです。
+- Content-Length、chunked 応答、不完全な応答、サイズ計算、タイムアウトを検査します。
 
-- HTTPS のみ成功。TLS 証明書・hostname 検証は既存 TLS 実装に委譲し、TLS error は
-  fail-closed。
-- redirect は最大 5 回（`PKG_FETCH_MAX_REDIRECTS`）。
-- `https`→`http` ダウングレードを拒否。
-- redirect 先 host は allow-list（`github.com` / `codeload.github.com` /
-  `api.github.com`）のみ。`Location` の CR／LF／NUL／制御文字を拒否。
-- status 200 以外を失敗にする。
-- `Content-Length` 上限検査と、総ダウンロード量の上限（`PKG_FETCH_MAX_BODY` =
-  64 MiB）。
-- chunked transfer-encoding をデコード（malformed chunk は拒否）。
-- integer overflow／truncated response／malformed header／timeout を検出。
+これらの制限値は `pkg_fetch.c` の定義と併せて確認できます。
 
----
+## 9. ZIP の検査
 
-## 9. ZIP 安全性（`src/pkg_zip.c`）
+`pkg_zip.c` は ZIP/DEFLATE を読み、ステージング内に展開します。
+外部の unzip・git・shell は起動しません。検査対象には次を含みます。
 
-vendored ではなく自己完結の security-first ZIP reader。`unzip`／shell／`git` は
-起動しない。展開先は必ず staging directory。以下を拒否する。
+- `../`、絶対パス、Windows ドライブパス、バックスラッシュ、制御バイト、正規化後の重複。
+- symlink などの非通常ファイル、暗号化、未対応の ZIP64、複数の最上位ディレクトリ。
+- マニフェスト・module ソースの欠落、エントリ数・圧縮/展開サイズ・圧縮率の上限超過。
+- central directory、CRC-32、不完全なデータ。
 
-ZIP Slip（`../`）、absolute path、Windows drive path、backslash 抜け道、NUL／
-制御文字、normalized path の重複、symlink／hard link／device／FIFO、encrypted
-entry、（未対応なら）ZIP64、複数 top-level root、`package.myon` 欠落、`modules/`
-または expected module 欠落、file count 上限超過、compressed／uncompressed size
-上限超過、展開比による decompression bomb、壊れた central directory、不正 CRC／
-truncated data。
+受理する形式と上限は実装の条件です。ZIP の検査によって、中にある Myon コードの動作が
+安全になるわけではありません。
 
----
+## 10. 配置の切り替え
 
-## 10. install transaction（`src/pkg_fs.c`）
+`pkg_fs.c` はプロジェクト内の `.myon/.staging/` に一時領域を作ります。
+取得・ハッシュ・マニフェスト・module を検証してから、既存配置を退避し、
+ステージングから配置先へ切り替えます。失敗時には退避した配置の復元を試みます。
 
-1. archive 取得 → 2. hash 確認 → 3. `.myon/.staging/<CSPRNG 由来の一意名>/` 作成 →
-4. staging へ展開 → 5. manifest／module 検証 → 6. final directory を保全 →
-7. staging を final へ atomic／transactional に promote → 8. backup・staging 掃除 →
-9. 途中失敗時は既存の正常 install を残す。
+一時名には OS の乱数源を使用します。POSIX と Windows の rename・ディレクトリ置換の
+差はこの層で処理します。パッケージの配置切り替えと、依存全体を同時に更新する単一の
+トランザクションは区別してください。
 
-固定名の一時 directory・予測可能な一時ファイル名・project root 外の temporary path は
-使わない。POSIX と Windows の rename／directory replacement 差は `pkg_fs` に隔離。
+## 11. module の解決
 
----
+組み込み名はインタプリタに登録された myon.* の名前、external.* はスクリプト相対の
+外部ファイルとして扱います。それ以外は配置済みパッケージの名前空間から解決します。
 
-## 11. module import 解決規則（interpreter、仕様 §6）
+1. 実行スクリプトのディレクトリから上へ myon.toml を探索し、プロジェクトを決めます。
+2. ロック内の宣言 module と取り込み名を比較し、最長一致するパッケージを選びます。
+3. `modules/` に module の `.` を `/` に置換した相対パスと `.myon` を付けて探索します。
+4. パス要素、ロック内の登録、alias、循環取り込みを検査します。
 
-module path は prefix dispatch で分類される（`src/interpreter.c`）。
+パッケージの取り込みには別名が必要です。実行プロセスの CWD ではなく、スクリプトの位置が
+探索起点です。パッケージ名・module 名・GitHub のリポジトリ名は区別します。
 
-- `myon.*` → builtin module（記録のみ）
-- `external.*` → 従来どおり実行 script directory 基準の legacy external module
-- それ以外 → **installed package module resolver**
+## 12. MVM での取り込み
 
-installed package module resolver:
+パッケージの module 取り込みはツリーウォーク専用です。
+`--compile` / `--run-mvm` ではコンパイル時に未対応エラーになります。
+MVM の module リンク機能は実装されていません。
+[MVM 仕様7節](mvm_spec.md#7-対応範囲と制約) と [既知の問題](../known-issues.md) を参照してください。
 
-- project root は**実行 script のディレクトリ**から上方向に `myon.toml` を探して
-  決める（プロセス CWD に依存しない）。
-- `myon.lock` を読み、各 package の宣言 module namespace の**最長一致**で所属
-  package を決める。
-- 実 file は
-  `<project-root>/.myon/packages/<package-name>/modules/<path→スラッシュ>.myon`。
-  各 path 要素を安全性検証し、`.myon/packages/` の外へは解決しない。
-- package import は **alias 必須**。
-- `myon.lock` に無い package は拒否。循環 import は検出してエラー。
-- package ごとに独立 namespace（既存 alias module の仕組みを再利用）。global
-  namespace を汚染しない。URL 由来の package name と module name を混同しない。
+## 13. 検証と実行の境界
 
----
+コミット SHA は取得する revision、SHA-256 はアーカイブの一致を指定します。
+これらは署名検証やコードレビューの代替ではありません。
 
-## 12. MVM 境界（仕様 §6.3）
-
-初版の package module import 実行対象は tree-walking interpreter（`.myon`）のみ。
-`--compile`／`--run-mvm`／`.myc` 実行では、installed package module の取り込みを
-**明示的な未対応エラー**にする（`src/mvm_compiler.c`）。曖昧なフォールバックや
-`.myc` の自動代替実行は行わない。詳細は [`../known-issues.md`](../known-issues.md)。
-
----
-
-## 13. セキュリティ境界（まとめ）
-
-- package code は sandbox されない。import＝任意 code 実行。
-- 取得は full SHA 固定 + archive SHA-256 検証で改竄・すり替えを防ぐ。
-- 展開は path-safety を全面に適用し、project root 外へ書き込まない。
-- 失敗時に既存の正常 install を破壊しない。
-- lock 中・install 中に package code を実行しない。
+取得・展開の検査と、取り込んだコードの権限は別です。
+install/lock に実行 hook はありませんが、import では通常の Myon コードが実行されます。
+そのコードは利用者プロセスと同じ権限で動作します。

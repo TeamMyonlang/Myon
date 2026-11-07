@@ -2,438 +2,221 @@
 
 半分ネタ、半分実用(？) の、**型に厳密な**プログラミング言語です。
 
-Myon は C 実装のツリーウォーク型インタプリタと、バイトコード VM（MVM）の 2 つの
-実行経路を持ちます。`.myon` ソースをそのまま実行することも、`.myc` バイトコードへ
-コンパイルして実行することもできます。文字列補間・構造体・ジェネリクス・高階関数・
-協調的な async/await・TCP/UDP ソケット・簡易 HTTP サーバー／クライアント・C FFI
-（外部共有ライブラリ呼び出し）まで、一通りの機能を備えています。
+Myon は C で実装されたプログラミング言語です。ソースを評価するツリーウォーク型
+インタプリタと、バイトコードを実行する MVM（Myon Virtual Machine）を備えています。
 
-## 特徴
+## はじめに
 
-- **厳密な型** — 暗黙の型変換を避け、キャストは明示的に。整数演算はオーバーフローを
-  実行時に検出します。
-- **わかりやすいエラー** — 構文・実行時エラーは行番号・列番号・ソース抜粋・`^`
-  マーカー付きで表示されます。
-- **豊富な標準ライブラリ** — `myon.math` / `myon.string` / `myon.array` /
-  `myon.map` / `myon.time` / `myon.random` / `myon.file` など。文字列の
-  `substring` / `index_of` など索引系は UTF-8 文字数ベースで安全に扱えます
-  （`length` はバイト数、文字数は `length_chars`）。乱数は高速な `myon.random.int`
-  と、OS の CSPRNG を使う暗号学的に安全な `myon.random.secure_int` の 2 系統。
-- **CLI ツール制作支援** — 改行なし出力 `myon.write`（`\r` 上書き・プログレスバー
-  向け）、改行付き `myon.println`、明示フラッシュ `myon.flush`、標準エラー出力
-  `myon.eprint`、端末判定 `myon.is_tty`、コマンドライン引数 `myon.argv()`
-  （詳細は [`docs/myon_spec.md`](docs/myon_spec.md) §10.1）。
-- **async/await** — シングルスレッドの協調的イベントループによる非同期処理
-  （OS スレッドは使いません）。
-- **ネットワーク** — 低水準ソケット `myon.net`（TCP/UDP、DNS 名前解決対応）と
-  簡易 HTTP モジュール `myon.http`（静的配信・ルーティング・HTTP/HTTPS クライアント）。
-- **C FFI** — `dlopen`/`LoadLibrary` 経由で外部の共有ライブラリ
-  （`.so`/`.dylib`/`.dll`）の C 関数を呼び出せます。構造体レイアウト DSL や
-  コールバックにも対応。
-- **2 つの実行経路** — ツリーウォーク実行と、`.myc` バイトコードの MVM VM 実行。
-- **クロスプラットフォーム** — Linux / macOS / Windows で実機ビルド・テスト済み。
-  プラットフォーム判定は `src/platform.h` に一元化しています。
-
-各機能の詳細な実装状況・開発の歩みは [`docs/features.md`](docs/features.md) を、
-言語仕様の正式な定義は [`docs/myon_spec.md`](docs/myon_spec.md)（言語仕様）と
-[`docs/mvm_spec.md`](docs/mvm_spec.md)（MVM バイトコード仕様）を参照してください。
-
-## クイックスタート
+C11 対応コンパイラ、Make、OpenSSL の開発用ヘッダとライブラリを用意し、
+リポジトリのルートでビルドします。
 
 ```sh
-# 1. ビルド
 make
-
-# 2. Hello, World を実行
 ./myon examples/hello.myon
-# => Hello Worlddd! 人間!
 ```
 
-`examples/hello.myon`:
+出力は `Hello Worlddd! 人間!` です。
 
-```
+```myon
 system myon.useversion=1
 module myon.stdio
 
-x = str("人間")
-myon.print("Hello Worlddd! ", x + "!")
+name = str("人間")
+myon.print("Hello, ", name)
 ```
 
-Myon の package を使いたい場合は [パッケージ管理（`myon pkg`）](#パッケージ管理myon-pkg)
-を参照してください（詳細な仕様は [`docs/package_manager.md`](docs/package_manager.md)、
-package を自作したい場合は [`docs/package_development.md`](docs/package_development.md)）。
+## ビルド環境
 
-## ビルド
+| 環境 | 依存関係の導入例 |
+|---|---|
+| Debian / Ubuntu | `sudo apt-get install build-essential libssl-dev` |
+| macOS / Homebrew | `brew install openssl@3` |
+| Windows / MSYS2 MINGW64 | `pacman -S make mingw-w64-x86_64-gcc mingw-w64-x86_64-openssl` |
+
+macOS では Makefile が Homebrew の `openssl@3` の配置を調べます。
+Windows の出力ファイル名は `myon.exe` です。共有リンクした OpenSSL の DLL は、
+実行ファイルの配置先または DLL 検索パスから参照できる必要があります。
+
+Linux からの Windows 向けクロスビルドには、MinGW-w64 と Windows 向け OpenSSL が必要です。
 
 ```sh
-make
+make win-cross WIN_OPENSSL_LDLIBS="-L/path/to/windows/openssl/lib -lcrypt32"
 ```
 
-`myon` という実行ファイルが生成されます。
+追加の include パスは `CFLAGS` で指定できます。CI の設定例は
+[heavy-checks.yml](.github/workflows/heavy-checks.yml) にあります。
 
-**ビルドに必要なもの**：C コンパイラ（GCC など）と OpenSSL 開発パッケージ。
-HTTPS/TLS 対応（`src/tls.c`）が OpenSSL をネイティブに利用するため、`libssl-dev`
-相当が**必須依存**です。Makefile は常に `-lssl -lcrypto` をリンクします。
+## 実行とコンパイル
 
 ```sh
-# Debian / Ubuntu
-sudo apt-get install build-essential libssl-dev
+./myon program.myon
+./myon --compile program.myon -o program.myc
+./myon program.myc
+./myon --dump-bytecode program.myc
+./myon --tokens program.myon
+./myon --help
+./myon --version
 ```
 
-DNS 名前解決（`getaddrinfo`）は libc に含まれるため追加依存はありません。
+`.myon` はツリーウォークで実行します。`.myc` という拡張子を持つファイル、または
+先頭が `MYC1` のファイルは MVM で実行します。`-` を指定すると標準入力をソースとして読みます。
+`--run-mvm program.myon` は、ソースをメモリ上でコンパイルして MVM で実行する検証用の経路です。
 
-### Windows でのビルド
+`.myc` の実行時には元ソースとの不一致を調べ、検出すると警告します。
+`--strict-stale` を付けると不一致をエラーにします。元ソースがない場合はこの検査を省略します。
+バイトコードの形式は [MVM 仕様](docs/mvm_spec.md) を参照してください。
 
-Windows は 実機で動作済みです(Github Action workflowにて)
+スクリプトパスの後ろの引数は `myon.argv()` で取得します。
 
 ```sh
-# MSYS2 / MinGW-w64 (native): OpenSSL を導入してから make
-pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-openssl
-make                                         # myon.exe を生成
-
-# Linux からのクロスコンパイル
-make win-cross                               # 便利ターゲット
-# OpenSSL の検索パスを補う場合:
-make win-cross WIN_OPENSSL_LDLIBS="-L/path/to/openssl/lib"
+./myon program.myon --output result.txt
+./myon program.myon -- --help
 ```
 
-Windows ビルドでは Makefile が自動的に出力名を `myon.exe` とし、Winsock2 を
-`-lws2_32` でリンクします。OpenSSL を共有リンクした場合は、実行時に
-`libssl-*.dll` / `libcrypto-*.dll`（MSYS2 ではランタイム DLL も）を `myon.exe` と
-同じディレクトリに置くか、静的リンクしてください。
+引数なしで起動すると REPL に入ります。変数・関数・構造体はセッション中保持され、
+`exit`、`quit`、EOF で終了します。REPL はツリーウォーク実行のみです。
 
-## 使い方
+## 言語機能と標準ライブラリ
+
+- 整数・浮動小数点数・文字列・文字・真偽値。異なる型の算術演算には明示的な変換が必要です。
+- 条件分岐、ループ、関数、複数戻り値、ラムダ、構造体、継承、ジェネリクス。
+- ブロックスコープと `myon.expose`、文字列の式補間。
+- 配列・Map、数学、文字列操作、ファイル入出力、時刻、乱数。
+- 単一スレッドの協調的な async/await、IPv4 TCP/UDP、HTTP サーバー、HTTP/HTTPS クライアント。
+- 共有ライブラリを呼び出す C FFI、メモリブロック、構造体レイアウト、コールバック。
+
+詳細な構文と関数一覧は [言語リファレンス](docs/myon_spec.md)、実装箇所とテストの対応は
+[機能・実装状況](docs/features.md) にまとめています。
+
+## 実行経路の制約
+
+MVM は標準ライブラリの一部をツリーウォーク側の実装と共有しますが、
+対応範囲と診断がすべてのプログラムで一致するわけではありません。
+
+| 操作 | ツリーウォーク | MVM |
+|---|---|---|
+| 外部ファイル・パッケージの module 取り込み | 対応 | 未対応エラー |
+| 高階ネイティブメソッド `array.map/filter/reduce` での関数呼び出し | ツリーウォーク関数で対応 | VM 関数では未対応エラー |
+| FFI コールバック | ツリーウォーク関数で対応 | VM 関数では未対応エラー |
+| REPL | 対応 | 未対応 |
+
+保存済み `.myc` は構造体宣言の AST を保持しないため、構造体を使う単体実行には制約があります。
+`--run-mvm` と保存済みバイトコードの検証範囲は [MVM 仕様7節](docs/mvm_spec.md#7-対応範囲と制約) を参照してください。
+
+文字列リテラルのバックスラッシュエスケープなど、仕様と実装が一致していない項目もあります。
+使用前に [既知の問題](known-issues.md) の未修正項目を確認してください。
+文字列は NUL 終端で、任意のバイナリデータを保持する型ではありません。
+
+## パッケージ管理
+
+公開 GitHub リポジトリから、プロジェクト単位でパッケージを取得します。
 
 ```sh
-# --- 実行 ---
-./myon examples/hello.myon          # .myon をツリーウォークで実行
-./myon examples/hello.myc           # .myc（MVM バイトコード）を VM で実行
-
-# --- スクリプトへ引数を渡す（myon.argv() で受け取る）---
-./myon script.myon --foo bar        # スクリプトパスの後ろは全部スクリプト用引数
-./myon script.myon -- --help -v     # `--` 以降は先頭が `-` でも素通し
-
-# --- MVM バイトコードの生成・確認 ---
-./myon --compile examples/hello.myon              # hello.myc を書き出す（実行はしない）
-./myon --compile examples/hello.myon -o out.myc   # 出力先を指定
-./myon --dump-bytecode examples/hello.myon        # 逆アセンブルを表示して終了
-
-# --- 対話モード（REPL）---
-./myon                              # 引数なしで起動
-
-# --- その他 ---
-./myon --tokens examples/hello.myon # トークン列を出力
-./myon --tokens -                   # 標準入力から読み込む
-./myon --help                       # 使い方を表示
-./myon --version                    # バージョンを表示（-v も可）
+./myon pkg install https://github.com/owner/repository
+./myon pkg lock
+./myon pkg install
+./myon pkg verify
+./myon pkg tree
 ```
 
-ファイル引数は内容と拡張子で振り分けられます。先頭が `MYC1` マジックのバイトコード
-（あるいは `.myc` という名前）なら MVM バイトコード VM で、それ以外はツリーウォーク型
-インタプリタで実行されます。`-` は常に標準入力（ソース）を意味します。
+`install <URL>` は配布元の ref をフルコミット SHA に解決し、依存関係とアーカイブの
+SHA-256 を `myon.lock` に記録します。引数なしの `install` は既存ロックを使います。
+取得物は `.myon/packages/` に配置され、グローバルインストールや PATH 変更は行いません。
 
-`.myon` を `--compile` すると MVM バイトコード（`.myc`, マジック `MYC1`）が生成され、
-`./myon foo.myc` で実行できます。`.myon`（ツリーウォーク）実行の挙動と一致します。
-`.myon` より古い `.myc` を実行しようとすると stale 警告が出ます（`--strict-stale` で
-エラー化）。async/await・`myon.net`／`myon.http`・FFI・ジェネリクス・クロージャ
-（上位変数キャプチャ）・高階関数は **MVM でも対応済み**です（イベントループや標準
-ライブラリはツリーウォーク実装をブリッジ経由で共有します）。ただし *VM で作った
-関数値をツリーウォークのネイティブに渡してコールバック実行させる*ケース
-（`array.map`／`filter`／`reduce` などの高階ネイティブメソッド、`myon.ffi.make_callback`）
-だけはエンジン境界をまたげないため MVM では明示的なエラーになります。該当プログラムは
-ツリーウォーク実行（`.myon`）で動かしてください。外部モジュール取り込み
-（`module external.* as ...`）とインストール済みパッケージの module 取り込み
-（`module <package-module> as ...`）も MVM 非対応で、`--compile`／`--run-mvm`
-では明示的なエラーになります（仕様 §6.3）。
-
-### 対話モード（REPL）
-
-```sh
-$ ./myon
-Myon REPL. Type 'exit' or 'quit' to leave (Ctrl+D also works).
-myon> x = 1
-myon> myon.print(x)
-1
-myon> exit
-```
-
-入力が未完（`()`/`[]`/`{}` が閉じていない）の場合は継続プロンプト `...> ` を表示し、
-定義した変数・関数・構造体はセッション終了まで保持されます。実行時エラーが起きても
-REPL は終了しません。
-
-### エラーメッセージ
-
-構文・実行時エラーは、行番号・列番号・該当行のソース抜粋・`^` マーカー付きで
-表示されます。
-
-```
-myon: syntax error at line 5, column 17: expected ')' to close call (got an integer literal)
-     5 | myon.print(1, 2 3)
-       |                 ^
-```
-
-## パッケージ管理（`myon pkg`）
-
-GitHub の public repository を配布元とする、プロジェクト単位のパッケージ管理を
-内蔵しています。URL を一度指定するだけで導入でき、導入後は package が宣言した
-module 名だけで利用できます。
-
-```sh
-# URL を指定して導入（初回・通常利用）
-myon pkg install https://github.com/owner/repository
-
-# 明示的な操作
-myon pkg lock       # 依存を解決して myon.lock を（再）生成
-myon pkg install    # 既存の myon.lock だけを信頼して再現インストール
-myon pkg verify     # myon.toml / myon.lock / 展開物の整合性を検査
-myon pkg tree       # ロック済み依存グラフを表示（ネットワーク不要）
-```
-
-導入した package は、`myon.toml`／`myon.lock` に記録され、実体は
-`<project-root>/.myon/packages/<package-name>/` にプロジェクトローカルで
-配置されます（グローバルキャッシュや PATH 変更は行いません）。
-
-利用側の source からは、package manifest が宣言した **module 名**を alias 付きで
-取り込みます（GitHub URL やインストール先 path は import 文に書きません）。
+ソースではパッケージが宣言したモジュール名と別名を使います。
 
 ```myon
-module example.tools as tools           # package のルート module
-module example.tools.util as util       # サブ module
-
-myon.print(tools.greet(str("myon")))
-myon.print(util.triple(7))
+module example.tools as tools
+myon.print(tools.square(6))
 ```
 
-module import の解決規則（仕様 §6）:
+`install` と `lock` はパッケージのコードを実行しません。取り込んだモジュールは実行され、
+ファイル・ネットワーク・FFI へのアクセスを制限するサンドボックスはありません。
+チェックサムの一致は取得物の一致を調べるもので、コードの発行者や動作を保証するものではありません。
 
-- 取り込み path は、`myon.lock` に記録された各 package の宣言 module namespace の
-  **最長一致**で所属 package を決めます。
-- package の実 file は
-  `<project-root>/.myon/packages/<package-name>/modules/<path→スラッシュ>.myon`
-  に解決され、各 path 要素は安全性検証されます（`..`／絶対 path／区切り混入を拒否し、
-  `.myon/packages/` の外へは解決しません）。
-- project root は**実行スクリプトのディレクトリ**から上方向に `myon.toml` を探して
-  決めるため、プロセスの作業ディレクトリに依存しません。
-- package import は **alias 必須**、`myon.lock` にない package は拒否、
-  循環 import は検出してエラーにします。
-- **⚠️ package code は sandbox されません。** package の module を import することは、
-  任意の Myon code（file I/O・network・FFI 等を含む）を実行することと同じ扱いです。
-  信頼できる repository のみを導入してください。
-- `--compile`／`--run-mvm`／`.myc` 実行では package module 取り込みは未対応で、
-  明示的なエラーになります（仕様 §6.3）。ツリーウォーク実行（`.myon`）で利用して
-  ください。
+ファイル形式・取得・展開の規則は [パッケージマネージャー](docs/package_manager.md)、
+配布側の手順は [パッケージ開発](docs/package_development.md) を参照してください。
 
-GitHub からの archive 取得（仕様 §7）は package manager 専用の C 層
-（`src/pkg_fetch.c`）で行い、既存の `myon.http` とは独立です。HTTPS のみを許可し、
-TLS 証明書・ホスト名を検証（fail-closed）、`https`→`http` ダウングレード拒否、
-redirect は最大 5 回かつ GitHub の archive host のみ許可、`Location` の制御文字拒否、
-`Content-Length`／総ダウンロード量の上限（64 MiB）、chunked 転送のデコードなどを
-実装しています。
+## ネットワークと FFI の利用条件
 
-`.myon/packages/` は通常 `.gitignore` 対象とし、`myon.toml` と `myon.lock` を
-Git 管理する運用を推奨します（本リポジトリの [`.gitignore`](.gitignore) にも
-`.myon/packages/` を記載しています）。
+HTTPS クライアントは OpenSSL で証明書チェーンとホスト名を検証し、TLS 1.2 以降を使用します。
+OCSP/CRL による失効確認、証明書ピンニング、クライアント証明書、TLS サーバーは未対応です。
+HTTP サーバーは HTTP/1.0 で、接続ごとに1リクエストを処理します。
 
-より詳しい情報は次のドキュメントを参照してください。
-
-- 仕様・内部実装: [`docs/package_manager.md`](docs/package_manager.md)
-  — GitHub URL 解決・`myon.toml`／`myon.lock`／`package.myon` の文法・network 層・
-  ZIP 安全性・install トランザクション・module import 解決規則（§6）
-- package を作って公開する方法: [`docs/package_development.md`](docs/package_development.md)
-  — ディレクトリ構成・`package.myon` の書き方・module 名と path の対応・
-  公開／導入フロー・ローカル検証手順
+FFI は呼び出し先の C ヘッダを読みません。利用者が ABI、引数型、レイアウト、メモリ寿命を
+確認する必要があります。誤ったシグネチャや生アドレスによるアクセスはプロセスを破壊し得ます。
+ライブラリ名と配置も OS ごとに異なります。
 
 ## サンプル
 
-`examples/` ディレクトリに動作するサンプルがあります。
-
 | ファイル | 内容 |
 |---|---|
-| `hello.myon` | 変数と `myon.print` の基本 |
-| `cli_progress.myon` | `myon.write`/`flush`/`is_tty`/`eprint`/`argv` を使った進捗バー CLI |
-| `control_flow.myon` | if/elif/else・while・for・break/continue |
-| `http_static_server.myon` | 静的ファイルサーバー（`python -m http.server` 相当） |
-| `http_router_server.myon` | パスに応じて分岐するルーティング＋404 |
-| `http_https_get.myon` | HTTPS クライアント（`myon.http.get`） |
-| `net_game_echo.myon` | UDP による座標 echo デモ |
-| `ffi_math.myon` / `ffi_zlib_version.myon` | C FFI（`libm` / `libz`） |
-| `ffi_sdl_window.myon` ほか `ffi_sdl_*.myon` | SDL2 を FFI で叩く GUI/オーディオデモ |
-| `snake5.myon` | 総合サンプル |
+| [hello.myon](examples/hello.myon) | 基本的な代入と出力 |
+| [control_flow.myon](examples/control_flow.myon) | 条件分岐・ループ |
+| [http_static_server.myon](examples/http_static_server.myon) | 静的ファイルの HTTP 配信 |
+| [http_router_server.myon](examples/http_router_server.myon) | HTTP ハンドラ |
+| [http_https_get.myon](examples/http_https_get.myon) | HTTPS クライアント |
+| [net_game_echo.myon](examples/net_game_echo.myon) | UDP 通信 |
+| [ffi_math.myon](examples/ffi_math.myon) | C 数学ライブラリの呼び出し |
+| [ffi_sdl_window.myon](examples/ffi_sdl_window.myon) | SDL2 によるウィンドウ表示 |
 
-サーバー系・SDL 系・ネットワーク系のサンプルは、常駐したり外部ライブラリ
-（`libSDL2` など）を必要としたりするため、回帰テストには含めていません。SDL 系デモの
-実行には `libSDL2-2.0.so.0`（オーディオは加えて `libSDL2_mixer-2.0.so.0`）が必要です。
-
-> **セキュリティ**：`myon.http` の TLS（HTTPS）クライアントは**フェイルクローズ**
-> で動作します。システムの信頼ストアに対してサーバ証明書チェーンを検証し
-> （`SSL_VERIFY_PEER`）、接続前に期待するホスト名（DNS 名は `SSL_set1_host`、
-> IP リテラルは証明書の iPAddress SAN）を照合、**TLS 1.2 を最低バージョン**として
-> 強制（RFC 8996）、SNI は DNS 名のみ送信（RFC 6066）、TLS 圧縮・再ネゴシエーション
-> を無効化し、ハンドシェイクにタイムアウトを設けます。証明書が失効・ホスト名不一致・
-> 自己署名などの場合はハンドシェイクを中断し、理由付きのエラーを返します
-> （中間者攻撃に対する基本的な保護を提供します）。
->
-> ただし OCSP/CRL による失効確認・証明書ピンニング・クライアント証明書には非対応の
-> コンパクトな実装です。高保証が必要な用途ではこの制限を考慮してください。また
-> `myon.http.get`/`post` に渡す URL は、ホスト・ポート・パスに含まれる制御文字
-> （CR/LF 等）や範囲外ポートを拒否し、HTTP ヘッダ／リクエストインジェクションを
-> 防ぎます。
+サーバーの例は常駐します。FFI・SDL の例には対応する共有ライブラリが必要です。
+`cli_progress.myon` の `\r` による上書き表示は、エスケープ処理の既知の問題の影響を受けます。
 
 ## テスト
 
 ```sh
 make test
+make test-pkg
+make test-runtime
+make test-mvm
+make test-mvm-equality
+make test-asan
 ```
 
-`make test` は次の 4 つのスイートを順に実行します。
+テストには Bash、GNU coreutils、diffutils を使います。macOS では
+`brew install coreutils` で `gtimeout` を、MSYS2 では `pacman -S coreutils diffutils` で
+`timeout`・`diff`・`cmp` を用意します。
 
-| スイート | 内容 |
-|---|---|
-| パッケージマネージャの C 単体テスト | `tests/pkg_unit_tests.c` / `pkg_zip_tests.c` / `pkg_ops_tests.c` |
-| メインスイート | `tests/cases/` 以下の `*.myon` を実行し、`*.out`（期待出力）または `*.err`（エラー終了を期待）と比較 |
-| MVM コンパイラテスト | バイトコード生成の検証 |
-| 等価性スイート | ツリーウォーク実行と MVM バイトコード実行の出力一致を確認 |
+`make test` はパッケージの C テスト、メモリ所有権と各種回帰検査、ソース実行、
+コンパイラ、実行経路の等価性検査を実行します。ネットワークのケースはローカルの
+ソケットを使用します。Linux の `.so` 名に依存するケースは、メインスイートでは
+Linux 以外でスキップされます。MVM の未対応機能は等価性スイートで除外されます。
+合格・失敗・スキップ・除外の件数は実行ログを確認してください。
 
-個別に実行したい場合は次のターゲットが使えます。
+`make test-asan` は ASan/UBSan で全スイートを実行します。全体のリーク検出は
+`detect_leaks=0` です。個別のリーク検査では、例えば次のように LSan を有効にします。
 
 ```sh
-make test-pkg           # パッケージマネージャの C 単体テストのみ
-make test-mvm           # MVM コンパイラテストのみ
-make test-mvm-equality  # `.myon`／`.myc` 等価性スイートのみ
+make asan
+ASAN_OPTIONS=detect_leaks=1 bash tests/numeric_regressions.sh ./myon_asan
 ```
 
-> FFI（`libm`/`libz` 等を要する）やネットワーク（ソケットを開く）を伴う一部ケースは、
-> 実行環境によってはテストハーネスが自動的に除外します。除外は失敗ではなく、対応
-> ライブラリ・権限のある環境ではパスします。また `.so` 名を直書きしている FFI
-> ケースは Linux 以外ではスキップされます。
+## CI とリリース
 
-### Sanitizer（ASan/UBSan）テスト
-
-メモリ破壊・未定義動作の再発を検出するため、AddressSanitizer と
-UndefinedBehaviorSanitizer 付きでテストスイートを走らせるターゲットがあります。
-
-```sh
-make test-asan     # myon_asan をビルドし、ASan/UBSan 下で全テストを実行
-make asan          # myon_asan バイナリだけをビルド
-```
-
-`make test-asan` は `-fsanitize=address,undefined` でビルドした `myon_asan` を
-一時的に `./myon` として差し替えてスイートを実行し、終了時に元のバイナリへ戻します
-（テストスクリプトは無改修）。Sanitizer が問題を検出するとステップは異常終了します。
-`tests/cases/p_overflow_*` と `p_float_roundtrip` は、過去に踏んだオーバーフロー／
-未定義動作（境界計算・整数リテラル・数値変換・float 往復）の回帰ケースです。
-
-## CI・リリース
-
-GitHub Actions で以下のワークフローを用意しています（`.github/workflows/`）。
-
-| ワークフロー | トリガー | 内容 |
-|---|---|---|
-| `ci.yml` | push(main) / PR | gcc・clang の 2 系統で `make` + `make test`（軽量な毎コミットチェック） |
-| `heavy-checks.yml` | push(main) / 手動 | sanitizer（`make test-asan`）、Windows クロスビルド、Windows 実機ビルド＋テスト、macOS 実機ビルド＋テスト、ベンチマーク |
-| `release.yml` | 手動のみ | Linux / Windows / macOS の 3 種のバイナリを配布リリースとして公開 |
-
-- **heavy-checks** は重いジョブ群です。
-  - **win-cross**：MinGW-w64 で Windows 版 OpenSSL をソースからクロスビルド
-    （`actions/cache` でキャッシュ）し、`-lcrypt32` を含めてリンクします。
-  - **win-native**：`windows-latest` ランナー上の MSYS2 で実機ビルドし、
-    テストスイートを実行します。
-  - **macos-native**：`macos-15`（Apple Silicon）で実機ビルドし、`make test` を
-    実行します（ビルド確認だけではありません）。
-- **benchmark** ジョブはリリース公開に依存しない独立ジョブで、計測結果を
-  artifact として保存します。
-
-### ダウンロード（リリース）
-
-ビルド済みバイナリは [Releases](../../releases) ページから入手できます。
-
-- **正式版**（タグに `-dev.` を**含まない** 例: `v1.3.0`）は安定版です。
-- **開発版**（タグに `-dev.` を含む 例: `v1.3.0-dev.20260818.1`）は
-  開発中のスナップショットで、既知バグを含む・不安定な可能性があります。
-
-各リリースには次の 3 つのバイナリが添付され、ログイン不要でダウンロードできます。
-
-| ファイル名 | 対象 |
+| ワークフロー | 実行条件・内容 |
 |---|---|
-| `myon-linux-x86_64` | Linux (x86_64) |
-| `myon-windows-x86_64.exe` | Windows (x86_64) |
-| `myon-macos-arm64` | macOS (Apple Silicon) |
+| [ci.yml](.github/workflows/ci.yml) | main への push と PR。Linux の gcc/clang でビルドとテスト |
+| [heavy-checks.yml](.github/workflows/heavy-checks.yml) | main への push と手動実行。sanitizer、Windows クロスビルド、Windows/macOS 実機テスト、benchmark |
+| [release.yml](.github/workflows/release.yml) | 手動実行による Linux・Windows・macOS バイナリの配布 |
 
-リリースはメンテナが `release.yml` を手動実行し、`pre`／`stable` とバージョン番号
-（`X.Y.Z`）を指定して発行します。`pre` はタグに日付＋連番が付与され、
-GitHub 上で pre-release バッジが付きます。
+配布物は [Releases](https://github.com/TeamMyonlang/Myon/releases) から取得できます。
+`-dev.` を含むタグは開発版として扱います。タグ名と実行対象 OS・アーキテクチャを確認してください。
 
-## プロジェクト構成
+## リポジトリ構成と文書
 
-```
-src/
-  platform.h         プラットフォーム判定・機能マクロの一元管理（MYON_OS_* / MYON_HAVE_*）
-  token.{h,c}        トークン定義
-  lexer.{h,c}        字句解析器
-  types.{h,c}        型システム
-  value.{h,c}        実行時の値表現
-  ast.{h,c}          AST ノード定義
-  parser.{h,c}       再帰下降パーサー
-  env.{h,c}          変数スコープ環境
-  interpreter.{h,c}  ツリーウォーク型インタプリタ
-  common.{h,c}       共通ユーティリティ（メモリ確保・文字列複製）
-  diag.{h,c}         診断ヘルパー（ソース抜粋・列番号・トークン名変換）
-  ffi_platform.{h,c} C FFI プラットフォーム抽象化層（POSIX: dlopen ｜ Windows: LoadLibrary）
-  ffi.{h,c}          C FFI 型・ハンドル管理レイヤ
-  ffi_call.{h,c}     C FFI 呼び出しディスパッチ（libffi 不使用）
-  ffi_callback.{h,c} C FFI コールバック（静的トランポリン）
-  event_loop.{h,c}   協調的イベントループ（POSIX: ucontext ｜ Windows: Win32 Fiber）
-  net.{h,c}          低水準ソケット myon.net（POSIX ソケット ｜ Windows: Winsock2）
-  http.{h,c}         簡易 HTTP モジュール myon.http
-  tls.{h,c}          HTTPS/TLS クライアント（OpenSSL、フェイルクローズ検証）
-  package.{h,c}      パッケージマニフェスト（myon.toml / myon.lock / package.myon）
-  pkg_fetch.{h,c}    GitHub からの archive 取得（myon.http とは独立した HTTPS GET）
-  pkg_fs.{h,c}       インストール先のファイル操作（staging → atomic 反映）
-  pkg_hash.{h,c}     SHA-256（OpenSSL EVP）
-  pkg_ops.{h,c}      install / lock / verify / tree の依存解決ロジック
-  pkg_zip.{h,c}      安全性優先の ZIP 展開（ZIP Slip・symlink・展開爆弾を拒否）
-  mvm_bytecode.h     MVM オペコード定義
-  mvm_chunk.{h,c}    MVM チャンク・定数プール・`.myc` シリアライズ
-  mvm_compiler.{h,c} AST→MVM バイトコードコンパイラ
-  mvm_vm.{h,c}       MVM バイトコード VM ランタイム
-  main.c             エントリポイント（CLI 解析・.myon/.myc 振り分け・REPL・myon pkg）
-examples/            サンプルプログラム
-docs/                言語仕様・機能一覧
-  myon_spec.md       言語仕様
-  mvm_spec.md        MVM バイトコード仕様
-  features.md        機能一覧・実装状況・開発の歩み
-  package_manager.md パッケージ管理の仕様・内部実装
-  package_development.md  パッケージ開発者向けガイド
-tests/               回帰テスト（`make test`）
-  cases/             `.myon`／`.out`／`.err` の回帰ケース
-  fixtures/          テスト用の C ソース・パッケージ雛形
-  run_tests.sh          メインのケース実行ハーネス
-  mvm_compiler_tests.sh MVM コンパイラ（バイトコード生成）テスト
-  run_mvm_tests.sh      `.myon`／`.myc` 等価性検証スイート
-  pkg_unit_tests.c      パッケージマニフェスト・パースの C 単体テスト
-  pkg_zip_tests.c       ZIP 展開の安全性テスト
-  pkg_ops_tests.c       依存解決ロジックのテスト
-  bench_mvm.sh          ベンチマーク（`BENCH_FIB` / `BENCH_LOOP` で負荷調整）
-known-issues.md      既知の制限事項
-.github/workflows/   GitHub Actions
-  ci.yml             push(main)/PR の gcc・clang ビルド＋テスト
-  heavy-checks.yml   sanitizer／Windows クロス・実機／macOS 実機／ベンチ
-  release.yml        手動リリース（Linux/Windows/macOS バイナリを Releases に公開）
-```
-
-## ドキュメント
-
-- [`docs/myon_spec.md`](docs/myon_spec.md) — 言語仕様（型・構文・標準ライブラリ・
-  EBNF 文法など）
-- [`docs/mvm_spec.md`](docs/mvm_spec.md) — MVM バイトコード仕様
-- [`docs/features.md`](docs/features.md) — 機能一覧・実装状況・開発の歩み
-- [`docs/package_manager.md`](docs/package_manager.md) — GitHub ベース package
-  管理の仕様・内部実装（`myon pkg` / `myon.toml` / `myon.lock` / module import §6）
-- [`docs/package_development.md`](docs/package_development.md) — package 開発者向け
-  ガイド（package の作り方・公開／導入・ローカル検証）
+| 場所 | 内容 |
+|---|---|
+| `src/` | lexer、parser、型・値、インタプリタ、MVM、FFI、ネットワーク、パッケージ管理 |
+| `examples/` | 実行例 |
+| `tests/` | 回帰テストとフィクスチャ |
+| [myon_spec.md](docs/myon_spec.md) | 構文・型・標準ライブラリのリファレンス |
+| [mvm_spec.md](docs/mvm_spec.md) | 命令・スタック・バイトコード形式 |
+| [features.md](docs/features.md) | 機能と実装・検証箇所の対応 |
+| [package_manager.md](docs/package_manager.md) | パッケージ取得・配置・検証の規則 |
+| [package_development.md](docs/package_development.md) | パッケージの作成と公開 |
+| [known-issues.md](known-issues.md) | 未対応事項、未修正の問題、修正記録 |
 
 ## ライセンス
 
-Apache License, Version 2.0. 詳細は [`LICENSE`](LICENSE) を参照してください。
-
-Copyright 2026 TeamMyonlang
+[Apache License 2.0](LICENSE)。Copyright 2026 TeamMyonlang。
