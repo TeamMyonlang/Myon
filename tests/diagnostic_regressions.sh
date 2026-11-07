@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 set -eu
+# Diagnostics contain UTF-8 bytes even in native Windows CRT output. Compare
+# those bytes directly; MSYS2's locale-aware grep can reject non-BMP patterns.
+export LC_ALL=C
 MYON=${1:-./myon}
 scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT
