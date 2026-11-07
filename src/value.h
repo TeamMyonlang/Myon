@@ -18,6 +18,7 @@
 #define MYON_VALUE_H
 
 #include "types.h"
+#include <stddef.h>
 
 /*
  * Runtime value representation (spec.md section 2 and beyond).
@@ -57,6 +58,15 @@ typedef enum {
     OBJ_FUNC,     /* function / lambda / bound method */
     OBJ_TASK      /* Phase5: async task handle (wraps event-loop Task*) */
 } ObjKind;
+
+/* Intrusive cycle-collector metadata, shared by objects and upvalue cells.
+ * External references are inferred by subtracting owned heap edges from RC. */
+typedef struct ValueGC {
+    struct ValueGC *prev, *next, *work;
+    int *refs;
+    void *owner;
+    int is_cell, trial, marked;
+} ValueGC;
 
 /* dynamic array of values */
 typedef struct {
@@ -103,6 +113,7 @@ typedef struct {
  * point at.  The cell is refcounted so it outlives the frame that created it.
  */
 typedef struct UpvalueCell {
+    ValueGC gc;
     Value value;
     int   refcount;
 } UpvalueCell;
@@ -127,14 +138,13 @@ typedef struct {
     int              upvalue_count;
 } FuncData;
 
-/* async task handle (Phase5): opaque pointer into the event loop.  The
- * event-loop Task itself is owned by the loop (freed on loop destroy); this
- * object only holds a borrowed handle used by myon.await. */
+/* An owned event-loop Task reference; completed stacks have separate lifetimes. */
 typedef struct {
     void *task;   /* event-loop `Task *` (opaque here to keep layering clean) */
 } TaskData;
 
 struct Obj {
+    ValueGC gc;
     ObjKind kind;
     int     refcount;
     union {
@@ -164,10 +174,12 @@ Value value_array(TypeSpec *elem_type /*owned*/);
 Value value_map(TypeSpec *key_type /*owned*/, TypeSpec *val_type /*owned*/);
 Value value_struct(const char *type_name, struct StructDecl *decl);
 Value value_func(struct FuncDecl *decl, struct Env *closure);
-Value value_task(void *task /* borrowed event-loop Task* */);
+Value value_task(void *task /* retained event-loop Task* */);
 
 /* ---- refcount management ---- */
 Value value_copy(const Value *v);   /* shares objects, bumps refcount */
+void  value_collect_cycles(void);
+size_t value_live_allocations(void); /* objects + upvalue cells (diagnostics) */
 void  value_free(Value *v);         /* drops one reference */
 
 /* ---- helpers ---- */

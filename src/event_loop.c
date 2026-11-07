@@ -70,7 +70,7 @@
 #include <time.h>
 #include <errno.h>
 
-#define TASK_STACK_SIZE (256 * 1024)
+#define TASK_STACK_SIZE MYON_TASK_STACK_SIZE
 
 struct Task {
     ucontext_t  ctx;         /* this task's own context               */
@@ -81,6 +81,9 @@ struct Task {
     void      (*entry)(void *ud);
     void       *ud;
 
+    int         call_depth;
+    int         refs;
+    void      (*result_cleanup)(void *);
     TaskState   state;
     myon_fd_t   waiting_fd;        /* WAITING_IO fd being watched (native-width fd) */
     int         waiting_for_write; /* 0=read, 1=write                  */
@@ -98,7 +101,9 @@ struct Task {
 
 struct EventLoop {
     ucontext_t  core_ctx;   /* context we swap back to from a task     */
-    Task       *tasks;      /* all tasks (never removed while alive)   */
+    Task       *tasks;      /* active tasks only                       */
+    Task       *tail;
+    void      (*result_cleanup)(void *);
     Task       *current;    /* task currently running, or NULL         */
 };
 
@@ -122,13 +127,45 @@ EventLoop *event_loop_create(void) {
     return loop;
 }
 
+static void release_stack(Task *t) {
+    free(t->stack); t->stack = NULL;
+}
+
+int *event_loop_task_call_depth(Task *t) { return &t->call_depth; }
+void event_loop_task_ref(Task *t) { if (t) t->refs++; }
+void event_loop_task_unref(Task *t) {
+    if (!t || --t->refs != 0) return;
+    if (t->result && t->result_cleanup) t->result_cleanup(t->result);
+    free(t);
+}
+void event_loop_set_result_cleanup(EventLoop *loop, void (*cleanup)(void *)) {
+    loop->result_cleanup = cleanup;
+}
+
+/* Only called on the core stack. Waiting tasks keep their own target refs. */
+static void reap_done(EventLoop *loop) {
+    Task **link = &loop->tasks;
+    Task *prev = NULL;
+    while (*link) {
+        Task *t = *link;
+        if (t->state != TASK_DONE) { prev = t; link = &t->next; continue; }
+        *link = t->next;
+        if (loop->tail == t) loop->tail = prev;
+        release_stack(t);
+        event_loop_task_unref(t); /* release active-list ownership */
+    }
+}
+
 void event_loop_destroy(EventLoop *loop) {
     if (!loop) return;
     Task *t = loop->tasks;
     while (t) {
         Task *n = t->next;
-        free(t->stack);
-        free(t);
+        release_stack(t);
+        t->state = TASK_DONE;
+        if (t->waiting_on) event_loop_task_unref(t->waiting_on);
+        t->waiting_on = NULL;
+        event_loop_task_unref(t);
         t = n;
     }
     free(loop);
@@ -161,6 +198,8 @@ Task *event_loop_spawn(EventLoop *loop, void (*entry)(void *ud), void *ud) {
     t->stack_size = TASK_STACK_SIZE;
     t->stack = malloc(t->stack_size);
     if (!t->stack) { fprintf(stderr, "myon: out of memory (task stack)\n"); abort(); }
+    t->refs = 1; /* active list owns a reference */
+    t->result_cleanup = loop->result_cleanup;
     t->entry = entry;
     t->ud = ud;
     t->state = TASK_READY;
@@ -168,14 +207,10 @@ Task *event_loop_spawn(EventLoop *loop, void (*entry)(void *ud), void *ud) {
     t->loop = loop;
     t->return_ctx = &loop->core_ctx;
 
-    /* link into the all-tasks list (append to preserve spawn order) */
-    if (!loop->tasks) {
-        loop->tasks = t;
-    } else {
-        Task *p = loop->tasks;
-        while (p->next) p = p->next;
-        p->next = t;
-    }
+    /* Append to the active list in O(1), preserving spawn order. */
+    if (loop->tail) loop->tail->next = t;
+    else loop->tasks = t;
+    loop->tail = t;
     return t;
 }
 
@@ -223,14 +258,20 @@ void event_loop_wait_task(EventLoop *loop, Task *target) {
     Task *t = loop->current;
     if (!t || !target) return;
     if (target->state == TASK_DONE) return;
+    event_loop_task_ref(target);
     t->waiting_on = target;
     t->state = TASK_WAITING_TASK;
     task_yield_to_core(t);
     t->waiting_on = NULL;
+    event_loop_task_unref(target);
 }
 
 int event_loop_task_done(Task *target) {
     return target && target->state == TASK_DONE;
+}
+
+int event_loop_task_result_exclusive(Task *target) {
+    return target && target->state == TASK_DONE && target->refs == 1;
 }
 
 void *event_loop_task_result(Task *target) {
@@ -348,11 +389,14 @@ static Task *pick_ready(EventLoop *loop) {
 
 int event_loop_run_once(EventLoop *loop) {
     wake_task_waiters(loop);
+    reap_done(loop);
     wake_sleepers(loop, now_ms());
 
     Task *ready = pick_ready(loop);
     if (ready) {
         resume_task(loop, ready);
+        wake_task_waiters(loop);
+        reap_done(loop);
         return count_pending(loop);
     }
 
@@ -475,8 +519,8 @@ void event_loop_run_until_foreground_done(EventLoop *loop) {
  *     proc, after the task's entry() finishes, enter an infinite loop that
  *     marks the task DONE and SwitchToFiber(main_fiber) forever.  The scheduler
  *     never SwitchToFiber's into a DONE task again, so this loop body executes
- *     exactly once per completion; the fiber then simply sits parked until
- *     event_loop_destroy() calls DeleteFiber on it.  This is the single biggest
+ *     exactly once per completion; the scheduler then calls DeleteFiber
+ *     after control has returned to the core.  This is the single biggest
  *     structural difference from the ucontext build and is called out in the
  *     Step3 completion report.
  *
@@ -502,7 +546,7 @@ void event_loop_run_until_foreground_done(EventLoop *loop) {
 #include <winsock2.h>
 #include <windows.h>
 
-#define TASK_STACK_SIZE (256 * 1024)
+#define TASK_STACK_SIZE MYON_TASK_STACK_SIZE
 
 struct Task {
     LPVOID      fiber;       /* this task's fiber (CreateFiber result)  */
@@ -510,6 +554,9 @@ struct Task {
     void      (*entry)(void *ud);
     void       *ud;
 
+    int         call_depth;
+    int         refs;
+    void      (*result_cleanup)(void *);
     TaskState   state;
     myon_fd_t   waiting_fd;        /* WAITING_IO fd being watched (native-width fd) */
     int         waiting_for_write; /* 0=read, 1=write                  */
@@ -527,7 +574,9 @@ struct Task {
 
 struct EventLoop {
     LPVOID      main_fiber; /* ConvertThreadToFiber result; loop core  */
-    Task       *tasks;      /* all tasks (never removed while alive)   */
+    Task       *tasks;      /* active tasks only                       */
+    Task       *tail;
+    void      (*result_cleanup)(void *);
     Task       *current;    /* task currently running, or NULL         */
 };
 
@@ -585,13 +634,45 @@ EventLoop *event_loop_create(void) {
     return loop;
 }
 
+static void release_stack(Task *t) {
+    if (t->fiber) DeleteFiber(t->fiber); t->fiber = NULL;
+}
+
+int *event_loop_task_call_depth(Task *t) { return &t->call_depth; }
+void event_loop_task_ref(Task *t) { if (t) t->refs++; }
+void event_loop_task_unref(Task *t) {
+    if (!t || --t->refs != 0) return;
+    if (t->result && t->result_cleanup) t->result_cleanup(t->result);
+    free(t);
+}
+void event_loop_set_result_cleanup(EventLoop *loop, void (*cleanup)(void *)) {
+    loop->result_cleanup = cleanup;
+}
+
+/* Only called on the core stack. Waiting tasks keep their own target refs. */
+static void reap_done(EventLoop *loop) {
+    Task **link = &loop->tasks;
+    Task *prev = NULL;
+    while (*link) {
+        Task *t = *link;
+        if (t->state != TASK_DONE) { prev = t; link = &t->next; continue; }
+        *link = t->next;
+        if (loop->tail == t) loop->tail = prev;
+        release_stack(t);
+        event_loop_task_unref(t); /* release active-list ownership */
+    }
+}
+
 void event_loop_destroy(EventLoop *loop) {
     if (!loop) return;
     Task *t = loop->tasks;
     while (t) {
         Task *n = t->next;
-        if (t->fiber) DeleteFiber(t->fiber);
-        free(t);
+        release_stack(t);
+        t->state = TASK_DONE;
+        if (t->waiting_on) event_loop_task_unref(t->waiting_on);
+        t->waiting_on = NULL;
+        event_loop_task_unref(t);
         t = n;
     }
     /* Convert the thread back so a second loop (if ever created) can convert
@@ -629,20 +710,18 @@ static VOID CALLBACK task_fiber_proc(PVOID param) {
 Task *event_loop_spawn(EventLoop *loop, void (*entry)(void *ud), void *ud) {
     Task *t = (Task *)calloc(1, sizeof(Task));
     if (!t) { fprintf(stderr, "myon: out of memory (task)\n"); abort(); }
+    t->refs = 1; /* active list owns a reference */
+    t->result_cleanup = loop->result_cleanup;
     t->entry = entry;
     t->ud = ud;
     t->state = TASK_READY;
     t->waiting_fd = -1;
     t->loop = loop;
 
-    /* link into the all-tasks list (append to preserve spawn order) */
-    if (!loop->tasks) {
-        loop->tasks = t;
-    } else {
-        Task *p = loop->tasks;
-        while (p->next) p = p->next;
-        p->next = t;
-    }
+    /* Append to the active list in O(1), preserving spawn order. */
+    if (loop->tail) loop->tail->next = t;
+    else loop->tasks = t;
+    loop->tail = t;
     return t;
 }
 
@@ -691,14 +770,20 @@ void event_loop_wait_task(EventLoop *loop, Task *target) {
     Task *t = loop->current;
     if (!t || !target) return;
     if (target->state == TASK_DONE) return;
+    event_loop_task_ref(target);
     t->waiting_on = target;
     t->state = TASK_WAITING_TASK;
     task_yield_to_core(t);
     t->waiting_on = NULL;
+    event_loop_task_unref(target);
 }
 
 int event_loop_task_done(Task *target) {
     return target && target->state == TASK_DONE;
+}
+
+int event_loop_task_result_exclusive(Task *target) {
+    return target && target->state == TASK_DONE && target->refs == 1;
 }
 
 void *event_loop_task_result(Task *target) {
@@ -818,11 +903,14 @@ static Task *pick_ready(EventLoop *loop) {
 
 int event_loop_run_once(EventLoop *loop) {
     wake_task_waiters(loop);
+    reap_done(loop);
     wake_sleepers(loop, now_ms());
 
     Task *ready = pick_ready(loop);
     if (ready) {
         resume_task(loop, ready);
+        wake_task_waiters(loop);
+        reap_done(loop);
         return count_pending(loop);
     }
 
@@ -924,11 +1012,19 @@ int  event_loop_wait_writable(EventLoop *loop, myon_fd_t fd) { (void)loop; (void
 void event_loop_sleep_ms(EventLoop *loop, long long ms) { (void)loop; (void)ms; }
 void event_loop_wait_task(EventLoop *loop, Task *target) { (void)loop; (void)target; }
 int  event_loop_task_done(Task *target) { (void)target; return 1; }
+int event_loop_task_result_exclusive(Task *target) {
+    (void)target; return 0;
+}
+
 void *event_loop_task_result(Task *target) { (void)target; return NULL; }
 int  event_loop_task_has_error(Task *target) { (void)target; return 0; }
 void event_loop_task_set_result(Task *task, void *result, int has_error) {
     (void)task; (void)result; (void)has_error;
 }
+int *event_loop_task_call_depth(Task *t) { (void)t; return NULL; }
+void event_loop_task_ref(Task *t) { (void)t; }
+void event_loop_task_unref(Task *t) { (void)t; }
+void event_loop_set_result_cleanup(EventLoop *l, void (*c)(void *)) { (void)l; (void)c; }
 Task *event_loop_current(EventLoop *loop) { (void)loop; return NULL; }
 int  event_loop_run_once(EventLoop *loop) { (void)loop; return 0; }
 void event_loop_run_until_all_done(EventLoop *loop) { (void)loop; }

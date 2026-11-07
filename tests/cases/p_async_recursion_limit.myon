@@ -1,0 +1,8 @@
+module myon.stdio
+myon.func recurse(n: int) ret int {
+    myon.if n == 0 then { ret 0 }
+    ret recurse(n - 1)
+}
+myon.async myon.func worker() ret int { ret recurse(50000) }
+t = worker()
+myon.print(myon.await t)

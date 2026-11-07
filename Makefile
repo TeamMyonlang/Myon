@@ -177,6 +177,7 @@ test-asan: $(ASAN_BIN)
 	cp -f $(ASAN_BIN) myon; \
 	export ASAN_OPTIONS="abort_on_error=1:halt_on_error=1:detect_leaks=0"; \
 	export UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=1:abort_on_error=1"; \
+	bash tests/runtime_regressions.sh ./myon; \
 	./tests/run_tests.sh; \
 	./tests/mvm_compiler_tests.sh; \
 	if [ -f ./tests/run_mvm_tests.sh ]; then ./tests/run_mvm_tests.sh; fi
@@ -190,7 +191,7 @@ $(BUILD):
 # Full test suite.  The existing suites (run order and output format) are kept
 # exactly as before; Step 7-c only appends the .myon/.myc equality suite when
 # it is present (tests/run_mvm_tests.sh), so older checkouts still work.
-test: all test-pkg
+test: all test-pkg test-runtime
 	./tests/run_tests.sh
 	./tests/mvm_compiler_tests.sh
 	@if [ -f ./tests/run_mvm_tests.sh ]; then ./tests/run_mvm_tests.sh; fi
@@ -268,3 +269,13 @@ uninstall:
 
 clean:
 	rm -rf $(BUILD) $(BIN) $(ASAN_BIN) myon.asan-backup
+
+# Ownership/collection checks assert counts directly; they do not depend on RSS
+# or on the main harness's permissive expected-error checks.
+RUNTIME_TEST_SRCS = tests/runtime_memory_tests.c src/value.c src/types.c \
+                    src/ast.c src/common.c src/event_loop.c
+.PHONY: test-runtime
+test-runtime: all | $(BUILD)
+	$(CC) $(CFLAGS) -Isrc $(RUNTIME_TEST_SRCS) $(LDLIBS) -o $(BUILD)/runtime_memory_tests
+	$(BUILD)/runtime_memory_tests
+	bash tests/runtime_regressions.sh ./$(BIN)
