@@ -178,9 +178,7 @@ static int find_method_chunk(VM *vm, StructDecl *sd, const char *method) {
  */
 static void vm_error(VM *vm, int line, const char *fmt, ...) {
     va_list ap;
-    fprintf(stderr, "runtime error");
-    if (line > 0) fprintf(stderr, " (line %d)", line);
-    fprintf(stderr, ": ");
+    fprintf(stderr, "myon: runtime error at line %d: ", line);
     va_start(ap, fmt);
     vfprintf(stderr, fmt, ap);
     va_end(ap);
