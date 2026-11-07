@@ -1,43 +1,41 @@
-# Myon言語仕様書 v0.1
+# Myon 言語リファレンス
 
-## 0. 概要
+## 0. この文書について
 
-**Myon** は実用性を見据えた、型に厳密なプログラミング言語である。
-`myon.` プレフィックスによる名前空間の明示、`str()`/`char()`/`int()` のような値コンストラクタ風の型構文、
-そして独自のスコープ公開機構 `myon.expose` を特徴とする。
+この文書は Myon の構文、型、標準ライブラリ、実行方法を説明します。
+実装は C のツリーウォーク型インタプリタと MVM で構成されます。
+MVM の命令とファイル形式は [MVM リファレンス](mvm_spec.md)、実装箇所・検証例は
+[機能一覧](features.md) を参照してください。
 
-### 0.1 設計方針まとめ
+言語の規則と実装の不一致は [既知の問題](../known-issues.md) に記録しています。
+特にエスケープ処理、module 宣言による機能制限、Unicode の大小文字変換、
+実行エンジン間のエラー段階には制約があります。
 
-| 項目 | 方針 |
-|---|---|
-| プレフィックス | `myon.stdio` 等モジュール読み込み以外は原則 `myon.` を付与 |
-| 型システム | 厳密（異なる型同士の演算はエラー） |
-| コメント | `#`（改行不可） / `//`（改行可） / `/* */`（複数行） |
-| 実装言語 | C（理想はアセンブリ） |
-| エラー処理 | Rust/Go風、戻り値にエラーを含める |
-| null | `myon.nil` はエラー値専用。通常変数はnil不可・初期化必須 |
-| 整数オーバーフロー | 実行時エラー |
+### 0.1 表記
 
----
+`ret T` は戻り値の型、`ret T, error` は結果とエラーの2値を表します。
+API 表の `int|float`・`?`・`func`・`array of T` は説明上の表記を含みます。
+それぞれを型注釈としてそのまま書けるとは限りません。
+コードブロックには、単体で実行できる例と、宣言・外部ライブラリなどを前提とする断片があります。
 
 ## 1. 字句規則
 
 ### 1.1 コメント
 
+`#` と `//` は行末まで、`/* ... */` は複数行のコメントです。
+コメント内の改行と、文の区切りとしての改行を区別してください。
+
 ```myon
-# 単一行コメント（改行不可）
-// 単一行コメント（改行可能、JS的）
-/* 
-複数行コメント
-何行でも書ける
-*/
+# 行コメント
+// 行コメント
+/* 複数行の
+   コメント */
 ```
 
 ### 1.2 識別子
 
-- 使用可能文字：英数字とアンダースコア（`_`）
-- 数字始まりは不可
-- 大文字・小文字を区別する
+英字または `_` で始まり、英数字と `_` を続けます。大文字と小文字は区別します。
+数字で始まる名前は識別子として扱いません。
 
 ### 1.3 リテラル
 
@@ -46,294 +44,246 @@
 | int | `1`, `42`, `0x1F`, `0o17` | 10進数・16進数・8進数（14.1節参照） |
 | float | `3.14`, `1.5e10` | 通常表記・指数表記（14.1節参照） |
 | str | `str("人間")` | コンストラクタ経由 |
-| char | `char("a")` | コンストラクタ経由、1文字 |
+| char | `char("a")` | 現実装の変換は1バイト単位 |
 | bool | `true`, `false` | 直接代入可（int同様の扱い） |
+
+浮動小数点数には `1.5e10` や `1e3` の指数表記も使えます。
+文字列リテラルは式補間の対象です。バックスラッシュエスケープは現実装でデコードされません。
 
 ### 1.4 文の区切り
 
-- 改行で文を区切るのが基本
-- セミコロン `;` を使えば1行に複数文を書ける
+改行または `;` で文を区切ります。`()` と `[]` の内側の改行は区切りにしません。
+`{}` の内側では文の区切りとして改行を使えます。
 
 ```myon
-x = 1; y = 2; myon.print(x + y)
-```
-
-- ただし `()` / `[]` の内部にある改行は文の区切りとみなさない。
-  これにより、関数呼び出しの引数リストや配列アクセスなどを複数行に
-  分けて書ける（字句解析器が `(`・`[` の深さを数え、深度が0より大きい
-  間は改行を読み飛ばす）。
-
-```myon
-hero = Hero(
-    name = str("勇者"),
-    hp = 80
+x = 1; y = 2
+myon.print(
+    x,
+    y
 )
 ```
 
-- 一方、ブロック本体を囲む `{}` の内部では改行は引き続き文の区切りとして
-  機能する（複数の文を並べるために改行が必要なため、`{}` は上記の深さ計算に
-  含めない）。
+### 1.5 キーワードと予約名
 
-### 1.5 予約語一覧
+主な字句キーワードは次のとおりです。`myon.print` などは専用トークンを持ち、
+`myon.println` などは修飾名として解決される組み込み名です。
+実際のトークン化は `src/lexer.c` の PLAIN_KW / MYON_KW で確認できます。
 
-```
-system module myon ret str char int float bool void error
-myon.if myon.elif myon.else then
-myon.while myon.for myon.in myon.break myon.continue range
-myon.func myon.struct myon.array myon.map myon.print myon.input
-myon.println myon.write myon.eprint myon.flush myon.is_tty myon.argv
-myon.and myon.or myon.not myon.nil myon.expose
-myon.lambda myon.extends self myon.async myon.await
-true false as
+```text
+system module myon ret str char int float bool void error then range self as
+true false
+myon.if myon.elif myon.else myon.while myon.for myon.in
+myon.break myon.continue myon.func myon.struct myon.array myon.map
+myon.print myon.input myon.and myon.or myon.not myon.nil
+myon.expose myon.lambda myon.extends myon.async myon.await
 ```
 
----
+## 2. 型と変換
 
-## 2. 型システム
+### 2.1 値の型
 
-### 2.1 プリミティブ型
+| 型 | 内容 |
+|---|---|
+| int | 符号付き64ビット整数 |
+| float | C の double による浮動小数点数 |
+| bool | true / false |
+| str | NUL 終端のバイト列として保持する文字列 |
+| char | 文字用の型。現実装の変換は1バイト単位 |
+| error | 失敗を表すメッセージ |
+| void | 戻り値なしの宣言に使う型 |
 
-- `int`：整数。オーバーフロー時は実行時エラー
-- `float`：浮動小数点数
-- `str`：文字列（`str(...)` で構築）
-- `char`：1文字（`char(...)` で構築）
-- `bool`：真偽値（`true`/`false` を直接代入可）
+配列・Map・構造体・関数・Task も実行時の値です。
+Task は async 関数の呼び出し結果で、通常は利用者が型注釈に書きません。
 
-int 同士の比較は int64 のまま行い、2^53 を超える値でも精度を失わない。
+### 2.2 演算の型
 
-### 2.2 型の厳密性
+異なる型の算術演算は自動変換しません。例えば int + float は型不一致です。
+数値型の変換を許容する標準ライブラリ関数は、その関数の規則に従います。
+整数の加減乗除、符号反転などで結果が範囲を超える場合は実行時エラーです。
+int 同士の比較は double を経由せず、int64 のまま行います。
 
-異なる型同士の演算は**すべてエラー**となる（例：`char + int` はコンパイル/実行時エラー）。
-
-### 2.3 型変換（キャスト）
-
-型コンストラクタが変換も兼ねる。
+### 2.3 明示的な変換
 
 ```myon
-n = int("123")     // str → int
-s = str(123)        // int → str
-c = char(65)         // int → char
+n = int("123")
+s = str(123)
+c = char(65)
 ```
 
-`int(float)` は有限値を 0 方向へ切り捨てる。結果が int64 の範囲外、または
-入力が NaN/Infinity の場合は実行時エラーとなる。`int(str)` も範囲外の整数文字列を
-端点に飽和させず、実行時エラーとする。
+`int(float)` は0方向への切り捨てです。NaN/Infinity と int64 範囲外の値は拒否します。
+`int(str)` は10進文字列を解析し、解析失敗・範囲外を実行時エラーにします。
+`myon.string.to_int` は別の API で、エラーを第2戻り値として受け取れます。
+
+`char(int)` は下位8ビット、`char(str)` は先頭バイトを使います。空文字列は拒否します。
+Unicode コードポイントを char に変換する API ではありません。
+`str(value)` は値の表示表現を生成します。任意のバイナリ列を保存する機能ではありません。
 
 ### 2.4 myon.nil
 
-`myon.nil` は**エラー値専用**。通常の変数（int/str/bool等）に代入することはできず、
-すべての変数は宣言時に初期化が必須。
+nil は値がないことを表すセンチネルとして、error の成功側や Map の未検出結果などに使います。
+通常変数への単一の nil 代入は拒否します。変数の宣言には初期値が必要です。
+エラーとの比較には `err == myon.nil` / `err != myon.nil` を使います。
+
+## 3. 変数と演算子
 
 ```myon
-x: int          // エラー：初期化なしの宣言は不可
-x = 0            // OK
-
-result, err = divide(10, 0)
-myon.if err != myon.nil then { ... }   // myon.nilはerror型の文脈でのみ有効
+count = 1
+message = str("hello")
+count += 2
 ```
 
----
-
-## 3. 変数と代入
-
-```myon
-x = str("人間")
-a = char("a")
-b = 1
-flag = true
-```
+型注釈を付ける場合は `count: int = 1` と書きます。
+注釈を省いた束縛は評価結果の値から作られます。関数呼び出しや計算結果の代入にも使います。
+静的な型推論でプログラム全体の型を事前に確定する機構ではありません。
 
 ### 3.1 演算子
 
-**算術・比較**
-```
-+  -  *  /
-==  !=  <  >  <=  >=
-```
+算術は `+ - * /`、比較は `== != < > <= >=`、複合代入は `+= -= *= /=` です。
+論理演算は中置の `myon.and` / `myon.or` と前置の `myon.not` を使います。
+and/or は右辺を評価しない場合があります。not を後置には書けません。
 
-**論理演算子（プレフィックススタイル）**
-```
-myon.and  myon.or  myon.not
-```
+### 3.2 優先順位
 
-`myon.not` は前置専用の単項演算子である（EBNF: `not_expr = [ "myon.not" ], comparison ;`）。
-必ずオペランドの前に置くこと。後置で書くと構文エラーになる。
+| 高い順 | 演算子 |
+|---|---|
+| 1 | 呼び出し `()`、添字 `[]`、メンバー `.` |
+| 2 | 単項 `-` |
+| 3 | `* /` |
+| 4 | `+ -` |
+| 5 | 比較 |
+| 6 | `myon.not` |
+| 7 | `myon.and` |
+| 8 | `myon.or` |
 
-```myon
-// 正しい書き方（前置）
-myon.if myon.not flag then { ... }
-
-// 誤り（後置は構文エラーになる）
-// myon.if flag myon.not then { ... }
-```
-
-**複合代入演算子**
-```
-+=  -=  *=  /=
-```
-
-### 3.2 演算子優先順位（上ほど優先度が高い）
-
-| 優先度 | 演算子 | 種別 |
-|---|---|---|
-| 1 | `()` `[]` `.` | グループ化・添字・メンバアクセス |
-| 2 | `myon.not` `-`（単項） | 単項演算子 |
-| 3 | `*` `/` | 乗除 |
-| 4 | `+` `-` | 加減 |
-| 5 | `==` `!=` `<` `>` `<=` `>=` | 比較 |
-| 6 | `myon.and` | 論理AND |
-| 7 | `myon.or` | 論理OR |
-
----
+優先順位を明示する場合は括弧を使います。`myon.not a == b` は比較結果に対する否定です。
 
 ## 4. 文字列補間
 
-`{}` 内に任意の式を書ける（変数参照・計算・プロパティアクセス等）。
+文字列内の `{expr}` を評価して文字列化します。`{{` と `}}` はリテラルの波括弧です。
 
 ```myon
-myon.print("Hello, {name}! Next year you'll be {age + 1}.")
-myon.print("{p.name}'s age is {p.age}.")
+name = str("myon")
+count = 2
+myon.print("name={name}, next={count + 1}")
 ```
 
----
+現実装の補間は最初の閉じ波括弧を区切りに使います。入れ子の波括弧を含む任意の式が
+常に解析できるという規則ではありません。エスケープ処理の問題14とは別の機能です。
 
 ## 5. 制御構文
 
 ### 5.1 条件分岐
 
+if の then は省略可能、elif の then は必須、else には条件を付けません。
+
 ```myon
+a = 2
+b = 1
 myon.if a > b {
-    myon.print("aがbよりデカい")
-} myon.elif b > a then {
-    myon.print("bがaよりデカい")
+    myon.print("a is greater")
+} myon.elif a < b then {
+    myon.print("b is greater")
 } myon.else {
-    myon.print("しらね")
+    myon.print("equal")
 }
 ```
 
-`then` は `myon.elif` の文法要素として残す（`myon.if`/`myon.else` には不要）。
+### 5.2 ループ
 
-### 5.2 繰り返し
+range の終点は含みません。配列の for-in は要素を順に束縛します。
 
 ```myon
-myon.while a < b {
-    myon.print(a)
-    a = a + 1
-    myon.if a == 5 then { myon.break }
-}
-
-myon.for i myon.in range(0, 10) {
-    myon.if i == 3 then { myon.continue }
+myon.for i myon.in range(0, 3) {
     myon.print(i)
 }
 
-myon.for item myon.in xs {
-    myon.print(item)
+n = 0
+myon.while n < 3 {
+    n += 1
+    myon.if n == 2 then { myon.continue }
+    myon.print(n)
 }
 ```
 
----
+break は最も内側のループを抜け、continue は次の反復へ進みます。
 
-## 6. 関数
+## 6. 関数とエラー
 
-### 6.1 基本構文
+### 6.1 宣言と呼び出し
 
-引数の型注釈は必須。戻り値は `ret 型` の後置スタイル。voidは明示的に `ret void`。
+引数は `名前: 型`、戻り値は `ret 型` と書きます。
 
 ```myon
 myon.func add(a: int, b: int) ret int {
     ret a + b
 }
-
-myon.func greet(name: str) ret void {
-    myon.print("Hello, ", name, "!")
-}
+myon.print(add(2, 3))
 ```
 
-### 6.2 複数戻り値とエラー処理（Rust/Go風）
+戻り値を持たない宣言には `ret void` を使います。
 
-`error` はエラー専用の型で、`error(str)` の形でエラー値を生成する組み込みコンストラクタを持つ
-（`str()`/`char()`/`int()` と同様の値コンストラクタパターン）。
+### 6.2 複数戻り値
 
 ```myon
 myon.func divide(a: int, b: int) ret int, error {
-    myon.if b == 0 then {
-        ret 0, error("ゼロ除算")
-    }
+    myon.if b == 0 then { ret 0, error("division by zero") }
     ret a / b, myon.nil
 }
-
-result, err = divide(10, 0)
-myon.if err != myon.nil then {
-    myon.print("エラー: ", err)
-} myon.else {
-    myon.print("結果: ", result)
-}
+result, err = divide(10, 2)
+myon.if err != myon.nil then { myon.print(err) }
+myon.print(result)
 ```
 
-### 6.2.1 診断メッセージの形式（構文/実行時エラー）
+error 値の返却は、呼び出し元で検査するための規約です。
+一方、型不一致や通常の算術オーバーフローなどの実行時エラーは処理を中止します。
+この2つの経路を区別してください。
 
-構文エラー・実行時エラーは、gcc / Rust コンパイラ風の詳細な形式で報告する。
+### 6.2.1 診断
 
-- **行番号と列番号**の両方を表示する（字句解析器が保持する `col` を活用）。
-- **該当行のソースコード抜粋**と、エラー位置を指す `^` マーカーを表示する。
-- 構文エラーでは、期待していたトークン種別を人間が読みやすい表現に変換して出す
-  （例：`TOK_RPAREN` ではなく `')'`、`TOK_EOF` ではなく `end of file`）。
+構文エラーは行・列とトークンの説明を表示します。
+実行時エラーは行を表示し、ソースを参照できる場合は抜粋とキャレットを追加します。
+実行時のキャレットは列情報がないため行頭を指します。
 
-```
-myon: syntax error at line 5, column 17: expected ')' to close call (got an integer literal)
-     5 | myon.print(1, 2 3)
-       |                 ^
-```
-
-実行時エラー（型不一致・範囲外アクセス・ゼロ除算・整数オーバーフロー等）でも、
-発生行のソース抜粋を表示する。実行時は列情報を保持していないため、キャレットは
-行頭を指すベストエフォートの位置となる。
-
-```
+```text
 myon: runtime error at line 4: division by zero
      4 | myon.print(a / b)
        | ^
 ```
 
-### 6.3 ラムダ（無名関数）
+REPL はエラー後も次の入力を受け付けます。ファイル実行では終了コードで失敗を報告します。
+全診断の本文や発生段階が実行エンジン間で一致するわけではありません。
 
-`myon.lambda` で定義。外側スコープの変数を捕捉できる（通常のクロージャ）。
+### 6.3 ラムダ
 
 ```myon
 threshold = 10
-isOver = myon.lambda(x: int) ret bool { ret x > threshold }
-myon.print(isOver(15))   // true
+is_over = myon.lambda(x: int) ret bool { ret x > threshold }
+myon.print(is_over(15))
 ```
 
----
+ラムダやネスト関数は上位変数を参照します。
+MVM の捕捉セルとネイティブへの受け渡し制約は MVM リファレンス7節を参照してください。
 
 ## 7. 配列
 
-`myon.array` 型として定義。可変長・同一型要素のみ。
+`myon.array(T)` は要素型情報を持つ空配列を作ります。
 
 ```myon
 xs = myon.array(int)
 xs.push(1)
 xs.push(2)
-xs.push(3)
-
-y = xs[0]              // []記法でアクセス
-xs.pop()                 // 末尾を削除
-len = xs.length()        // 要素数取得
-xs.push("文字列")        // エラー：型不一致
+myon.print(xs[0])
+myon.print(xs.length())
 ```
 
-### 7.1 配列メソッド（Phase4）
+添字は0始まりです。負の添字や要素数以上のアクセスはエラーになります。
+代入やコピーは配列オブジェクトを共有し、複製を作る操作とは異なります。
 
-`push` / `pop` / `length` に加え、並べ替え・検索・部分取得・高階関数の
-メソッドを備える。`sort` / `sort_desc` / `reverse` は**破壊的**（呼び出し
-元の配列をその場で書き換える）で、それ以外は元の配列を変更せず新しい
-配列や値を返す。
+### 7.1 メソッド
 
 | メソッド | シグネチャ | 説明 |
 |------|-----------|------|
-| `push` | `(v: T) ret void` | 末尾に追加（型不一致は`error`） |
+| `push` | `(v: T) ret void` | 末尾に追加（型不一致は実行時エラー） |
 | `pop` | `() ret T` | 末尾を削除して返す |
 | `length` | `() ret int` | 要素数 |
 | `sort` | `() ret void` | 昇順にその場でソート（破壊的）。要素は全て`int`/`float`/`str`である必要がある（混在した`int`/`float`は`double`比較、`str`は`strcmp`のバイト列辞書順）。それ以外の型が混ざると`runtime_error` |
@@ -342,211 +292,106 @@ xs.push("文字列")        // エラー：型不一致
 | `contains` | `(v) ret bool` | `v`と等しい要素が存在するか（`value_equal`） |
 | `index_of` | `(v) ret int` | `v`と最初に等しい要素の位置（0-indexed）。無ければ`-1` |
 | `slice` | `(start: int, len: int) ret myon.array(T), error` | `start`番目から`len`個を取り出した新しい配列。`start`/`len`が負、または`start+len`が配列長超過なら`error` |
-| `map` | `(f) ret myon.array(?)` | 各要素に1引数関数/ラムダ`f`を適用した新しい配列。要素型は先頭要素の変換結果から推定（空配列は型無し） |
+| `map` | `(f) ret myon.array(?)` | 各要素に1引数関数/ラムダ`f`を適用した新しい配列。要素型情報は先頭結果から取得（空配列は型情報なし） |
 | `filter` | `(f) ret myon.array(T)` | `f`の結果がtruthyな要素だけを残した新しい配列（要素型は元と同じ） |
 | `reduce` | `(f, init) ret ?` | `acc=init`から左畳み込み（各要素で`acc = f(acc, elem)`）。空配列は`init`をそのまま返す |
 
-`map` / `filter` / `reduce` は `myon.lambda` を引数に取れる高階関数である。
+sort/sort_desc/reverse は元の配列を変更します。push/pop も要素数を変更します。
+slice/map/filter は新しい配列を返します。map/filter/reduce の関数引数を
+MVM からネイティブ側へ渡す処理には未対応の境界があります。
 
 ```myon
 xs = myon.array(int)
 xs.push(3)
 xs.push(1)
-xs.push(2)
-xs.sort()                       // [1, 2, 3]（破壊的）
-xs.sort_desc()                  // [3, 2, 1]
-xs.reverse()                    // [1, 2, 3]
-myon.print(xs.contains(2))      // true
-myon.print(xs.index_of(2))      // 1
-mid, merr = xs.slice(1, 2)      // [2, 3]（元の配列は不変）
-
-doubled = xs.map(myon.lambda(x: int) ret int { ret x * 2 })       // [2, 4, 6]
-sum = xs.reduce(myon.lambda(acc: int, x: int) ret int { ret acc + x }, 0)  // 6
+xs.sort()
+part, err = xs.slice(0, 1)
+myon.print(part)
 ```
 
----
+## 8. 構造体と継承
 
-## 8. 構造体（struct）
-
-複数フィールド・異種混在データの受け皿。フィールド名指定でインスタンス生成。
-メソッド定義・継承をサポートする。
+フィールドとメソッドを宣言し、フィールド名付きの引数でインスタンスを作ります。
 
 ```myon
 myon.struct Person {
     name: str
     age: int
-
     myon.func greet() ret void {
-        myon.print("Hello, my name is ", self.name)
+        myon.print("name=", self.name)
     }
 }
-
-myon.struct Employee myon.extends Person {
-    salary: int
-
-    myon.func showSalary() ret void {
-        myon.print(self.name, "'s salary: ", self.salary)
-    }
-}
-
-p = Person(name=str("太郎"), age=20)
+p = Person(name=str("myon"), age=20)
 p.greet()
-
-e = Employee(name=str("花子"), age=30, salary=5000)
-e.greet()
-e.showSalary()
 ```
 
----
+`myon.extends Parent` で親構造体を指定します。親と同名のフィールドは宣言できません。
+インスタンスの操作には self を使います。MVM で保存した `.myc` だけを実行する場合の
+宣言情報の制約は MVM リファレンス7節を参照してください。
 
-## 9. スコープ規則
+## 9. スコープ
 
-### 9.1 基本方針
+### 9.1 束縛の有効範囲
 
-ブロック（`{}`）スコープを基本としつつ、独自の `myon.expose` により
-明示的に外側スコープへ変数を持ち出すことができる。
+ブロック内で作った束縛は、そのブロックを出ると外から参照できません。
+`myon.expose` は束縛を1つ外側へ持ち出します。
 
 ```myon
-x = 1
 {
-    y = 2
-    myon.expose y
+    exported = 7
+    myon.expose exported
 }
-myon.print(y)   // OK: exposeされたので見える
-myon.print(x)   // OK: 元々外側
+myon.print(exported)
 ```
 
-`myon.expose` を使わない限り、ブロックを抜けた変数は消える。
+### 9.2 代入と同名束縛
 
-### 9.2 シャドーイング
+代入先の解決規則は単一代入・複数代入に適用します。
 
-**禁止**。同名変数の再定義はエラーとなる。
+1. 現在のスコープに束縛があれば更新します。
+2. 外側にだけ束縛がある場合、明示的なブロックではシャドーイングとして拒否します。
+   通常の関数本体などでは外側の束縛を更新します。
+3. どこにもなければ現在のスコープに作ります。
 
-```myon
-x = 1
-{
-    x = 2   // エラー：同名変数の再定義
-}
-```
+構造体メソッドは外側への代入探索の境界です。self のフィールド更新と、
+同名のグローバル変数の更新は別の操作になります。
+この規則に関する MVM とツリーウォークのエラー段階の差は既知の問題26です。
 
-このシャドーイング禁止ルールと代入の解決規則は、単純代入
-（`x = ...`）だけでなく**多重代入（`x, y = ...`）にも同じように
-適用される**。すなわち、
-
-1. 代入先の名前が**現在のスコープ**に既に束縛されていれば、その束縛を
-   更新する。
-2. 現在のスコープには無いが**外側のスコープ**に束縛が存在する場合、
-   - 現在のスコープが明示的な `{ }` ブロックであれば、外側変数の
-     シャドーイングとみなしエラーとなる（上記の禁止ルール）。
-   - 関数本体などブロックでないスコープであれば、外側の既存の束縛を
-     更新する。
-3. どこにも束縛が無ければ、現在のスコープに新規定義する。
-
-したがって、関数内で `x, y = pair()` のように多重代入を行った場合、
-`x` や `y` が外側スコープの既存変数であれば、（新しいローカル変数を
-作るのではなく）その外側の変数が更新される。
-
-```myon
-x = 100
-y = 200
-myon.func inner() ret void {
-    x, y = pair()   // 外側の x, y を更新する（新規ローカルは作らない）
-}
-inner()
-myon.print(x)       // pair() の第1返り値
-myon.print(y)       // pair() の第2返り値
-```
-
-#### 構造体メソッドと外側スコープの境界
-
-上記の「外側の既存束縛を更新する」規則は、**構造体メソッドの本体**では
-グローバルスコープを越えて適用されない。メソッドは `self` を通じて
-インスタンス状態を操作するのが本来の目的であり、メソッド本体はメソッド
-呼び出し境界（function boundary）を形成する。したがってメソッド内で、
-（現在スコープにもメソッド本体内の外側スコープにも束縛が無い）名前へ
-代入した場合は、**たまたま同名のグローバル変数が存在してもそれを更新
-せず、メソッド本体内に新しいローカルとして定義される**。
-
-```myon
-myon.func pair() ret float, error { ret 1.0, myon.nil }
-
-myon.struct Bar {
-    v: int
-    myon.func render() ret void {
-        bar, err = pair()   // これはメソッドローカル。外側の bar には触れない
-        myon.print(bar)     // 1.0
-    }
-}
-
-bar = Bar(v=1)
-bar.render()
-bar.render()                // OK: グローバル bar は構造体のまま
-```
-
-これにより、使い捨てのローカル名がたまたまトップレベル変数と衝突しても、
-メソッドが意図せずグローバル状態を破壊してしまうことはない
-（`self.field = ...` によるフィールド更新は従来どおり有効）。
-
----
-
-## 10. 入出力
+## 10. 標準ライブラリ
 
 ### 10.1 標準入出力
 
-```myon
-name = myon.input("お名前は？")   // str型で受け取る
-myon.print("Hello Worlddd! ", x + "!")
-```
-
-`module myon.stdio` を宣言すると、以下の入出力用組み込み関数が利用できる。
-複数の引数を受け取る出力関数（`print` / `println` / `write` / `eprint`）は、
-各引数を文字列化して順に連結して書き出す（名前付き引数は不可）。
+出力関数は各引数を文字列化し、順に連結します。名前付き引数には対応しません。
+組み込み宣言 `module myon.stdio` を例で使用しますが、現実装は宣言を利用ゲートにしていません。
 
 | 関数 | シグネチャ | 説明 |
 |------|-----------|------|
-| `myon.print`   | `myon.print(...) ret void`   | stdout へ出力し、**末尾に改行を付ける**（従来どおり） |
+| `myon.print`   | `myon.print(...) ret void`   | stdout へ出力し、**末尾に改行を付ける** |
 | `myon.println` | `myon.println(...) ret void` | stdout へ出力し、末尾に改行を付ける（`print` の明示的な別名） |
-| `myon.write`   | `myon.write(...) ret void`   | stdout へ出力し、**改行を付けない**。`\r` による行の上書き（プログレスバー・スピナー）が可能になる |
+| `myon.write`   | `myon.write(...) ret void`   | stdout へ出力し、**改行を付けない** |
 | `myon.eprint`  | `myon.eprint(...) ret void`  | **stderr** へ出力し、末尾に改行を付ける。診断・進捗表示を stdout（パイプ加工対象）と分離する |
 | `myon.flush`   | `myon.flush() ret void`      | stdout のバッファを即座に書き出す。`myon.write` で1行を更新し続ける場合に有用 |
 | `myon.is_tty`  | `myon.is_tty() ret bool`     | stdout が対話端末（TTY）に接続されていれば `true`。パイプ・リダイレクト時に ANSI 制御文字を抑制する判断に使う |
 | `myon.input`   | `myon.input(prompt: str) ret str` | prompt を表示して stdin から1行読み込む |
 | `myon.argv`    | `myon.argv() ret myon.array(str)` | スクリプトへ渡されたコマンドライン引数（§10.1.1）を返す。常に配列（空配列もあり得る）を返し、`nil` は返さない |
 
-```myon
-module myon.stdio
+文字列リテラルの `\r` は現実装では制御文字へデコードされません。
+write 自体が改行を付けないことと、上書き表示のためのエスケープ処理は別です。
 
-// 改行なし出力＋明示フラッシュで、1行を上書きしながら進捗を表示する。
-myon.for i myon.in range(0, 101) {
-    pct = i
-    myon.if myon.is_tty() {
-        myon.write("\r進捗: " + str(pct) + "%")
-        myon.flush()
-    }
-}
-myon.println("")            // 最後に改行して行を確定
-myon.eprint("完了しました")   // ログは stderr へ
-```
+### 10.1.1 スクリプト引数
 
-### 10.1.1 コマンドライン引数
-
-`myon <script.myon> [args...]` のように、スクリプトパスの後ろに続くトークンは
-そのスクリプト自身の引数として扱われ、`myon.argv()` で読み取れる（先頭が `-`
-でもインタプリタのオプションとしては解釈されない）。明示的に `--` を置くと、
-それ以降のすべてのトークンをスクリプト引数として素通しする。
+スクリプトパスの後ろのトークンは、そのスクリプトの引数です。
+`--` は引数の開始を明示し、その区切り自体は argv に含めません。
 
 ```sh
-myon build.myon --release out.bin       # argv() => ["--release", "out.bin"]
-myon build.myon -- --help -v            # argv() => ["--help", "-v"]
+myon script.myon --output result.txt
+myon script.myon -- --help
 ```
 
-### 10.2 ファイルI/O
+### 10.2 ファイル入出力
 
-`module myon.stdio` を宣言すると、以下のファイル操作関数が利用できる。
-読み書きに失敗した場合（ファイル不在・権限不足など）は、`runtime_error` で
-プロセスを終了させるのではなく、6.2節のエラー処理方式（Rust/Go 風、`error(...)`）
-に従って第2戻り値として `error` 値を返す。呼び出し側は `myon.if err != myon.nil`
-でこれを捕捉できる。
+`module myon.file` を宣言できます。読み書き API は結果と error を返します。
+処理対象のパスは実行環境のファイルシステムに解決され、サンドボックスによる制限はありません。
 
 | 関数 | シグネチャ | 説明 |
 |------|-----------|------|
@@ -556,40 +401,22 @@ myon build.myon -- --help -v            # argv() => ["--help", "-v"]
 | `myon.file.exists` | `myon.file.exists(path: str) ret bool`                | 存在確認（エラーは返さない） |
 
 ```myon
-module myon.stdio
-
-path = "/tmp/greeting.txt"
-ok, werr = myon.file.write(path, "line1")
-myon.if werr != myon.nil then { myon.print("書き込み失敗") }
-
-aok, aerr = myon.file.append(path, "-line2")
-
-content, rerr = myon.file.read(path)
-myon.if rerr != myon.nil then {
-    myon.print("読み込み失敗")
-} myon.else {
-    myon.print(content)          // line1-line2
+module myon.file
+ok, err = myon.file.write("/tmp/myon-example.txt", "hello")
+myon.if err == myon.nil then {
+    content, read_err = myon.file.read("/tmp/myon-example.txt")
+    myon.print(content)
 }
-
-myon.print(myon.file.exists(path))                       // true
-myon.print(myon.file.exists("/tmp/does_not_exist.txt"))  // false
 ```
 
-- 成功時の第2戻り値（`error`）は `myon.nil` になる。
-- `NULL` パス等、明らかに未定義動作になりうる入力はガードする。
-  パストラバーサル対策など高度な安全性は本フェーズの対象外。
+Windows の `/tmp/` 接頭辞は実装内で TEMP/TMP のディレクトリへ変換します。
+一般の相対パスはプロセスの CWD に依存します。パッケージ探索の起点とは異なります。
 
----
+### 10.3 C FFI
 
-### 10.3 C FFI（外部共有ライブラリ呼び出し, Phase3）
-
-`module myon.ffi` を宣言すると、ビルド済みの共有ライブラリ
-（Linux: `.so` / macOS: `.dylib` / Windows: `.dll`）に含まれるC関数を
-実行時に読み込んで直接呼び出せる。内部的には `dlopen`/`dlsym`/`dlclose`
-相当の仕組みを使う（`libffi` などの外部依存は持たない）。
-
-失敗（ライブラリ不在・シンボル未検出・型不一致など）は 6.2 節の
-エラー処理方式に従い、第2戻り値として `error` 値を返す。
+`module myon.ffi` は共有ライブラリへの接続を扱います。
+POSIX は dlopen/dlsym/dlclose、Windows は LoadLibraryA/GetProcAddress/FreeLibrary を使います。
+ライブラリ名と配置は OS に依存します。libffi には依存しません。
 
 | 関数 | シグネチャ | 説明 |
 |------|-----------|------|
@@ -600,9 +427,7 @@ myon.print(myon.file.exists("/tmp/does_not_exist.txt"))  // false
 | `myon.ffi.call_p` | `myon.ffi.call_p(handle: int, name: str, sig: str, ...) ret int, error`   | ポインタを返すC関数を呼ぶ（戻り値は `int` として表現） |
 | `myon.ffi.call_v` | `myon.ffi.call_v(handle: int, name: str, sig: str, ...) ret bool, error`  | `void`（戻り値なし）のC関数を呼ぶ（成功時 `true`） |
 
-**シグネチャ文字列（`sig`）の記法**
-
-引数の型を1文字ずつ並べた文字列で指定する。
+引数型を1文字ずつ並べた sig を渡します。空 sig は引数なしです。
 
 | 文字 | 対応するC型 | Myon側の型 |
 |------|-------------|-----------|
@@ -610,109 +435,29 @@ myon.print(myon.file.exists("/tmp/does_not_exist.txt"))  // false
 | `d`  | `double`             | `float`（`int` も可、自動的に `double` へ変換） |
 | `p`  | `void*`（不透明ポインタ） | `int`（ポインタ値をそのまま整数として保持） |
 | `s`  | `const char*`        | `str` |
-| `b`  | `void*`（Myonが確保したメモリブロックを指す, **Phase3.1**） | `int`（`myon.ffi.alloc` が返すブロックID） |
+| `b`  | `void*`（Myon が確保したメモリブロックを指す） | `int`（`myon.ffi.alloc` が返すブロックID） |
 
-`'b'` と `'p'` の違い（Phase3.1）:
+引数は最大6個で、整数系 i/p/s/b の後ろに d を並べる形式に対応します。
+異なる並び順は受理されない場合があります。C の構造体の値渡し・値返しは未対応です。
+シグネチャ別ラッパーの一覧は `src/ffi_call.c` にあります。
 
-- `'p'` は「Cが返してきた生アドレス値をそのまま `int64` として受け渡すだけ」で、
-  Myon側はそのブロックの中身を一切関知しない。
-- `'b'` は「Myon側の `myon.ffi.alloc` で確保したブロックIDを渡すと、C呼び出しの
-  直前にFFI層がそのブロックの実際のメモリアドレスに変換してからC関数に渡す」。
-  これにより `sqlite3_open(path, &db)` のような「出力引数（ダブルポインタ）」に、
-  Myonが確保した書き込み可能な領域のアドレスを安全に渡せる。
-  `'b'` に `myon.ffi.alloc`（や `load`）が発行していない不正な値を渡した場合は
-  `error` を返す（クラッシュを防ぐガード）。
-- 引数の並び順の制約において、`'b'` は `'i'`/`'p'`/`'s'` と同じ「整数系」グループに
-  属する（`double` 引数より前に置く）。
-
-例: `"id"` は「`int` 引数を1つ、`double` 引数を1つ」の意味。
-戻り値の型は関数名で分ける（`call_i` / `call_d` / `call_p` / `call_v`）。
-引数は0〜6個までサポートする。`sig` が空文字列（`str("")`）の場合は
-引数0個（可変長引数を一切渡さない）を意味する。
-
-**対応する値の型と制約**
-
-- 対応する値の型は `int64` / `double` / `ptr` / `string` の4種類のみ。
-  構造体を値渡し・値返しする関数は本フェーズでは非対応。
-- ポインタを介した受け渡しはサポートするが、呼び出し先が構造体の中身を
-  書き込んで返す関数（例: `SDL_PollEvent(SDL_Event *event)`）は、その
-  構造体メモリをMyon側で `ptr` として確保できないため扱えない。
-  そのため本フェーズのFFIだけでは、ウィンドウを出して一定時間後に閉じる
-  程度のデモは組めるが、`SDL_PollEvent` を使う一般的なイベントループ形式の
-  GUIアプリは組めない。
-  （この制約は Phase3 時点のもの。Phase3.1 のメモリ確保／型付き読み出しと
-  Phase4.1 の型付き書き込み・構造体DSL、および Phase5.1 で追加した
-  `myon.ffi.read_i32` によって、確保済みブロックを `'b'` で渡し `SDL_Event`
-  のフィールドを読み戻す形で out 方向の構造体読み取りが可能になった。
-  詳細は後述の「(5) SDL_Event の読み取り（Phase5.1）」を参照。）
-- 引数の並びは「整数系（`i`/`p`/`s`）の引数がすべて先、`double`（`d`）の
-  引数がすべて後」の順序のみサポートする（x86-64 System V ABI の
-  レジスタ割り当てに対応。SDL2 の主要関数はこの並びに収まる）。
-  それ以外の並び順や7引数以上は `error` を返す。
-- **32bit幅のC引数への注意**: Myonの `int` は64bit だが、呼び出し先の
-  C関数の引数が `int` / `unsigned int` / `Uint32` のような32bit幅である
-  場合がある。呼ばれた側が下位32bitのみを参照するため、`0 〜 4294967295`
-  の範囲で値を渡す限り問題は起きない。この範囲を超える値や負の値を渡すと
-  C関数が意図しない値を受け取る可能性があるため、呼び出し側が正しい範囲の
-  値を渡す責任を持つ（本フェーズでは自動的な範囲チェックは行わない）。
-
-**対応プラットフォーム**
-
-Linux・macOS・\*BSD・Windows で本実装済み（実装は `src/ffi_platform.c`）。
-どのプラットフォームの実装を使うかは `src/platform.h` の機能マクロ
-（`MYON_HAVE_DLOPEN` など）で決まる。
-
-- **POSIX 系（Linux / macOS / \*BSD、`MYON_HAVE_DLOPEN`）**:
-  `dlopen`/`dlsym`/`dlclose` を用いて共有ライブラリを読み込む。
-  エラーメッセージは `dlerror()` の文字列をそのまま用いる。
-  （リンク時に `-ldl` が必要なのは Linux のみ。macOS / \*BSD では
-  これらの関数は libc に含まれる。）
-- **Windows**: `LoadLibraryA`/`GetProcAddress`/`FreeLibrary`（`kernel32`）を
-  用いて `.dll` を読み込む。読み込み失敗時のエラーメッセージは
-  `GetLastError()` + `FormatMessageA`（`FORMAT_MESSAGE_FROM_SYSTEM |
-  FORMAT_MESSAGE_IGNORE_INSERTS`）で人間可読な文字列へ変換される。
-  なお、拡張子（`.dll`）の自動補完は行わないため、呼び出し側が
-  `myon.ffi.load(str("xxx.dll"))` のようにパスを明示する
-  （Windows の DLL 検索順序については各自の配布形態に従うこと）。
-
-上記以外のプラットフォームでは `myon.ffi.load` が
-「FFI is not supported on this platform」という `error` を返すスタブになる
-（コンパイル自体はどの環境でも通る）。
-
-> **注意（ライブラリ名の可搬性）**：FFI 機構自体は可搬だが、
-> 渡す**ライブラリ名は可搬ではない**（Linux は `libm.so.6`、
-> macOS は `libm.dylib` / `libSystem.B.dylib`、Windows は `xxx.dll`）。
-> このため回帰テストでは、`.so` 名をハードコードしたケースを
-> Linux 以外ではスキップしている（`tests/run_tests.sh` の
-> `LINUX_ONLY_SO_CASES`）。移植性が必要なコードでは、
-> ライブラリ名を OS ごとに切り替えること。
+i は Myon 側の int64 を使います。呼び出し先が32ビット int を要求する場合も、
+ABI と符号・値域を利用者が確認してください。「下位32ビットに収まれば常に正しい」
+という規則ではありません。
 
 ```myon
 module myon.ffi
-
-handle, err = myon.ffi.load(str("libm.so.6"))
-myon.if err != myon.nil then { myon.print(str("load failed")) }
-
-// sqrt(16.0) -> 4.0
-result, cerr = myon.ffi.call_d(handle, str("sqrt"), str("d"), 16.0)
-myon.print(result)                                 // 4
-
-// pow(2.0, 10.0) -> 1024.0
-p, perr = myon.ffi.call_d(handle, str("pow"), str("dd"), 2.0, 10.0)
-myon.print(p)                                      // 1024
-
-ok, clerr = myon.ffi.close(handle)
+h, err = myon.ffi.load(str("libm.so.6"))
+myon.if err == myon.nil then {
+    result, call_err = myon.ffi.call_d(h, str("sqrt"), str("d"), 16.0)
+    myon.print(result)
+    myon.ffi.close(h)
+}
 ```
 
-- 一度 `close` したハンドルIDは再利用されない。閉じ済みハンドルへの
-  再アクセス（再 `close` や `call_*`）は `error` を返す。
+このライブラリ名は Linux の例です。close 後のハンドルは呼び出しに使えません。
 
-#### 10.3.1 メモリ確保・文字列・バイト列（Phase3.1）
-
-Phase3のFFIだけでは、(1) 文字列を返すC関数の中身を読めない、(2) 出力引数
-（ダブルポインタ）を取るC関数にNULLしか渡せずクラッシュする、(3) 長さ付きの
-任意バイト列を安全に受け渡せない、といった制約があった。Phase3.1では以下を
-追加してこれらに対応する。
+#### 10.3.1 管理メモリと生アドレス
 
 | 関数 | シグネチャ | 説明 |
 |------|-----------|------|
@@ -722,142 +467,26 @@ Phase3のFFIだけでは、(1) 文字列を返すC関数の中身を読めない
 | `myon.ffi.write_bytes` | `myon.ffi.write_bytes(block_id: int, offset: int, data: str) ret bool, error` | ブロック内の `offset` から `data` のバイト列を書き込む（成功時 `true`）。範囲外は `error` |
 | `myon.ffi.read_bytes`  | `myon.ffi.read_bytes(block_id: int, offset: int, len: int) ret str, error`    | ブロックの `[offset, offset+len)` を `str` として読み出す。範囲外は `error` |
 | `myon.ffi.read_i64`    | `myon.ffi.read_i64(block_id: int, offset: int) ret int, error`                | ブロックの `offset` から8バイトをリトルエンディアンの `int` として読み出す。範囲外は `error` |
-| `myon.ffi.read_i32`    | `myon.ffi.read_i32(block_id: int, offset: int) ret int, error`                | ブロックの `offset` から4バイトをリトルエンディアンの int32 として読み出し、符号拡張して `int` を返す（`read_i64` の4バイト版。Phase5.1で追加）。範囲外は `error` |
+| `myon.ffi.read_i32`    | `myon.ffi.read_i32(block_id: int, offset: int) ret int, error`                | ブロックの `offset` から4バイトをリトルエンディアンの int32 として読み出し、符号拡張して `int` を返す（符号拡張する）。範囲外は `error` |
 
-**ブロックIDと生アドレスは別の名前空間**
+alloc が返すブロックID、load のハンドルID、生アドレスは別の値です。
+シグネチャ b は管理ブロックのIDを実アドレスへ変換します。
+p と call_p の戻り値は生アドレスです。
 
-`myon.ffi.alloc` が返す「ブロックID」は、MyonのFFI層が内部で管理する番号で
-あり、Cから見た実際のメモリアドレスとは異なる（`myon.ffi.load` のハンドルIDと
-同じ考え方）。Myonスクリプト側に生ポインタは一切公開されない。C関数の引数として
-メモリのアドレスを渡したい場面では、sig文字に `'b'` を使うことで、FFI層が
-呼び出し直前にブロックID→実アドレスへ変換する。
+read_cstr は生アドレスを読みます。addr=0 は拒否しますが、それ以外のアドレスが
+有効かどうかを保証する機能はありません。読み出す最大量は1〜16,777,216バイトです。
+read_bytes/read_i64/read_i32 は管理ブロックのIDと範囲を検査します。
 
-一方、`call_p` の戻り値や `read_cstr` の第1引数 `addr` は「Cの生アドレス値」で
-あり、ブロックIDではない。
+str は NUL 終端です。write_bytes のデータ長は strlen によって決まり、
+read_bytes の結果も NUL 以降を通常の文字列操作で保持できません。
+任意バイト列には管理ブロックと型付きの読み書きを使用します。
 
-**`myon.ffi.read_cstr` の詳細**
+C の出力ポインタを受け取る例は `examples/ffi_sqlite_open.myon` です。
+ポインタの幅・エンディアン・寿命は呼び出す ABI に合わせる必要があります。
 
-- `max_len` で読み取る最大バイト数を制限する（暴走読み取り防止）。上限は
-  16MB（16777216）で、これを超える値や0以下の値を指定すると `error` を返す。
-- `addr` が `0`（NULL相当）の場合は `error` を返す（クラッシュしない）。
-- ただし `0` 以外の**不正な**アドレスを渡した場合はクラッシュしうる。
-  本フェーズでは signal handler 等による保護は行わない（呼び出し側が
-  `call_*` から得た正しいアドレスを渡す責任を持つ）。
+#### 10.3.2 型付きメモリ・レイアウト・コールバック
 
-```myon
-module myon.ffi
-
-handle, err = myon.ffi.load(str("libz.so.1"))
-
-# const char *zlibVersion(void) -> call_p で生アドレスを得る
-verptr, e1 = myon.ffi.call_p(handle, str("zlibVersion"), str(""))
-
-# 生アドレスを Myon の str にデリファレンス（最大64バイト）
-version_str, e2 = myon.ffi.read_cstr(verptr, 64)
-myon.print(version_str)                 # 例: "1.3.1"
-
-ok, clerr = myon.ffi.close(handle)
-```
-
-**`myon.ffi.write_bytes` / `myon.ffi.read_bytes` の詳細**
-
-`myon.ffi.alloc` で確保したブロックは「バイト列」の実体として扱える。バイト列は
-「ブロックID + 有効データ長」という組で表現し、有効データ長は呼び出し側が別途
-`int` で管理する。`write_bytes` / `read_bytes` は、ブロックIDを介してこの領域の
-任意のオフセットに読み書きする。範囲外アクセス（`offset+len` がブロックサイズを
-超える）になる場合は `error` を返す（メモリ破壊を防ぐガード）。
-
-> **既知の制約（str型のバイナリ安全性）**
-> MyonのstrはNUL終端の `char*` として表現され、明示的な長さフィールドを持たない。
-> そのため `write_bytes` は `data` の `strlen()` ぶんのバイトを書き込み、途中に
-> NULバイト（`0x00`）が含まれると、そこで途切れる。`read_bytes` の結果も同様に、
-> 読み出したバイト列にNULが含まれると、可視の文字列がそこで途切れる（ベスト
-> エフォート）。任意のバイナリ（NULを含むデータ）を厳密に扱う用途には、将来の
-> フェーズで専用のバイト列型を追加する余地を残している。
-
-```myon
-module myon.ffi
-
-handle, err = myon.ffi.load(str("libz.so.1"))
-
-# 16バイトのブロックを確保し、"hello"（5バイト）を書き込む
-buf, aerr = myon.ffi.alloc(16)
-w, we = myon.ffi.write_bytes(buf, 0, str("hello"))
-
-# uLong crc32(uLong crc, const Bytef *buf, uInt len)
-# sig "ibi": crc(int) + バッファ('b') + len(int)
-crc, ce = myon.ffi.call_i(handle, str("crc32"), str("ibi"), 0, buf, 5)
-myon.print(crc)                         # 907060870 (== zlib.crc32(b"hello"))
-
-freed, ferr = myon.ffi.free(buf)
-ok, clerr = myon.ffi.close(handle)
-```
-
-**出力引数（ダブルポインタ）の呼び出し例**
-
-`myon.ffi.alloc` で確保したブロックを sig `'b'` で渡すと、C関数がそのブロックに
-値を書き込む「出力引数」パターンを安全に扱える。書き込まれたポインタ値（8バイト）
-は `myon.ffi.read_i64` でリトルエンディアンの `int`（生アドレス値）として読み出し、
-続くC呼び出しに `'p'` で渡せる（x86-64のリトルエンディアンを前提とする）。
-
-```myon
-module myon.ffi
-
-handle, err = myon.ffi.load(str("libsqlite3.so.0"))
-# sqlite3 *db を受け取る8バイト領域（x86-64のポインタは8バイト）
-outblock, aerr = myon.ffi.alloc(8)
-
-# int sqlite3_open(const char *filename, sqlite3 **ppDb)
-# sig "sb": 文字列引数 + バッファ（ブロックID）引数
-rc, oerr = myon.ffi.call_i(handle, str("sqlite3_open"),
-                           str("sb"), str(":memory:"), outblock)
-# rc == 0 (SQLITE_OK) を期待。
-
-# 書き込まれた db ハンドル（sqlite3*）を生アドレス値として取り出す
-db_addr, re = myon.ffi.read_i64(outblock, 0)
-
-# int sqlite3_close(sqlite3 *db) — db_addr は生アドレスなので 'p' で渡す
-crc, cerr = myon.ffi.call_i(handle, str("sqlite3_close"), str("p"), db_addr)
-
-freed, ferr = myon.ffi.free(outblock)
-ok, clerr = myon.ffi.close(handle)
-```
-
-**Phase3.1の既知の制約（まとめ）**
-
-- `'b'` 以外の生アドレス（`'p'` や `call_p` の戻り値）を `read_cstr` /
-  `read_bytes` / `read_i64` の対象に使うこと自体は許容するが、`read_cstr` は
-  生アドレスを直接デリファレンスするため、不正なアドレスを渡すとクラッシュ
-  しうる（本フェーズでは signal handler 等による保護は行わない）。一方
-  `read_bytes` / `read_i64` はブロックID経由でのみ動作し、範囲チェックを
-  行うため安全である。
-- str型はバイナリセーフではない（上記「str型のバイナリ安全性」を参照）。
-- 出力引数を持つC関数（例: `sqlite3_open`）は、`'b'` で確保済みブロックの
-  アドレスを渡すことで安全に呼び出せる。書き込まれたポインタ値は
-  `read_i64` で取り出す。
-
-（`examples/ffi_zlib_version.myon`、`examples/ffi_sqlite_open.myon` に
-動作するサンプルがある。）
-
----
-
-#### 10.3.2 GUI/ゲーム制作向け FFI 拡張（Phase4.1）
-
-Phase3.1 までの「`int`/`double`/`ptr`/`string` の単純な値渡し ＋
-バイト列 `write_bytes`/`read_bytes`」だけでは、SDL/OpenGL のような
-GUI・ゲームライブラリを実用的に叩くには不足していた。Phase4.1 では
-次の4系統を追加する。いずれも C 側のヘッダは一切読まず、Myon 側が
-「このレイアウト・この型として扱う」と申告した内容をそのまま信じる
-（Phase3 以来の大方針を踏襲）。
-
-##### (1) 型付きメモリ書き込み（Step1）
-
-`write_bytes` は Myon の `str`（NUL終端）をコピーするため、`int` を
-エンコードした際にNULバイト（`0x00`）が混ざると途中で書き込みが
-切れてしまい、`SDL_Rect` のような「Myon側で値を組み立ててCへ渡す」
-構造体が作れなかった。型付き書き込みは値の生バイト列を
-リトルエンディアンで直接書き込むため、NULバイトを含む値でも欠落なく
-書ける。`read_i64`（Phase3.1）と対になる書き込み側 API である。
+##### 型付き書き込み
 
 | 関数 | シグネチャ | 説明 |
 | ---- | ---------- | ---- |
@@ -866,79 +495,24 @@ GUI・ゲームライブラリを実用的に叩くには不足していた。Ph
 | `myon.ffi.write_f64` | `myon.ffi.write_f64(block_id: int, offset: int, v: float) ret bool, error` | `offset` に `v` を8バイト IEEE754 double として書き込む |
 | `myon.ffi.write_f32` | `myon.ffi.write_f32(block_id: int, offset: int, v: float) ret bool, error` | `offset` に `v` を（double→float 変換後の）4バイト IEEE754 float として書き込む |
 
-範囲外オフセットや無効なブロックID、値の型不一致（`i` 系に `float`、
-`f` 系に `int` を渡す等）は `error` を返し、クラッシュしない。
+i32/i64 はリトルエンディアンで書きます。NUL を含む値でも型の幅を書き込みます。
+境界検査は管理ブロック内のアクセスに対する検査で、外部 C コードのアクセスを制限しません。
 
-```myon
-module myon.ffi
-module myon.stdio
-
-id, e = myon.ffi.alloc(16)
-myon.ffi.write_i32(id, 0, 100)     # 64 00 00 00
-myon.ffi.write_i32(id, 4, 200)     # C8 00 00 00
-v, ev = myon.ffi.read_i64(id, 0)   # 100 と 200 を結合した LE の値
-myon.print(v)                      # 858993459300
-myon.ffi.free(id)
-```
-
-##### (2) 構造体レイアウト DSL（Step2）
-
-フィールド名（インデックス）と型のリストから、各フィールドの
-オフセットと構造体全体のサイズを自動計算し、オフセットの手計算なしで
-構造体ブロックへ読み書きできる薄い DSL。
-
-- 対応フィールド型は `'i32'` / `'i64'` / `'f32'` / `'f64'` の4種のみ
-  （型付き書き込みでカバーされる型に対応）。
-- **アライメント**は一般的な C 構造体のデフォルト規則に従う。各
-  フィールドはそのサイズの自然境界（4バイト型→4境界、8バイト型→8境界）
-  に配置され、構造体全体のサイズは最大アライメント要求の倍数になるよう
-  末尾がパディングされる。`SDL_Rect`（`int` ×4）ではパディングは
-  発生しないが、`i32`/`i64` が混在する構造体では自動でパディングが入る。
-- 定義は FFI 層内部の「名前→レイアウト」テーブルに保持され、同名の
-  再定義は上書きされる。
+##### 構造体レイアウト
 
 | 関数 | シグネチャ | 説明 |
 | ---- | ---------- | ---- |
-| `myon.ffi.struct_def`   | `myon.ffi.struct_def(name: str, field_kinds: array of str) ret int, error` | `field_kinds`（例 `["i32","i32","i32","i32"]`）からレイアウトを定義し、合計サイズ（バイト数）を返す。不正な型文字列は `error` |
-| `myon.ffi.struct_alloc` | `myon.ffi.struct_alloc(name: str) ret int, error` | 定義済み構造体のサイズ分を確保し、ブロックIDを返す糖衣関数。未定義名は `error` |
+| `myon.ffi.struct_def`   | `myon.ffi.struct_def(name: str, field_kinds: array of str) ret int, error` | `field_kinds`（例 `["i32","i32","i32","i32"]`）からレイアウトを登録し、合計サイズ（バイト数）を返す。不正な型文字列は `error` |
+| `myon.ffi.struct_alloc` | `myon.ffi.struct_alloc(name: str) ret int, error` | 定義済み構造体のサイズ分を確保し、ブロックIDを返すラッパー。未定義名は `error` |
 | `myon.ffi.struct_write` | `myon.ffi.struct_write(block_id: int, name: str, field_index: int, v: int\|float) ret bool, error` | `field_index` 番目のフィールドへ、その型に応じて書き込む。値の型とフィールド型が矛盾すれば `error` |
 | `myon.ffi.struct_read`  | `myon.ffi.struct_read(block_id: int, name: str, field_index: int) ret int\|float, error` | 同フィールドを読み出す。戻り値のスカラー型（`int`/`float`）はフィールド型から実行時に決まる |
 
-> **`struct_read` の戻り値型についての設計判断**
-> 指示書では「戻り値型を実行時に決める案」と「`struct_read_i` /
-> `struct_read_f` に分ける案」のいずれでもよいとされていた。Myon の
-> タプル返却（`v, e = ...`）は内部的に型なしの配列（`make_result_pair`）
-> にパックして返すため、フィールド型に応じて `int` 値・`float` 値の
-> どちらを詰めても分割代入で自然にアンパックできる。関数を分けるより
-> API が素直になるので、**単一の `struct_read` が実行時にスカラー型を
-> 選ぶ設計**を採用した。
+対応する要素は i32/i64/f32/f64 です。4バイト型は4境界、8バイト型は8境界へ配置し、
+末尾を最大アライメントの倍数に揃えます。例えば i32/i64 はオフセット0/8、合計16バイトです。
+同名の定義は上書きします。struct_read のスカラー型は登録フィールドの型で決まります。
+C ヘッダ、packing 指定、実際の ABI と一致しているかは別途確認してください。
 
-```myon
-module myon.ffi
-module myon.stdio
-
-rf = myon.array(str)
-rf.push(str("i32")); rf.push(str("i32")); rf.push(str("i32")); rf.push(str("i32"))
-sz, e = myon.ffi.struct_def(str("SDL_Rect"), rf)   # 16
-
-r, er = myon.ffi.struct_alloc(str("SDL_Rect"))
-myon.ffi.struct_write(r, str("SDL_Rect"), 0, 50)   # x
-myon.ffi.struct_write(r, str("SDL_Rect"), 1, 60)   # y
-myon.ffi.struct_write(r, str("SDL_Rect"), 2, 200)  # w
-myon.ffi.struct_write(r, str("SDL_Rect"), 3, 100)  # h
-x, ex = myon.ffi.struct_read(r, str("SDL_Rect"), 0)
-myon.print(x)                                      # 50
-myon.ffi.free(r)
-```
-
-`i32`/`i64` 混在の例（`["i32","i64"]`）では、i32 がオフセット0、
-i64 が（8境界へアライメントされて）オフセット8、合計サイズ16 となる。
-
-##### (3) 配列一括読み書き（Step3）
-
-頂点バッファ・色配列のような同型の値の連続を、Myon の `array` から
-1回の呼び出しでブロックへ書き込む／読み出す。内部は単一値版の
-ループなので特別な最適化はしていない（正しさを優先）。
+##### 配列の読み書き
 
 | 関数 | シグネチャ |
 | ---- | ---------- |
@@ -951,83 +525,25 @@ i64 が（8境界へアライメントされて）オフセット8、合計サ�
 | `myon.ffi.read_array_f32`  | `(block_id: int, offset: int, count: int) ret array of float, error` |
 | `myon.ffi.read_array_f64`  | `(block_id: int, offset: int, count: int) ret array of float, error` |
 
-`i32`/`f32` は要素あたり4バイト、`i64`/`f64` は8バイトを消費する。
-`count`（または書き込む要素数）がブロックの範囲を超える場合は `error`。
+i32/f32 は1要素4バイト、i64/f64 は8バイトです。
+要素数とブロックのサイズを検査します。内部では単一値の読み書きを繰り返します。
 
-```myon
-module myon.ffi
-module myon.stdio
-
-id, e = myon.ffi.alloc(64)
-xs = myon.array(int)
-xs.push(1); xs.push(2); xs.push(3); xs.push(4)
-myon.ffi.write_array_i32(id, 0, xs)
-ri, eri = myon.ffi.read_array_i32(id, 0, 4)
-myon.print(ri)             # [1, 2, 3, 4]
-myon.ffi.free(id)
-```
-
-##### (4) コールバック関数ポインタ（限定版, Step4）
-
-`SDL_SetEventFilter` のように「C ライブラリがコールバック関数ポインタを
-受け取り後で呼び返す」パターンに、**限定的な形**で対応する。
-
-**スコープ（この範囲を超えない）:**
-
-- コールバックの引数は **最大4個**、型は **int64 または ptr（Cポインタ）
-  相当のみ**（Cの `long long (*)(long long, ...)` に類する固定シグネチャ。
-  `double` 引数のコールバックは非対応）。
-- コールバックの戻り値は **int64 のみ**（`void` を返したい場合は戻り値を
-  無視する運用でカバー）。
-- 同時に登録できるコールバックは **固定上限16個**。
-
-**実装方式:** libffi の closure 機構は使わない（依存を増やさないため）。
-C 側にあらかじめ「スロット番号 × 引数個数（0〜4）」ぶんの静的な
-トランポリン関数群を用意し、各トランポリンが自分のスロットに登録された
-Myon 関数値を `call_function()` で呼び返す。シングルスレッド前提のため
-スレッド安全性はスコープ外。コールバック内で `runtime_error` が起きても
-プロセスは落とさず、`stderr` にメッセージを出して戻り値0を返す。
+##### コールバック
 
 | 関数 | シグネチャ | 説明 |
 | ---- | ---------- | ---- |
 | `myon.ffi.make_callback` | `myon.ffi.make_callback(fn: func, arg_count: int) ret int, error` | Myon の関数値 `fn` をコールバックとして登録し、C から見た生の関数ポインタを `int`（アドレス値）で返す。この値はそのまま `'p'` 引数として `call_i`/`call_v` 等に渡せる。スロット枯渇や `arg_count` 範囲外（0〜4以外）は `error` |
 | `myon.ffi.free_callback` | `myon.ffi.free_callback(ptr: int) ret bool, error` | 登録済みコールバックを解放しスロットを再利用可能にする |
 
-```myon
-module myon.ffi
-module myon.stdio
+最大4引数、整数/ポインタ系、int64戻り値、同時16スロットのコールバックに対応します。
+double 引数や外部スレッドからの呼び出しには対応しません。
+静的トランポリンからツリーウォークの関数を呼び、関数内の実行時エラーは診断を表示して0を返します。
+C 側が参照している間は free_callback しないでください。MVM 関数値はこの境界に渡せません。
 
-printer = myon.lambda(x: int) ret int { myon.print(x) ret 0 }
-h, e = myon.ffi.load(str("libfoo.so"))
-cbp, ec = myon.ffi.make_callback(printer, 1)
-# void call_twice(long long (*cb)(long long), long long x) { cb(x); cb(x+1); }
-myon.ffi.call_v(h, str("call_twice"), str("pi"), cbp, 10)   # printer が 10, 11 で2回呼ばれる
-myon.ffi.free_callback(cbp)
-myon.ffi.close(h)
-```
+##### SDL の例
 
-##### (5) SDL_Event の読み取り（out 方向構造体読み取り, Phase5.1）
-
-ゲーム制作に必須の入力取得（キーボード・マウス・ウィンドウクローズ）は、
-`int SDL_PollEvent(SDL_Event *event)` のように「C 関数が構造体メモリへ
-書き込んで返す（out 引数）」パターンに依存する。Phase5.1 で追加した
-`myon.ffi.read_i32`（+ Phase3.1 の `alloc` / `'b'` 引数）を組み合わせることで、
-確保済みブロックを `SDL_Event*` として渡し、書き戻されたフィールドを
-Myon 側で読み取れるようになった。
-
-**基本的な流れ:**
-
-1. `SDL_Event` ぶんのブロックを `myon.ffi.alloc` で確保する。`SDL_Event` は
-   C の共用体（union）で、そのサイズは含まれる最大メンバのサイズになる。
-   SDL2 では伝統的に 56 バイト前後だが、**バージョンやビルドオプションで
-   変わりうる**ため、Myon 側は C ヘッダを読まない前提で「安全に大きめ」
-   （例: 128 バイト）を確保しておくのが実践的な妥協策。
-2. ブロックを `'b'` 引数として `SDL_PollEvent` に渡す（`call_i`, sig `"b"`）。
-   戻り値は「イベントがあったか」を表す 0/1 の `int`。
-3. 書き戻された `SDL_Event` の先頭 4 バイト（`Uint32 type`）を
-   `myon.ffi.read_i32(block, 0)` で読み、イベント種別を判定する。
-
-**主要なイベント種別の定数**（SDL2 `SDL_events.h`。値は固定）:
+`examples/ffi_sdl_event_loop.myon` は alloc したブロックを SDL_PollEvent の out 引数へ
+渡し、read_i32 でフィールドを取得します。以前の文書で示した定数は次のとおりです。
 
 | 定数 | 値 | 意味 |
 | ---- | -- | ---- |
@@ -1038,9 +554,6 @@ Myon 側で読み取れるようになった。
 | `SDL_MOUSEBUTTONDOWN` | `1025` (`0x401`) | マウスボタン押下 |
 | `SDL_MOUSEBUTTONUP` | `1026` (`0x402`) | マウスボタン解放 |
 
-**`SDL_KeyboardEvent` の主なオフセット**（SDL2, x86-64 の一般的なレイアウト。
-すべて `read_i32` で 4 バイト読み出す）:
-
 | offset | フィールド | 説明 |
 | ------ | ---------- | ---- |
 | 0  | `Uint32 type` | イベント種別（上表の定数） |
@@ -1050,114 +563,27 @@ Myon 側で読み取れるようになった。
 | 16 | `SDL_Scancode scancode` | 物理キー位置を表すスキャンコード |
 | 20 | `SDL_Keycode sym` | 論理キーコード（多くのキーで ASCII 近似。例: `SDLK_a` = 97） |
 
-```myon
-module myon.ffi
-module myon.stdio
+オフセットの表は SDL2 / x86-64 の例で、実際のレイアウトを検査する代わりにはなりません。
+サイズは使用する SDL のヘッダとビルド条件で確認してください。大きめのバッファを確保する
+だけでは、レイアウトの一致や外部関数のアクセス境界は確認できません。
 
-SDL_QUIT    = 256
-SDL_KEYDOWN = 768
+SDL_mixer のオーディオ例は `examples/ffi_sdl_audio.myon` にあります。
+SDL_Init、Mix_OpenAudio、Mix_LoadWAV_RW/Mix_LoadMUS、再生、解放、終了の順に
+資源を管理します。音源と SDL2/SDL_mixer の共有ライブラリが必要です。
 
-handle, err = myon.ffi.load(str("libSDL2-2.0.so.0"))
-# SDL_Init(SDL_INIT_VIDEO) など（省略。examples/ffi_sdl_event_loop.myon 参照）
+### 10.4 数学と文字列
 
-# SDL_Event ぶんのバッファ（安全のため 128 バイト確保）
-event_block, aerr = myon.ffi.alloc(128)
+#### 数値関数の戻り値型
 
-running = true
-myon.while running {
-    # int SDL_PollEvent(SDL_Event *event) — sig "b" で確保済みブロックを渡す
-    has_event, perr = myon.ffi.call_i(handle, str("SDL_PollEvent"),
-                                      str("b"), event_block)
-    myon.if has_event != 0 then {
-        ev_type, terr = myon.ffi.read_i32(event_block, 0)   # 先頭4バイト = type
-        myon.if ev_type == SDL_QUIT then {
-            running = false
-        } myon.elif ev_type == SDL_KEYDOWN then {
-            sym, serr = myon.ffi.read_i32(event_block, 20)  # 論理キーコード
-            myon.print(sym)
-        }
-    }
-    myon.ffi.call_v(handle, str("SDL_Delay"), str("i"), 16)
-}
+abs/max/min/clamp/mod は入力の型に応じて int/float を使います。
+floor/ceil/round/trunc/sign は int、sqrt/pow/三角関数/対数は float を返します。
+戻り値型は「float入力があれば必ずfloat」という単一の規則ではありません。
 
-myon.ffi.free(event_block)
-```
+最小 int の符号反転・abs、表現不能な gcd は実行時エラーです。
+intへの変換や丸め結果の変換は、有限性と int64 範囲を確認します。
+lcm/pow_int は範囲外を error 戻り値で報告します。
 
-**既知の制約:**
-
-- `SDL_Event` の正確なレイアウト・サイズは **SDL2 のバージョンやビルド
-  オプションによって変わりうる**。ここに示すオフセットは一般的な x86-64
-  ビルドに基づく目安であり、環境によってはずれる可能性がある。ブロックを
-  大きめに確保し、まず `type`（offset 0）が期待値になることを確認してから
-  他フィールドを解釈すること。
-- 全イベント種別（ゲームパッド、タッチ、テキスト入力等）のレイアウトを
-  網羅しているわけではない。実用上必要となる `SDL_QUIT` /
-  `SDL_KeyboardEvent`（およびマウス系）の読み取りを主眼とする。
-- リトルエンディアン（x86-64 ネイティブ）を前提とする。
-
-（動作するサンプルは `examples/ffi_sdl_event_loop.myon`。実際の入力操作が
-ある `examples/snake5.myon` も同じパターンでイベントを読んでいる。）
-
-##### (6) SDL_mixer によるオーディオ再生（Phase5.1）
-
-効果音・BGM 再生は、専用のオーディオ・モジュールを新設せず、FFI 経由で
-SDL_mixer（`libSDL2_mixer`）を叩くことで実現する。`libSDL2-2.0.so.0` と
-`libSDL2_mixer-2.0.so.0` の 2 つを `myon.ffi.load` で読み込み、以下の流れで
-再生する:
-
-1. `SDL_Init(SDL_INIT_AUDIO)` でオーディオサブシステムを初期化する
-   （`SDL_INIT_AUDIO = 0x10 = 16`）。
-2. `int Mix_OpenAudio(int frequency, Uint16 format, int channels,
-   int chunksize)` でミキサーを開く。一般的な設定値は
-   `frequency=44100`、`format=MIX_DEFAULT_FORMAT`（`0x8010 = 32784`、
-   リトルエンディアンでは `AUDIO_S16SYS` に相当）、`channels=2`、
-   `chunksize=2048`。成功時 `0` を返す。sig は `"iiii"`。
-3. `Mix_Chunk *Mix_LoadWAV(const char *file)` で WAV を読み込む（sig `"s"`、
-   戻り値はポインタ handle なので `call_p`。失敗時は `0`/NULL）。
-4. `int Mix_PlayChannel(int channel, Mix_Chunk *chunk, int loops)` で再生する
-   （`channel=-1` は空きチャンネル、`loops=0` は 1 回再生。sig `"ipi"`）。
-5. 後片付け: `Mix_FreeChunk(chunk)` → `Mix_CloseAudio()` → `SDL_Quit()` →
-   `myon.ffi.close`。
-
-**既知の制約:**
-
-- `Mix_OpenAudio` は**利用可能なオーディオデバイスが無い環境（CI コンテナ、
-  ヘッドレスサーバ等）では失敗する**（負値/非0を返す）。サンプルはこの失敗を
-  検知して、クラッシュせずにエラーメッセージを表示して終了する作りにすること。
-- `MIX_DEFAULT_FORMAT` の値は SDL_mixer のビルド（エンディアン）に依存する。
-  上記 `0x8010` は一般的なリトルエンディアン x86-64 ビルドの値。
-
-（動作するサンプルは `examples/ffi_sdl_audio.myon`。テスト用の小さな WAV
-`examples/beep.wav` を同梱している。オーディオデバイスの無い環境では
-`Mix_OpenAudio` の失敗を確認するに留まる。）
-
----
-
-### 10.4 標準ライブラリ myon.math / myon.string（Phase3.5）
-
-Step16で最小実装された `myon.math` / `myon.string` を、Phase3.5で実用的な
-ラインナップに拡張・修正した。ここで確定した関数シグネチャが正式な仕様である
-（14.4節・15章の「未確定」記述はこれをもって解消する）。
-
-#### 数値の型保持ルール
-
-`myon.math` の関数は、C言語などと同様の暗黙昇格ルールに従う。
-
-- **全ての数値引数が `int` 型であれば結果も `int` 型**（数学的に整数を
-  返しうる関数に限る）。
-- **1つでも `float` が含まれていれば結果は `float` 型**。
-
-「整数のままで意味が保たれる」関数（`abs` / `max` / `min` / `floor` /
-`ceil` / `round` / `trunc` / `mod` / `sign` / `clamp`）は `int` 入力で
-`int` を返し、`double` を経由しない。これにより `2^53` を超える `int64`
-値でも丸め誤差なく正確に扱える。一方 `sqrt` / `pow` / 三角関数 / 対数などは
-数学的に非整数を返しうるため、`int` 入力でも常に `float` を返す。
-
-int の最小値の符号反転・`abs`、および int で表現不能な `gcd` の非負の結果は、
-通常の整数オーバーフローとして実行時エラーにする。`floor` / `ceil` / `round` /
-`trunc` の結果が NaN/Infinity または int64 範囲外なら、整数変換前に実行時エラーにする。
-
-#### myon.math 関数一覧
+#### myon.math
 
 | 関数 | シグネチャ | 説明 |
 |------|-----------|------|
@@ -1186,38 +612,12 @@ int の最小値の符号反転・`abs`、および int で表現不能な `gcd`
 | `pi` | `() ret float` | 円周率 π |
 | `e` | `() ret float` | ネイピア数 e |
 
-`mod` はゼロ除算をスクリプト側でハンドリングできるよう、他の `myon.math`
-関数と異なり `(value, error)` の2値返却にしている。
+#### myon.string
 
-`gcd`（Phase4）は常に成功する単値返却だが、`lcm` / `pow_int`（Phase4）は
-オーバーフロー・負指数を `error` として返すため `(value, error)` の
-2値返却になる。`pow_int` は `pow` と異なり **double を経由しない** ため、
-`2^62`（`4611686018427387904`）のような大きな指数の整数冪も桁落ちなく
-正確に計算できる。
-
-```myon
-myon.print(myon.math.gcd(12, 18))                   // 6
-myon.print(myon.math.gcd(-12, 18))                  // 6（絶対値扱い）
-l, lerr = myon.math.lcm(4, 6)                        // 12
-p, perr = myon.math.pow_int(2, 62)                   // 4611686018427387904
-n, nerr = myon.math.pow_int(2, -1)                   // nerr != myon.nil（負指数）
-o, oerr = myon.math.pow_int(2, 63)                   // oerr != myon.nil（int64オーバーフロー）
-```
-
-```myon
-myon.print(myon.math.max(9223372036854775807, 1))  // 9223372036854775807（誤差なし）
-myon.print(myon.math.floor(3.7))                    // 3
-q, err = myon.math.mod(7, 0)                         // err != myon.nil（ゼロ除算）
-myon.print(myon.math.clamp(15, 0, 10))              // 10
-```
-
-#### myon.string 関数一覧
-
-`length` は **バイト数**（`strlen`相当、既存動作のまま）を返す。
-Unicodeコードポイント数（文字数）が必要な場合は `length_chars` を使う。
-`substring` / `index_of` / `split`（空区切り）
-などのインデックス系関数は全て **文字数ベース** であり、バイトオフセット
-ではない（日本語などのマルチバイト文字でも安全）。
+length はバイト数、length_chars は Unicode コードポイント数です。
+substring/index_of と空区切り split はコードポイント単位で動きます。
+結合文字や絵文字列の書記素クラスタ単位ではありません。
+upper/lower は Unicode ケースマッピングを実装していません。
 
 | 関数 | シグネチャ | 説明 |
 |------|-----------|------|
@@ -1238,169 +638,59 @@ Unicodeコードポイント数（文字数）が必要な場合は `length_char
 | `to_int` | `(s: str) ret int, error` | 整数へパース（`strtoll`）。失敗時は`error` |
 | `to_float` | `(s: str) ret float, error` | 浮動小数点数へパース（`strtod`）。失敗時は`error` |
 | `from_int` | `(n: int) ret str` | 整数を文字列化 |
-| `from_float` | `(f: float) ret str` | 浮動小数点数を文字列化（**最短往復表現**、下記参照） |
+| `from_float` | `(f: float) ret str` | 浮動小数点数を文字列化（15〜17桁から往復を確認して選択。下記参照） |
 
 ```myon
-myon.print(myon.string.length_chars(str("あ")))  // 1（文字数）
-myon.print(myon.string.length(str("あ")))         // 3（バイト数）
-sub, err = myon.string.substring(str("こんにちは"), 1, 3)  // "んにち"（文字数ベース）
-myon.print(myon.string.index_of(str("こんにちは"), str("にち")))  // 2（文字数ベース）
-parts = myon.string.split(str("a,b,c"), str(","))          // ["a", "b", "c"]
-myon.print(myon.string.join(parts, str(",")))              // "a,b,c"
+myon.print(myon.string.length("あ"))
+myon.print(myon.string.length_chars("あ"))
+part, err = myon.string.substring("こんにちは", 1, 3)
+myon.print(part)
 ```
 
-#### float の文字列化仕様（最短往復表現）
+#### float の表示
 
-`myon.print(float)`・`str(float)`・`myon.string.from_float` による `float`
-（IEEE 754 倍精度 `double`）の文字列化は、**その値へ正確に復元できる最短の
-10進表現**（shortest round-trip representation）を用いる。具体的には
-`%.15g` → `%.16g` → `%.17g` の順に試し、`strtod` で元の `double` に戻る最初の
-桁数を採用する。これにより **表示 → 再パース（`myon.string.to_float`）の往復で
-同じ値が得られる**ことが保証される。
+float の文字列化は %.15g、%.16g、%.17g の順に試し、strtod で元の値に戻る最初の
+桁数を採用します。これは実装が用いる15〜17桁の選択手順です。
+すべての形式を探索して文字数の最短性を証明するアルゴリズムという意味ではありません。
 
-- 小数点も指数も含まない有限値には末尾に `.0` を付け、`int` の文字列化と
-  区別できるようにする（例: `1024.0`, `123456789.0`）。
-- 特別な値は `nan` / `inf` / `-inf` と表記する。
+小数点も指数もない有限値には `.0` を付けます。特別な値は nan/inf/-inf と表示します。
+value_to_cstr を共有する両エンジンに適用されます。検査例は p_float_roundtrip です。
 
-```myon
-myon.print(3.141592653589793)   // 3.141592653589793（%g の 6 桁丸めではない）
-myon.print(1024.0)              // 1024.0（.0 付き）
-s = myon.string.from_float(3.141592653589793)
-v, e = myon.string.to_float(s)
-myon.print(v == 3.141592653589793)   // true（往復一致）
-```
+### 10.5 時刻
 
-> この挙動はツリーウォーク実行と MVM 実行のどちらでも共通（両経路が同じ
-> `value_to_cstr()` を通る）。往復性の回帰テストは
-> `tests/cases/p_float_roundtrip` にある。
-
-### 10.5 myon.time（Phase4）
-
-現在時刻の取得とスリープのための最小限のモジュール。エポック時刻は
-UNIXエポック（1970-01-01 UTC）からの経過時間で、いずれも `int`（int64）で
-返す。
+now/now_ms は UNIX エポックからの秒/ミリ秒を int で返します。
+壁時計時刻なので、経過時間測定に単調増加を仮定しないでください。
 
 | 関数 | シグネチャ | 説明 |
 |------|-----------|------|
 | `now` | `() ret int` | 現在時刻（UNIXエポック秒）。C標準の`time(NULL)`相当 |
 | `now_ms` | `() ret int` | 現在時刻（UNIXエポックミリ秒）。`clock_gettime(CLOCK_REALTIME)`相当 |
 | `sleep_ms` | `(ms: int) ret void` | msミリ秒スリープ（`nanosleep`）。`ms<=0`は何もせず即座に返す |
-| `frame_start` | `() ret int` | フレーム開始時刻を記録する（Phase5.1）。実装は`now_ms()`と同じで、意味を明確にするための糖衣関数 |
-| `frame_wait` | `(frame_start_ms: int, target_fps: int) ret int` | ゲームループ用のFPS制御（Phase5.1）。`frame_start`で記録した時刻から現在までの経過時間を求め、`1000/target_fps`ミリ秒に満たない分だけスリープする。戻り値は実際に経過した時間（スリープ込みのdt、ミリ秒）。`target_fps<=0`はスリープせず経過時間だけを返す（FPS制限なし） |
+| `frame_start` | `() ret int` | フレーム開始時刻を記録する。実装は`now_ms()`と同じで、意味を明確にするためのラッパー |
+| `frame_wait` | `(frame_start_ms: int, target_fps: int) ret int` | ゲームループ用のFPS制御。`frame_start`で記録した時刻から現在までの経過時間を求め、`1000/target_fps`ミリ秒に満たない分だけスリープする。戻り値は実際に経過した時間（スリープ込みのdt、ミリ秒）。`target_fps<=0`はスリープせず経過時間だけを返す（FPS制限なし） |
 
-`now_ms()` は `now() * 1000` とほぼ一致する（同一時刻の呼び出しなら
-数ミリ秒程度の差）。POSIX環境（Linux/macOS）を前提とする。
+frame_wait は目標1フレーム長 `1000/target_fps` に満たない残り時間だけ待ちます。
+OS のスケジューリングにより実際の間隔は変動します。
+コルーチン内の sleep はイベントループへ制御を返し、それ以外ではブロックします。
 
-```myon
-module myon.time
-
-t1 = myon.time.now()
-myon.time.sleep_ms(1100)
-t2 = myon.time.now()
-myon.print(t2 - t1 >= 1)     // true（1秒以上経過）
-
-myon.print(myon.time.now() > 0)      // true
-myon.print(myon.time.now_ms() > 0)   // true
-```
-
-#### ゲームループヘルパー（Phase5.1）
-
-`frame_start` / `frame_wait` は、毎フレームの経過時間（dt）計算と目標FPS
-維持のためのスリープという定型処理を提供する。ゲームループの車輪の
-再発明を避けるための薄いヘルパーである。`frame_wait` は `sleep_ms` と
-同じスリープ経路を使うため、コルーチン内（`myon.async`/`myon.await`）で
-呼び出した場合はプロセス全体をブロックせずイベントループに制御を譲る。
-
-```myon
-module myon.time
-module myon.stdio
-
-myon.while true {
-    t0 = myon.time.frame_start()
-    // ここでゲームの更新・描画処理
-    dt = myon.time.frame_wait(t0, 60)  // 60FPSを目標
-    // dt（ミリ秒）を物理演算等の時間ベース計算に使ってもよい
-}
-```
-
-`target_fps` に `10` を指定すると、1フレームの目標時間は `1000/10 = 100`
-ミリ秒となり、更新・描画処理が100msより短く終わった場合はその差分だけ
-スリープして、ループの反復間隔がおおよそ100msに揃う。厳密なリアルタイム性は
-OSのスケジューラに依存するため、多少の誤差は許容される。
-
-### 10.6 myon.random（Phase4）
-
-乱数生成のためのモジュール。用途に応じて **2 系統** の関数を持つ。
+### 10.6 乱数
 
 | 関数 | シグネチャ | 説明 |
 |------|-----------|------|
 | `seed` | `(n: int) ret void` | 乱数生成器を`srand((unsigned)n)`で初期化する |
 | `int` | `(lo: int, hi: int) ret int, error` | lo以上hi以下（両端含む）の一様乱数。`lo>hi`は`error` |
 | `float` | `() ret float` | 0.0以上1.0未満の一様乱数 |
-| `secure_int` | `(lo: int, hi: int) ret int, error` | **暗号学的に安全**な lo以上hi以下（両端含む）の乱数。OS の CSPRNG を使用。`lo>hi` は `error` |
+| `secure_int` | `(lo: int, hi: int) ret int, error` | OS の CSPRNG を使った lo以上hi以下（両端含む）の乱数。`lo>hi` は `error` |
 
-#### 高速・再現可能な系統（`seed` / `int` / `float`）
+seed/int/float は C の srand/rand を使います。seed の省略時は初回に時刻で初期化します。
+同じ実装の同じ seed は再現用に使えますが、OS・Cライブラリをまたいだ同一列は規定しません。
+広い範囲の int は分布に偏りが生じる場合があり、暗号用途向けの系統ではありません。
 
-C標準の `srand` / `rand` を薄くラップしたもので、**暗号学的に安全ではない**。
-シミュレーションやゲームなど、再現性・速度が重要で秘密性が不要な用途に使う。
-トークン・鍵・パスワード・nonce などのセキュリティ用途には使わず、
-後述の `secure_int` を使うこと。
+secure_int は OS の乱数源と棄却サンプリングを使い、seed に依存しません。
+macOS/BSD の arc4random_buf、対応する POSIX の /dev/urandom を使用します。
+乱数源が利用できない環境では error を返し、rand へ切り替えません。
 
-`seed()` を一度も呼ばずに `int()` / `float()` を呼んだ場合、初回のみ
-`srand((unsigned)time(NULL))` 相当の自動初期化を行う（毎回シードし直すと
-短時間の連続呼び出しで同じ値が返るため、初回だけ初期化する）。同じ値で
-`seed()` すれば同じ乱数列が再現される（`srand`+`rand`の決定的性質に依存）。
-
-`rand()` は `RAND_MAX` までの範囲しか返さないため、`hi-lo` が `RAND_MAX` を
-超える広い範囲では分布に偏りが生じうる（この系統では均一性は要求しない）。
-
-#### 暗号学的に安全な系統（`secure_int`）
-
-`secure_int` は OS の CSPRNG から直接バイト列を取得する。
-`seed()` の影響を受けず、シードによる再現もできない（意図的な仕様）。
-
-- **macOS / \*BSD**（`MYON_HAVE_ARC4RANDOM`）: `arc4random_buf()`
-- **Linux ほかの POSIX**（`MYON_HAVE_DEV_URANDOM`）: `/dev/urandom` から読み出し
-- **上記以外**: 弱い値を返さず
-  `myon.random.secure_int: OS CSPRNG unavailable` という `error` を返す
-
-分布は**剰余バイアスを排除**してある（上位の余り分を捨てる棄却サンプリング）
-ため、`[lo, hi]` の各値は等確率で出現する。
-
-```myon
-module myon.random
-
-myon.random.seed(42)
-v, err = myon.random.int(1, 6)       // 1〜6のいずれか（再現可能・非セキュア）
-myon.print(v >= 1)                    // true
-
-f = myon.random.float()              // 0.0 <= f < 1.0
-myon.print(f >= 0.0)                  // true
-
-bad, berr = myon.random.int(5, 1)    // berr != myon.nil（lo > hi）
-
-// セキュリティ用途はこちら（OS CSPRNG・バイアスなし）
-s, serr = myon.random.secure_int(1, 6)
-myon.print(s >= 1)                    // true
-```
-
----
-
-### 10.7 ネットワーク myon.net（Phase5）
-
-IPv4 の TCP / UDP ソケットを直接扱うための低水準モジュール。POSIX
-ソケットAPI（`socket`/`bind`/`listen`/`accept`/`connect`/`send`/`recv`/
-`sendto`/`recvfrom`）の薄いラッパである。**POSIX 系（Linux / macOS / \*BSD）と
-Windows で本実装済み**で、それ以外のプラットフォームでは全関数が即座に
-`error` を返す（後述）。どちらの実装を使うかは `src/platform.h` の
-`MYON_HAVE_POSIX_SOCKETS` で切り替わる。Windows では同等のソケット機能を
-**Winsock2**（`ws2_32`）で提供する（下記「Windows 実装（Winsock2）」を参照）。
-
-ソケットは整数の**ソケットID**で識別する。IDは内部テーブル（最大256個）の
-インデックスであり、生のfdではない。全関数は非ブロッキングfdで動作し、
-イベントループ上のコルーチン内から呼ばれた場合は自動的に協調的な待機
-（イベントループへの譲渡）に切り替わる。トップレベル（コルーチン外）から
-呼ばれた場合は単一fdの `select()` による同期待機にフォールバックする。
+### 10.7 IPv4 ソケット
 
 | 関数 | シグネチャ | 説明 |
 |------|-----------|------|
@@ -1417,117 +707,21 @@ Windows で本実装済み**で、それ以外のプラットフォームでは�
 | `recv_from` | `(id: int, maxlen: int) ret str, str, error` | UDP受信。**3値タプル** `(data, "host:port", error)` |
 | `close` | `(id: int) ret bool, error` | ソケットを閉じる（常に成功扱い） |
 
-**エラー方針**：整数を返す関数（`tcp_socket`/`local_port`/`send` など）は
-失敗時に `-1` と `error` を、`bool` を返す関数（`bind`/`listen`/`connect`）は
-`false` と `error` を返す。`recv_from` のみ受信データ・送信元・エラーの
-3値を返し、失敗時は空文字列2つと `error` を返す。
+整数結果の失敗は -1 と error、真偽値の失敗は false と error を返す規約です。
+recv_from はデータ・送信元・error の3値です。str で扱うデータには NUL 終端の制約があります。
 
-**非ブロッキング挙動**：内部的に would-block（`EAGAIN`/`EWOULDBLOCK`）は
-`-2` として扱い、`recv`/`accept` は読み取り可能まで、`send`/`connect` は
-書き込み可能まで、それぞれイベントループに譲渡して待機する。この待機は
-`myon.async`/`myon.await` と組み合わせて複数接続を並行処理するための土台と
-なる（→ 14.9）。
+ノンブロッキング I/O の待ちは、コルーチン内ではイベントループへ制御を返します。
+外側では同期の待機処理を使用します。ホスト名は getaddrinfo で IPv4 に解決し、
+最初の候補を使います。IPv6 と複数アドレスの順次接続は未対応です。
 
-**DNS名前解決（Phase5.1）**：`connect`/`bind`/`send_to` の `host` 引数には、
-IPv4アドレスの直打ち（例 `"127.0.0.1"`）に加えて**ホスト名**（例
-`"example.com"` や `"localhost"`）も指定できる。内部的には、まず
-`inet_pton()` でIPv4リテラルとして解釈を試み（高速パス）、解釈できない場合に
-`getaddrinfo()` でDNS名前解決を行う（`AF_INET` に限定、ソケット種別に応じた
-`SOCK_STREAM`/`SOCK_DGRAM` をヒントに指定）。複数の候補が返った場合は最初の
-1つを使う（ラウンドロビン/フォールバックは未対応）。解決に失敗した場合は
-`cannot resolve host '<name>': <理由>` の形の error を返す（理由の文字列は
-プラットフォーム依存：Linux は `gai_strerror`、Windows は `WSAGetLastError`
-を `FormatMessageA` で整形したもの）。
+POSIX はソケット API、Windows は Winsock2 を使用します。
+公開 fd 型は intptr_t 相当の myon_fd_t で、Windows の SOCKET 幅を保持します。
+Windows の初期化・終了、エラー番号、closesocket 等の差は net.c で扱います。
 
-**Windows 実装（Winsock2）**：Windows では同じ関数群を Winsock2 で実装する。
-POSIX 版との主な差異は以下の通り（挙動・戻り値の規約は Linux と同一）。
+### 10.8 HTTP と HTTPS
 
-- **初期化/終了**：`net_state_create()` の初回呼び出しで
-  `WSAStartup(MAKEWORD(2,2), ...)` を、最後の `net_state_destroy()` で
-  `WSACleanup()` を呼ぶ。Winsock 自体が参照カウント式であることに加え、
-  net.c 側でも初期化カウンタを持ち、多重初期化・早すぎる解放を防ぐ。
-- **ソケット型**：ソケットは `int` ではなく `SOCKET`（`UINT_PTR`）で保持し、
-  無効値は `-1` ではなく `INVALID_SOCKET`、失敗の戻り値は `SOCKET_ERROR`。
-  Windows 版の `NetState` は `SOCKET socks[]` を持つ別定義（`net.h` の
-  opaque 宣言により問題なし）。
-- **非ブロッキング設定**：`fcntl(O_NONBLOCK)` の代わりに
-  `ioctlsocket(s, FIONBIO, &mode)`（`mode=1`）を使う。
-- **クローズ**：`close()` の代わりに `closesocket()`。
-- **would-block 判定**：`EAGAIN`/`EWOULDBLOCK` の代わりに `WSAEWOULDBLOCK`
-  を、非ブロッキング接続の進行中は `WSAEALREADY`/`WSAEINVAL` も `-2`（進行中）
-  として扱う。接続完了検査は `getsockopt(SO_ERROR)` を用いる。
-- **送受信長**：Winsock の `send`/`recv`/`sendto`/`recvfrom` は長さを `int`
-  で受け取るため、内部で `INT_MAX` にクランプする。`MSG_NOSIGNAL` は
-  Windows には無い（SIGPIPE が発生しない）ため指定しない。
-- **エラー文字列**：`errno`/`strerror` の代わりに `WSAGetLastError()` の値を
-  `FormatMessageA` で整形して `<prefix>: <text>` 形式の error を作る
-  （FFI の Windows 実装 `ffi_platform.c` と同じ手法）。
-- **リンク**：Windows ビルドでは `-lws2_32` を追加でリンクする（Makefile）。
-
-**fd 型の決着（既知の課題 #5 の恒久対応）**：
-`net_raw_fd()` が返す raw fd/socket は、Windows の `SOCKET`（64bit 環境で
-`UINT_PTR`）を `int` に切り詰めていた。Step2/Step3 の当初設計では「Winsock の
-カーネルハンドルは 32bit に収まる」ことに依拠し公開 fd 型を `int` に据え置いて
-いたが（実用上は安全だが型として不正確）、既知の課題 #5 の恒久対応として
-fd 型を次のように**確定・修正**した。
-
-- **公開インターフェースの fd 型を `myon_fd_t`（`intptr_t` 相当、`src/net.h`）に
-  統一する**。無効値は `MYON_INVALID_FD`。`net_raw_fd()` の戻り値、
-  `net_sync_wait_fd()` の引数、`event_loop_wait_readable/writable()` と
-  `Task.waiting_fd`、`interpreter.c` 内で fd を持ち回るローカル変数を
-  すべて `myon_fd_t` に広げた。これにより Windows の `SOCKET` が切り詰められず
-  そのまま往復する。
-- **Linux では `myon_fd_t` は実質 `int` の値域**であり、`FD_SET`/`select()` に
-  渡す直前に `(int)` へ戻す（widening はロスレスなのでこの narrowing は安全）。
-  Linux の挙動は従来と不変。
-- **Windows 側の `SOCKET` 復元は自明化した**。`(unsigned int)` によるゼロ拡張
-  再構成は不要になり、`event_loop.c` の `fd_to_socket()` は
-  `(SOCKET)(UINT_PTR)fd`、`net.c` は `(SOCKET)(UINT_PTR)fd` のみで復元する。
-- **回帰防止（CI）**：`src/net.c` の `_WIN32` 分岐に
-  `static_assert(sizeof(myon_fd_t) >= sizeof(SOCKET), ...)` を置き、fd 型が
-  再び狭くなった場合に Windows ビルド（`win-cross`/`win-native`）を
-  コンパイル時に失敗させる。`.github/workflows/heavy-checks.yml` の `win-cross`
-  ジョブには、正（Windows 向け `net.c` のコンパイル成功）と負の対照
-  （`myon_fd_t` を `int` に狭めた TU が同アサートで失敗する）を確認する
-  検証ステップを追加した。
-
-**Windows 同期待機ヘルパ `net_sync_wait_fd(myon_fd_t fd, int for_write)`**：
-コルーチン外（同期文脈）での単一 fd 待機は、従来 `interpreter.c` が
-`select(2)` を直接呼んでいた。Windows では Winsock の `select()` が
-`<winsock2.h>`（→ `<windows.h>` → `<winnt.h>`）を引き込み、`winnt.h` の
-`TokenType` 列挙が Myon 自身の `TokenType`（`src/token.h`）と衝突する。
-これを避けるため、Windows の同期単一 fd 待機は Winsock ヘッダを正しく内包
-している `net.c` の `net_sync_wait_fd()` に委譲する。Linux では従来どおり
-`interpreter.c` 内で `select(2)` を呼ぶ（`net_sync_wait_fd` の Linux 版は
-対称性のために用意されているが未使用）。この設計により `interpreter.c` は
-Windows でも `windows.h` を取り込まずにコンパイルできる。
-
-**未サポート**：上記以外のプラットフォーム、IPv6。非対応プラットフォームでは
-全関数が `myon.net unsupported on this platform` の error を返す。
-
-```myon
-module myon.net
-
-// TCPエコーサーバー（1接続だけ受けて返す簡単な例）
-srv, e1 = myon.net.tcp_socket()
-myon.net.bind(srv, "", 0)              // ポート0で任意ポートにバインド
-port, ep = myon.net.local_port(srv)    // 実際のポート番号を取得
-myon.net.listen(srv, 16)
-
-conn, e2 = myon.net.accept(srv)        // 接続を協調的に待機
-data, e3 = myon.net.recv(conn, 1024)
-myon.net.send(conn, data)              // エコー
-myon.net.close(conn)
-myon.net.close(srv)
-```
-
----
-
-### 10.8 HTTP myon.http（Phase5）
-
-`myon.net` の上に構築された最小限の HTTP モジュール。サーバー2種と
-クライアント2種を提供する。**HTTP/1.0・1コネクション1リクエスト固定**であり、
-Keep-Alive は行わない（レスポンスに `Connection: close` を付与する）。
+HTTP/1.0 のクライアントとサーバーを提供します。接続ごとに1リクエストを扱い、
+Keep-Alive と TLS サーバーには対応しません。
 
 | 関数 | シグネチャ | 説明 |
 |------|-----------|------|
@@ -1536,34 +730,32 @@ Keep-Alive は行わない（レスポンスに `Connection: close` を付与す
 | `get` | `(url: str) ret str, int, error` | GETリクエスト。**3値** `(body, status, error)` |
 | `post` | `(url: str, body: str, content_type: str) ret str, int, error` | POSTリクエスト。**3値** `(body, status, error)` |
 
-**サーバーの実行モデル**：`serve_static`/`serve` は受理ループ（accept loop）を
-イベントループ上のコルーチンとして起動し、接続ごとにさらに別のコルーチンを
-spawnして並行処理する。受理ループとそのラッパーは**デーモンタスク**として
-マークされるため、プログラム終了時のドレイン処理では無視される。これにより
-自己完結スクリプト（サーバーを起動し、別タスクでクライアント処理をして終了）
-がハングせずに終了できる。トップレベルからサーバー関数を直接呼んだ場合は、
-そのまま全タスク完了までブロックし続ける（常駐サーバー用途）。
+serve は method/path/body の3文字列をハンドラへ渡します。
+ハンドラが文字列を返す場合は 200 / text/plain の応答ボディです。
+配列を返す場合は末尾をボディ、先頭をステータス、要素が3つ以上なら2番目を Content-Type として
+解釈します。ステータスは100〜599です。文字列型の配列では例えば次のように指定できます。
 
-**静的配信のパス解決**：`http_resolve_static_path` が `..` を含むパスや制御
-バイトを含むパスを拒否し（ディレクトリトラバーサル防止）、`/` および末尾
-スラッシュは `index.html` にマップする。
+```myon
+module myon.http
+myon.func handler(method: str, path: str, body: str) ret myon.array(str) {
+    response = myon.array(str)
+    response.push("404")
+    response.push("text/plain")
+    response.push("not found")
+    ret response
+}
+```
 
-**ハンドラ規約**（`serve`）：`handler(method: str, path: str, body: str)` の形で
-呼ばれ、返した文字列がレスポンスボディになる。現状のレスポンスは常に
-`200 OK` / `Content-Type: text/plain` 固定である（ステータス・ヘッダの
-カスタマイズは未対応、→ Open Questions）。
+サーバーを起動する呼び出しは `myon.http.serve(8080, handler)` です。
+この呼び出しをトップレベルで実行すると待機し続けます。
+コルーチン内では受理ループ等をデーモンとして扱い、プログラム終了時にそれだけを理由として
+待機を続けないようにします。接続処理は別タスクとして実行します。
 
-**クライアント**：`get`/`post` はlibcurl等に依存せず、生のTCP（`myon.net`）で
-HTTP/1.0リクエストを自力で組み立てる自己完結実装である。戻り値はボディ・
-ステータスコード・エラーの3値で、URLパースや接続に失敗した場合は空ボディ・
-ステータス `0`・`error` を返す。ホスト名はDNS解決される（→ 10.7）。
+静的配信は .. や制御文字を含む要求パスを拒否し、/ や末尾スラッシュを index.html に対応させます。
+これだけで配信元の全ファイル・symlink の権限境界を定めるわけではありません。
 
-**HTTPS/TLS（Phase5.1）**：`https://` で始まるURLに対応した。通常のTCP接続を
-確立した上で、OpenSSL を用いたネイティブTLSハンドシェイクを行う（`src/tls.c`）。
-デフォルトポートは `https` が `443`、`http` が `80`。
-
-TLS クライアントは**フェイルクローズ**（検証に失敗したら接続を閉じる）で
-設計されている。具体的には以下を強制する。
+get/post は body/status/error の3値を返します。URL・接続などの失敗は空ボディとstatus=0とerrorです。
+HTTPS の既定ポートは443、HTTPは80です。クライアントの TLS は OpenSSL を使います。
 
 | 項目 | 内容 |
 |------|------|
@@ -1574,292 +766,136 @@ TLS クライアントは**フェイルクローズ**（検証に失敗したら
 | 無効化するレガシー機能 | TLS 圧縮・再ネゴシエーション（`SSL_OP_NO_COMPRESSION \| SSL_OP_NO_RENEGOTIATION`） |
 | ハンドシェイクのタイムアウト | 既定 30 秒（`MYON_TLS_HANDSHAKE_TIMEOUT_SECS`）。無応答のピアで無限待ちしない |
 
-証明書が失効・ホスト名不一致・自己署名などの場合は、理由付きの `error` を
-返して接続を中断する（中間者攻撃に対する基本的な保護を提供する）。
+証明書チェーンや接続先名の検証に失敗した場合は接続を中止します。
+証明書の有効期間の検査と失効確認は別です。OCSP/CRLによる失効確認、ピンニング、
+クライアント証明書は未対応です。
+URLのホスト・ポート・パスに含まれる制御文字と範囲外ポートは拒否します。
 
-> **実装の限界**：コンパクトな実装であり、以下は**非対応**である。
-> 高保証が必要な用途ではこの制限を考慮すること。
->
-> - OCSP / CRL による失効確認
-> - 証明書ピンニング
-> - クライアント証明書（mTLS）
->
-> **URL のサニタイズ**：`myon.http.get`/`post` に渡す URL は、ホスト・ポート・
-> パスに含まれる制御文字（CR/LF 等）や範囲外のポート番号を拒否し、
-> HTTP ヘッダ／リクエストインジェクションを防ぐ。
->
-> **ビルド依存**：この機能により、Myon本体のビルドに OpenSSL 開発パッケージ
-> （`libssl-dev` 相当）が**必須**となった。Makefile は常に `-lssl -lcrypto` を
-> リンクする。
+## 11. モジュール
 
-```myon
-module myon.http
+組み込みには myon.stdio/math/string/file/array/map/time/random/net/http/ffi があります。
 
-// 静的ファイルサーバー（常駐）
-myon.http.serve_static(8080, "./public")
+| 分類 | 記法 | 解決 |
+|---|---|---|
+| 組み込み | `module myon.stdio` | 登録済みの標準ライブラリ名 |
+| 外部ファイル | `module external.util as util` | 実行スクリプト相対の util.myon |
+| パッケージ | `module example.tools as tools` | ロック内の module 名前空間と配置済みソース |
 
-// 動的ハンドラ
-fn handler(method: str, path: str, body: str) ret str {
-    ret "hello from " + path
-}
-myon.http.serve(8080, handler)
+パッケージは alias が必要です。module名とパッケージ名・リポジトリ名を区別します。
+組み込み module 宣言で機能を制限する処理は未実装です。
+external とパッケージの取り込みはツリーウォーク専用です。
 
-// クライアント
-body, status, err = myon.http.get("http://127.0.0.1:8080/")
-myon.print(status)                      // 200
+形式・解決規則は [パッケージマネージャー](package_manager.md)、
+配布手順は [パッケージ開発](package_development.md) を参照してください。
 
-// HTTPS（TLS）クライアント（Phase5.1）
-body2, status2, err2 = myon.http.get("https://example.com/")
-myon.print(status2)                     // 200
-```
+## 12. 実行と対話モード
 
----
+トップレベルの文を順に実行し、専用の main 関数は要求しません。
 
-## 11. モジュールシステム
-
-`module` 宣言には次の 3 種類がある。
-組み込みモジュールには `myon.file`・`myon.array`・`myon.map` も指定できる。
-
-```myon
-system myon.useversion=1        // 使用するMyonバージョンの宣言
-module myon.stdio               // (1) 組み込みモジュール
-module external.util.math as m  // (2) 外部モジュール（./util/math.myon）をmとして読み込み
-module mylib.text as t          // (3) インストール済みパッケージのモジュール
-```
-
-| 種類 | 接頭辞 | 解決先 |
-|------|--------|--------|
-| (1) 組み込み | `myon.*` | インタプリタ内蔵の標準ライブラリ（§10） |
-| (2) 外部ファイル | `external.*` | スクリプトからの相対パス。ドット区切りがディレクトリ階層に対応（`external.util.math` → `./util/math.myon`） |
-| (3) パッケージ | 上記以外 | `myon pkg install` で導入したパッケージ（`.myon/packages/` 以下）。パッケージ名の後ろがパッケージ内の相対パスになる |
-
-ドット区切りはいずれの場合もファイルパス階層に対応する（`.myon` 拡張子を想定）。
-`as` による別名付けは (2)(3) で使える。
-
-パッケージの導入手順・`myon.toml` / `myon.lock` の書式は
-[`package_manager.md`](./package_manager.md)、
-パッケージを作る側の作法は
-[`package_development.md`](./package_development.md) を参照。
-
-> **注意**：MVM（バイトコード VM）でのパッケージ由来モジュールの取り扱いには
-> 制限がある。[`known-issues.md`](../known-issues.md) を参照。
-
----
-
-## 12. エントリーポイント
-
-専用の `main` は不要。トップレベルの文が上から順に実行される。
-
-```myon
-system myon.useversion=1
-module myon.stdio
-
-x = str("人間")
-myon.print("Hello Worlddd! ", x + "!")
-```
-
-### 12.0 コマンドラインインタフェース（CLI）
-
-`myon` コマンドの引数体系は次の通り。フラグは `--tokens` のようなダブルハイフン
-スタイルで統一する。
+### 12.0 CLI
 
 ```sh
-myon <file.myon>                 # .myon をツリーウォーク型インタプリタで実行
-myon <file.myc>                  # .myc（MVM バイトコード）をバイトコード VM で実行
-myon --compile <src> [-o out]    # .myon を MVM バイトコード（.myc）にコンパイル（実行しない）
-myon --dump-bytecode <src>       # .myon（または .myc）を逆アセンブルして表示し終了
-myon --tokens <file.myon>        # トークン列を出力して終了（Step 1 の確認用）
-myon --tokens -                  # 標準入力からソースを読み、トークン列を出力
-myon                             # 引数なし: 対話式実行（REPL）
-myon -h | --help                 # 使い方を表示して終了
+myon program.myon
+myon --compile program.myon -o program.myc
+myon program.myc
+myon --run-mvm program.myon
+myon --dump-bytecode program.myc
+myon --tokens program.myon
+myon --tokens -
+myon --help
+myon --version
 ```
 
-- **ファイル引数の振り分け**：先頭 4 バイトが MVM のマジック `MYC1`
-  （`.myc` ヘッダ。定義は [`docs/mvm_spec.md`](mvm_spec.md) の 6.2 節）で
-  あるか、名前が `.myc` で終わる場合はバイトコード VM で実行する。それ以外は
-  従来通りツリーウォーク型インタプリタで実行する。`-` は常に標準入力を意味し、
-  ソースとして扱う。**`.myon` 実行（拡張子指定なしを含む）の挙動は従来と一切
-  変わらない。**
-- **`-o <out>`**：`--compile` の出力先を指定する。省略時は入力名の拡張子を
-  `.myc` に置き換えた名前（例：`foo.myon` → `foo.myc`）。
-- **`--compile`** はコンパイルのみで実行はしない。
-- 未知の `--` 付きフラグはエラー（終了コード 64）として扱い、使い方を表示する。
-- **`--strict-stale`**：`.myc` を実行する際、その元になった `.myon`（Source Info
-  に記録されたパス、無ければ同名の隣接 `.myon`）が `.myc` より新しい場合に、
-  警告ではなく**エラー**（終了コード 65）として実行を中止する。省略時（既定）は
-  警告のみを表示して実行を続行する。元 `.myon` が存在しない（配布された `.myc`
-  単体）場合は検証をスキップする。詳細は [`docs/mvm_spec.md`](mvm_spec.md) の
-  6.5 節を参照。
-- **`--run-mvm <src>`**（内部確認用）：`.myon` をメモリ上でコンパイルし、そのまま
-  MVM VM で実行する。`.myon`/`.myc` の等価性検証スイート
-  （`tests/run_mvm_tests.sh`）が使う内部フラグで、通常の実行では不要。
+--compile は出力のみで実行しません。先頭がMYC1または拡張子が.mycならVMへ渡します。
+それ以外はソースで、`-` は標準入力です。
+保存元のソースとの差を検出すると警告し、--strict-staleではエラーにします。
+元ソースがなければ検査を省略します。詳細は MVM リファレンス6.5節を参照してください。
 
-### 12.1 対話モード（REPL）
+### 12.1 REPL
 
-`myon` を引数なしで起動すると対話式実行（REPL）モードに入る。
+引数なしで起動します。myon> が通常、...> が入力継続のプロンプトです。
+定義はセッション中保持します。実行時エラー後も次の入力を受け付け、exit/quit/EOFで終了します。
+REPL はツリーウォーク実行です。
 
-- プロンプトは `myon> `。入力が構文として未完（`()`/`[]`/`{}` が閉じていない等）の
-  場合は継続プロンプト `...> ` を表示し、閉じるまで入力を受け付ける
-- REPL 内で定義した変数・関数・構造体はセッション終了まで保持される
-  （インタプリタと環境を使い回す）
-- 実行時エラーが起きても REPL は終了せず、次の入力を受け付け続ける
-  （エラーはそのステートメントの中断のみ）
-- `exit` / `quit` または EOF（Ctrl+D）で終了する
-- REPL は当面ツリーウォーク型インタプリタのみで動作する。MVM バックエンドの
-  REPL 対応は将来課題とする。
+## 13. 構文の概要
 
-```
-$ myon
-myon> x = 1
-myon> myon.print(x)
-1
-myon> exit
-```
-
-ファイル実行モード（`myon file.myon`）は従来通り。
-
----
-
-## 13. EBNF文法定義
+次の EBNF は主要な構文の対応を示します。改行の扱いは1.4節、型・取り込みの制約は
+各節を参照してください。トークン単位の受理規則は src/parser.c が実装しています。
 
 ```ebnf
-program        = { top_level_stmt } ;
-
-top_level_stmt = system_decl | module_decl | statement ;
-
-system_decl    = "system", "myon.useversion", "=", int_literal ;
-module_decl    = "module", module_path, [ "as", identifier ] ;
-module_path    = identifier, { ".", identifier } ;
-
-statement      = assignment
-               | expr_stmt
-               | if_stmt
-               | while_stmt
-               | for_stmt
-               | func_decl
-               | struct_decl
-               | break_stmt
-               | continue_stmt
-               | return_stmt
-               | expose_stmt
-               | block ;
-
-statement_list = statement, { ( ";" | newline ), statement } ;
-
-block          = "{", statement_list, "}" ;
-
-assignment     = identifier, [ ":", type ], "=", expression
-               | identifier, compound_assign_op, expression ;
-compound_assign_op = "+=" | "-=" | "*=" | "/=" ;
-
-expr_stmt      = expression ;
-
-if_stmt        = "myon.if", expression, block,
-                 { "myon.elif", expression, "then", block },
-                 [ "myon.else", block ] ;
-
-while_stmt     = "myon.while", expression, block ;
-
-for_stmt       = "myon.for", identifier, "myon.in", ( range_expr | expression ), block ;
-range_expr     = "range", "(", expression, ",", expression, ")" ;
-
-func_decl      = [ "myon.async" ], "myon.func", identifier, [ type_params ],
-                 "(", [ param_list ], ")", "ret", ret_type_list, block ;
-type_params    = "<", identifier, { ",", identifier }, ">" ;
-param_list     = param, { ",", param } ;
-param          = identifier, ":", type ;
-ret_type_list  = type, { ",", type } ;
-
-struct_decl    = "myon.struct", identifier, [ type_params ],
-                 [ "myon.extends", identifier ],
-                 "{", { field_decl | func_decl }, "}" ;
-field_decl     = identifier, ":", type ;
-
-break_stmt     = "myon.break" ;
-continue_stmt  = "myon.continue" ;
-return_stmt    = "ret", expression, { ",", expression } ;
-expose_stmt    = "myon.expose", identifier ;
-
-expression     = or_expr ;
-or_expr        = and_expr, { "myon.or", and_expr } ;
-and_expr       = not_expr, { "myon.and", not_expr } ;
-not_expr       = [ "myon.not" ], comparison ;
-comparison     = additive, [ comp_op, additive ] ;
-comp_op        = "==" | "!=" | "<" | ">" | "<=" | ">=" ;
-additive       = multiplicative, { ( "+" | "-" ), multiplicative } ;
+program       = { statement, { separator } } ;
+separator     = newline | ";" ;
+statement     = system_decl | module_decl | assignment | expression
+              | if_stmt | while_stmt | for_stmt | func_decl | struct_decl
+              | "myon.break" | "myon.continue" | return_stmt
+              | "myon.expose", identifier | block ;
+block         = "{", { statement, { separator } }, "}" ;
+system_decl   = "system", "myon.useversion", "=", int_literal ;
+module_decl   = "module", module_path, [ "as", identifier ] ;
+module_path   = identifier, { ".", identifier } ;
+assignment    = identifier, { ",", identifier }, [ ":", type ], "=", expression
+              | identifier, compound_op, expression
+              | postfix_target, "=", expression ;
+compound_op   = "+=" | "-=" | "*=" | "/=" ;
+if_stmt       = "myon.if", expression, [ "then" ], block,
+                { "myon.elif", expression, "then", block }, [ "myon.else", block ] ;
+while_stmt    = "myon.while", expression, block ;
+for_stmt      = "myon.for", identifier, "myon.in", ( range_expr | expression ), block ;
+range_expr    = "range", "(", expression, ",", expression, ")" ;
+func_decl     = [ "myon.async" ], "myon.func", identifier, [ type_params ],
+                "(", [ params ], ")", "ret", return_types, block ;
+params        = identifier, ":", type, { ",", identifier, ":", type } ;
+return_types  = type, { ",", type } ;
+return_stmt   = "ret", [ expression, { ",", expression } ] ;
+struct_decl   = "myon.struct", identifier, [ type_params ],
+                [ "myon.extends", identifier ], "{", { field | func_decl | separator }, "}" ;
+field         = identifier, ":", type ;
+type_params   = "<", identifier, { ",", identifier }, ">" ;
+expression    = or_expr ;
+or_expr       = and_expr, { "myon.or", and_expr } ;
+and_expr      = not_expr, { "myon.and", not_expr } ;
+not_expr      = { "myon.not" }, comparison ;
+comparison    = additive, { comp_op, additive } ;
+comp_op       = "==" | "!=" | "<" | ">" | "<=" | ">=" ;
+additive      = multiplicative, { ( "+" | "-" ), multiplicative } ;
 multiplicative = unary, { ( "*" | "/" ), unary } ;
-unary          = [ "-" ], postfix ;
-postfix        = primary, { ".", identifier, [ "(", [ arg_list ], ")" ]
-                           | "[", expression, "]"
-                           | "(", [ arg_list ], ")" } ;
-primary        = literal
-               | identifier, [ "<", type, { ",", type }, ">" ]  (* ジェネリック実体化 *)
-               | "myon.await", expression
-               | lambda_expr
-               | "(", expression, ")" ;
-
-lambda_expr    = "myon.lambda", "(", [ param_list ], ")", "ret", type, block ;
-
-arg_list       = arg, { ",", arg } ;
-arg            = expression | identifier, "=", expression ;
-
-literal        = int_literal | float_literal | bool_literal
-               | str_constructor | char_constructor | error_constructor | string_interp ;
-
-str_constructor   = "str", "(", expression, ")" ;
-char_constructor  = "char", "(", expression, ")" ;
-error_constructor = "error", "(", expression, ")" ;
-string_interp     = '"', { text_fragment | "{", expression, "}" }, '"' ;
-
-type           = "int" | "float" | "str" | "char" | "bool" | "void"
-               | "error" | identifier, [ "<", type, { ",", type }, ">" ]  (* struct名／ジェネリック実体化 *)
-               | "myon.array", "(", type, ")"
-               | "myon.map", "(", type, ",", type, ")" ;
-
-int_literal    = dec_literal | hex_literal | oct_literal ;
-dec_literal    = digit, { digit } ;
-hex_literal    = "0x", hex_digit, { hex_digit } ;
-oct_literal    = "0o", oct_digit, { oct_digit } ;
-hex_digit      = digit | "a".."f" | "A".."F" ;
-oct_digit      = "0".."7" ;
-float_literal  = digit, { digit }, ".", digit, { digit }, [ exponent ] ;
-exponent       = ( "e" | "E" ), [ "+" | "-" ], digit, { digit } ;
-bool_literal   = "true" | "false" ;
-
-identifier     = letter, { letter | digit | "_" } ;
-letter         = "a".."z" | "A".."Z" | "_" ;
-digit          = "0".."9" ;
+unary         = { "-" }, postfix ;
+postfix       = primary, { "(", [ args ], ")" | "[", expression, "]" | ".", identifier } ;
+postfix_target = identifier, ( "[", expression, "]" | ".", identifier ),
+                 { "[", expression, "]" | ".", identifier } ;
+args          = arg, { ",", arg } ;
+arg           = [ identifier, "=" ], expression ;
+primary       = literal | identifier, [ "<", type, { ",", type }, ">" ]
+              | "(", expression, ")" | "myon.await", expression | lambda
+              | "myon.array", "(", type, ")"
+              | "myon.map", "(", type, ",", type, ")"
+              | constructor, "(", expression, ")" ;
+constructor   = "int" | "str" | "char" | "error" ;
+lambda        = "myon.lambda", "(", [ params ], ")", "ret", return_types, block ;
+type          = "int" | "float" | "str" | "char" | "bool" | "void" | "error"
+              | identifier, [ "<", type, { ",", type }, ">" ]
+              | "myon.array", "(", type, ")" | "myon.map", "(", type, ",", type, ")" ;
+literal       = int_literal | float_literal | string_literal | "true" | "false" | "myon.nil" ;
 ```
 
----
+int_literal / float_literal / string_literal / identifier の字句規則は1節を参照してください。
+組み込みの専用トークンと修飾名は、説明上この概要の識別子に対応させています。
 
-## 14. 拡張仕様（v0.2確定分）
+## 14. コレクション・型パラメータ・非同期処理
 
-### 14.1 数値リテラルの拡張
+### 14.1 数値リテラル
 
-10進数に加えて16進数・8進数・指数表記をサポートする。
+10進、0x/0Xの16進、0o/0Oの8進、指数表記を扱います。
+int の範囲を超えた整数リテラルはパース時に拒否します。
+最小intを算術で作る場合は `-9223372036854775807 - 1` のように書けます。
 
-```myon
-h = 0x1F        // 16進数
-o = 0o17         // 8進数
-e = 1.5e10       // 指数表記
-```
-
-### 14.2 辞書/マップ型
-
-`myon.map(K, V)` を導入する。`myon.array` と対になるコレクション型。
+### 14.2 Map
 
 ```myon
 m = myon.map(str, int)
-m.set(str("age"), 20)
-v = m.get(str("age"))
-m.delete(str("age"))
-has = m.has(str("age"))
+m.set("age", 20)
+myon.print(m.get("age"))
 ```
-
-#### マップメソッド（Phase4）
-
-`set` / `get` / `has` / `delete` に加え、中身を列挙するメソッドを備える。
 
 | メソッド | シグネチャ | 説明 |
 |------|-----------|------|
@@ -1871,228 +907,89 @@ has = m.has(str("age"))
 | `values` | `() ret myon.array(V)` | 全値を要素型`V`の配列で返す |
 | `length` | `() ret int` | エントリ数 |
 
-`keys()` / `values()` の要素順序は保証しない（このPhaseでは順序を仕様に
-含めない）。順序に依存しない検証をするか、必要なら返った配列を `sort()`
-してから使うこと。
-
-```myon
-m = myon.map(str, int)
-m.set(str("a"), 1)
-m.set(str("b"), 2)
-m.set(str("c"), 3)
-myon.print(m.length())          // 3
-ks = m.keys()
-ks.sort()
-myon.print(ks)                  // [a, b, c]
-vs = m.values()
-myon.print(vs.contains(2))      // true（順不同なので contains で確認）
-```
+キー型は str/int を想定した API です。現実装の列挙順序を挿入順として利用しないでください。
+keys/values の順序は保証しません。探索コストと順序の課題は既知の問題18です。
 
 ### 14.3 関数内の制御フロー
 
-早期 `ret` のみをサポートする。goto等の任意ジャンプは導入しない
-（明示的で読みやすい構文というMyonの設計思想に合わせるため）。
+ret で関数から戻ります。任意位置への goto 構文はありません。
+ループ内では break/continue を使います。
 
-### 14.4 標準ライブラリの初期ラインナップ
+### 14.4 標準ライブラリの参照
 
-`myon.stdio` に加え、以下を最初から用意する。
+標準入出力、ファイル、FFI、math/string、time/random、net/http の関数表は10節にあります。
+配列は7.1節、Mapは14.2節を参照してください。
 
-- `myon.stdio`：`myon.print`, `myon.input`, および以下のファイルI/O関数
-  - `myon.file.read(path: str) ret str, error`
-  - `myon.file.write(path: str, content: str) ret bool, error`
-  - `myon.file.append(path: str, content: str) ret bool, error`
-  - `myon.file.exists(path: str) ret bool`
-- `myon.math`：数学関数（10.4節、Phase4で `gcd`/`lcm`/`pow_int` を追加）
-- `myon.string`：文字列操作関数（10.4節）
-- `myon.time`：現在時刻取得・スリープ（10.5節、Phase4で新設）
-- `myon.random`：乱数生成（10.6節、Phase4で新設）
+### 14.5 循環取り込み
 
-ファイルI/Oの詳細な挙動（エラー伝播など）は10.2節を参照。
-その他の具体的な関数シグネチャは今後のAPI仕様書で別途定める。
+外部ファイル・パッケージの module 取り込みで循環を検出するとエラーを報告します。
+外部パッケージの依存解決時の循環と、実行時の module 取り込みの循環は別の検査です。
 
-### 14.5 モジュール循環参照
+### 14.6 継承のフィールド名
 
-循環参照は**エラー**とする。モジュール解決時に循環を検出した場合、
-コンパイル/実行時エラーとして報告する。
+子構造体が親と同名のフィールドを宣言することは拒否します。
+フィールドとメソッドの解決は、それぞれの宣言と継承チェーンを使います。
 
-### 14.6 struct継承時のフィールド名衝突
+### 14.7 型注釈と評価結果
 
-子structが親structと同名のフィールドを持つことは**エラー**とする。
-オーバーライドは許可しない（型の厳密性を保つため）。
+関数の引数・構造体フィールドには型を記述します。
+変数の型注釈を省いた場合は評価結果を使います。
+型情報があることと、すべての代入経路がコンパイル時に検査されることは同義ではありません。
 
-### 14.7 型推論の範囲
-
-関数の引数・戻り値・struct/フィールドの型注釈は引き続き**必須**。
-ただし、リテラル直接代入（右辺が単一リテラルの場合）に限り型注釈を省略できる。
+### 14.8 ジェネリクス
 
 ```myon
-x = 1          // int と推論（省略可）
-y: int = 1     // 明示も引き続き可能
-
-myon.func add(a: int, b: int) ret int { ret a + b }  // 関数は型注釈必須のまま
-```
-
-### 14.8 ジェネリクス（型パラメータ）
-
-structおよび関数は型パラメータをサポートする。
-
-```myon
-myon.struct Box<T> {
-    value: T
-}
-
-b = Box<int>(value=5)
+myon.struct Box<T> { value: T }
+box = Box<int>(value=5)
+myon.print(box.value)
 
 myon.func first<T>(xs: myon.array(T)) ret T {
     ret xs[0]
 }
 ```
 
-**型制約は導入しない（確定事項）。** `T: Comparable` のような境界指定は
-サポートせず、ジェネリクスは型パラメータへの型の代入のみを行う。任意の型を
-渡すことができる。現状のジェネリクス実装が「型の代入のみ」というシンプルな
-モデルであることを踏まえ、言語の複雑度を抑える実用性重視の判断としてこの方針を
-確定する。将来、型制約がないと困る具体的な利用シーンが現れた段階で改めて検討する。
+型パラメータへ型を割り当てます。T: Comparable のような型制約構文はありません。
+MVM は型消去でコンパイルし、型引数ごとの単相化は行いません。
 
-### 14.9 並行処理・非同期処理（Phase5 で本格化）
-
-`myon.async` / `myon.await` を導入する。
+### 14.9 async と await
 
 ```myon
-myon.async myon.func fetchData() ret str {
-    myon.await myon.time.sleep_ms(50)
-    ret str("結果")
+module myon.time
+myon.async myon.func fetch() ret str {
+    myon.await myon.time.sleep_ms(10)
+    ret str("done")
 }
-
-result = myon.await fetchData()
+task = fetch()
+myon.print(myon.await task)
 ```
 
-**実行モデル：シングルスレッド・協調的イベントループ（Phase5 で確定）。**
+async 関数の呼び出しは Task を返します。本体はイベントループで実行され、await は
+完了を待って結果を取得します。通常の値に対する await はその値を返します。
+Task内の失敗は await 側でも実行時エラーとして報告します。
 
-Phase5 以前の「疑似非同期（呼び出し即同期実行）」は廃止され、次の本格的だが
-軽量な非同期モデルに置き換えられた。
+処理は単一スレッドで、タスクは await・タイマー・I/O 待ちで協調的に中断します。
+CPU処理を一定時間で中断するプリエンプションや、マルチコア並列実行は行いません。
+POSIX は ucontext、Windows は Win32 Fiber を使用します。
 
-- 処理系はプロセス内にただ 1 つの **協調的イベントループ**（`src/event_loop.c`）
-  を持つ。
-- `myon.async myon.func` を呼び出しても本体はその場では実行されず、
-  **タスク（コルーチン）** として生成され、その関数呼び出し式は
-  **Task 値**（内部型 `TYPE_TASK`。ユーザーが型注釈に書くことは想定しない）を
-  即座に返す。挙動は Python の `asyncio.create_task` に近い。
-- `myon.await <Task>` は、対象タスクが完了するまで **現在のコルーチンを協調的に
-  一時停止**し、その間イベントループは他の準備完了タスクを実行する。対象が完了
-  したら再開し、その戻り値を返す（対象タスク内で実行時エラーが発生していた場合は
-  `myon.await` 地点で同じ実行時エラーとして再送出される）。
-- I/O 待ち（ソケットの read/write/accept/connect、`myon.time.sleep_ms` 等）は
-  OS スレッドをブロックせず、イベントループの `select(2)` 待ちに登録され、
-  他のタスクへ制御が回る。
-- タスクの切り替わりは **`await` 地点・I/O 待ち地点でのみ** 起こる（協調的
-  マルチタスク）。タイムスライスによる強制中断（プリエンプション）は行わない。
-  これは Python asyncio / JavaScript async-await と同じモデルである。
-- `myon.async` を使わない同期的なコード（トップレベルスクリプトなど）から
-  `myon.time.sleep_ms` や `myon.net.*` を呼んだ場合は、従来どおりの
-  **ブロッキング動作にフォールバック**する（後方互換）。
+各コルーチンのスタック予算は256 KiBです。再帰深度の上限はこのスタックとビルド条件から
+計算します。mainのスタック上限とは別です。完了タスクのスタック/Fiberはスケジューラへ
+戻ってから解放し、結果のメタデータはハンドルと待機タスクの参照がある間保持します。
 
-**後方互換性**：オペランドが Task 値でない（= `myon.async` でない普通の式に
-`myon.await` を書いた）場合、`myon.await` はその値をそのまま返す。これにより
-Phase5 以前の擬似非同期を前提としたコード（`result = myon.await fetchData()` の
-ような単一値返却）はそのまま動作する。
+WindowsのFiberエントリはreturnせず、完了を記録してmain_fiberへ切り替えます。
+別のFiberへ戻った後でDeleteFiberを呼びます。イベントループ破棄時だけに解放する方式ではありません。
+未完了タスクのコンテキスト後始末には既知の問題13が残っています。
 
-**コルーチンの実装方式**：POSIX `ucontext.h` の `makecontext`/`swapcontext` を用い、
-各タスクに専用の C スタック（256KB）を割り当てる方式（方式A）を採用した。これに
-より既存のツリーウォークインタプリタ（`eval_expr`/`exec_stmt` の再帰呼び出し）を
-一切変更せずに済む。各タスクは自分専用の C スタック上で通常どおり再帰し、`await`／
-I/O 待ち地点で `swapcontext` によりループ本体へ制御を返す。
+## 15. 現在の制約と検討対象
 
-**採用しなかった選択肢**：本物の OS スレッド化（マルチコア並列実行）は採用しない。
-値の参照カウント（`refcount`）をスレッドセーフにする大改修が必要で、処理系全体への
-侵襲が大きすぎるため（Phase2 P6 の判断を継続）。プリエンプティブなタスク切り替えも
-行わない。
+未対応なのは IPv6、TLSサーバー、HTTP Keep-Alive、MVMのmoduleリンクとREPL、
+VM関数値をネイティブ側で実行するコールバックなどです。
+Unicodeケース変換と文字列エスケープを含む実装上の問題は、既知一覧で状態を管理します。
+マルチスレッド化や追加の型制約は、現実装の仕様ではありません。
 
-**対応プラットフォーム**：イベントループは **POSIX 系（`ucontext` を持つ
-Linux / macOS / \*BSD、`MYON_HAVE_UCONTEXT`）と Windows（Fiber API）の双方で
-本実装済み**である。`ucontext`／Fiber のいずれも欠くプラットフォームでは未対応
-スタブ（`event_loop_supported()` が `0` を返す）としてコンパイルされる
-（FFI サブシステムと同じポリシー）。以下の表で「Linux」とあるものは
-`MYON_EVENT_LOOP_UCONTEXT` 分岐（= POSIX 系全体）を指す。
+HTTPハンドラのステータス/Content-Type指定、HTTPSクライアント、クロージャ、
+asyncのMVM対応は既に実装されており、未実装項目とは区別してください。
 
-**Windows 実装（Win32 Fiber、Phase5 Step3）**：`ucontext` は Windows に存在
-しないため、Windows では同等のユーザーモード・スタック切り替え機構である
-**Win32 Fiber API** でコルーチンを実装する（`src/event_loop.c` の
-`#elif defined(_WIN32)` 分岐、マクロ `MYON_EVENT_LOOP_FIBER`）。Linux 版
-（`MYON_EVENT_LOOP_UCONTEXT` 分岐）は一切変更していない。API 対応は次の通り
-（Microsoft Learn の winbase.h／winsock2.h リファレンスで確認）：
-
-| ucontext（Linux） | Fiber（Windows） | 役割 |
-|---|---|---|
-| `getcontext`＋`makecontext` | `CreateFiber(stack, proc, param)` | タスク用スタック確保＋エントリ設定 |
-| `swapcontext` | `SwitchToFiber(fiber)` | コンテキスト切り替え |
-| `loop->core_ctx` | `ConvertThreadToFiber(NULL)`（`main_fiber`） | ループ本体（復帰先） |
-| （`uc_stack` の `malloc`） | `CreateFiber` の第1引数（256KB） | スタックは Fiber API が内部確保 |
-| `uc_link` による自動復帰 | **なし**（下記の注意点を参照） | タスク終了時の復帰 |
-| `free(stack)` | `DeleteFiber(fiber)` | スタック破棄 |
-
-`CreateFiber` はエントリ関数へパラメータを直接渡せるため、`ucontext` 版に
-あったグローバル変数 `g_bootstrapping_task` によるバイパスは不要になり、
-`Task*` を素直に渡している。時刻取得は `clock_gettime(CLOCK_MONOTONIC)` の
-代わりに `GetTickCount64()`（システム起動からの単調増加ミリ秒）を用いる。
-I/O 多重化は Winsock の `select()` を用いる（`fd_set` は `SOCKET` の配列で、
-第1引数 `nfds` は無視されるため `0` を渡す。fd → `SOCKET` の復元は 10.7 を
-参照）。
-
-**Fiber のライフサイクル上の最重要注意点（`uc_link` 相当の不在）**：Fiber の
-エントリ関数（fiber proc）は**決して `return` してはならない**。return すると
-`ExitThread` が呼ばれスレッドごと終了する（`ucontext` の `uc_link` のような
-「呼び出し元へ自動復帰する」仕組みが Fiber には無い）。そこで Windows 版の
-`task_fiber_proc` は、タスク本体 `entry()` の完了後に状態を `TASK_DONE` にした
-うえで**無限ループに入り、`SwitchToFiber(main_fiber)` でループ本体へ制御を
-返し続ける**設計とした。スケジューラは `DONE` のタスクを二度と `SwitchToFiber`
-しないため、このループ本体は完了時に一度だけ実行され、以後 Fiber は
-`DeleteFiber` されるまで待機（park）状態で留まる。`DeleteFiber` は
-`event_loop_destroy()`（ループ本体＝別 Fiber）から、待機中（＝実行中でない）の
-タスク Fiber に対して呼ぶ。Microsoft のドキュメント上、実行中の Fiber を
-他 Fiber から削除するのは危険だが、破棄時点で全タスク Fiber は
-`SwitchToFiber` 地点で待機しており実行中ではないため安全である。
-
----
-
-## 15. Open Questions（残存する未決定事項）
-
-- `myon.map` のキー型に許される範囲（str/int以外の任意型を許すか）
-- 型推論をリテラル以外の式（関数呼び出し結果等）にも広げるか
-
-Phase5（`myon.net`/`myon.http`）で今回スコープ外とし、今後の検討課題として
-残した事項：
-
-- **IPv6対応**：現状の `myon.net` はIPv4のみ。`AF_INET6` の追加をどう表現するか
-- **TLSサーバー**：クライアント側の `https://` は Phase5.1 で実装済み（10.8節）。
-  サーバー側の TLS 終端（`serve` の HTTPS 化）は未対応
-- **HTTPサーバーのKeep-Alive対応**：現状はHTTP/1.0・1コネクション1リクエスト
-  固定。`Connection: keep-alive` / HTTP/1.1 chunked をサポートするか
-- **レスポンスヘッダ・ステータスコードのカスタマイズ**：`serve` のハンドラは
-  現状ボディ文字列のみを返し、常に `200 OK` / `text/plain` 固定。任意の
-  ステータス・ヘッダを返せるAPI形状（構造体を返す等）をどうするか
-- **本物のマルチスレッド化**：現状の並行処理は単一スレッドの協調的コルーチン
-  （14.9節）。OSスレッド/マルチコア並列をどう表現するか（当面は導入しない）
-- **クロスエンジンの関数値受け渡し**：MVM で生成した関数値を、ツリーウォーク側
-  実装のネイティブ関数（`array.map`/`filter`/`reduce`、`myon.ffi.make_callback`）
-  へ渡すことは現状できず、実行時エラーになる（`mvm_spec.md` 参照）
-
-> 以下は Phase 5.1 で確定・実装済みのため本リストから除外した。
-> - **TLS/HTTPS クライアント対応** → OpenSSL への依存を必須とし、
->   フェイルクローズな検証付きクライアントとして実装（10.8節）
->
-> 以下は Phase 5 で確定済みのため本リストから除外した。
-> - `myon.async`/`myon.await` の実行モデル → 単一スレッドの協調的イベント
->   ループ（POSIX は ucontext、Windows は Fiber ベースのコルーチン）に確定（14.9節）
-> - ジェネリクスの型制約 → 導入しないことに確定（14.8節）
->
-> 以下は Phase 3.5 で確定済みのため本リストから除外した。
-> - 標準ライブラリ `myon.math`/`myon.string` の具体的な関数シグネチャ一覧
->   → 全関数のシグネチャを 10.4節 に確定
-
----
-
-## 16. 総合サンプルコード
+## 16. 実行例
 
 ```myon
 system myon.useversion=1
@@ -2100,48 +997,28 @@ module myon.stdio
 
 myon.struct Person {
     name: str
-    age: int
-
     myon.func greet() ret void {
-        myon.print("Hello, my name is {self.name}")
+        myon.print("Hello, {self.name}")
     }
 }
 
 myon.func divide(a: int, b: int) ret int, error {
-    myon.if b == 0 then {
-        ret 0, error("ゼロ除算")
-    }
+    myon.if b == 0 then { ret 0, error("division by zero") }
     ret a / b, myon.nil
 }
 
-x = str("人間")
-a = char("a")
-b = 1
+person = Person(name=str("myon"))
+person.greet()
+result, err = divide(10, 2)
+myon.if err == myon.nil then { myon.print(result) }
 
-myon.print("Hello Worlddd! ", x + "!")
-
-myon.if a > b {
-    myon.print("aがbよりデカい")
-} myon.elif b > a then {
-    myon.print("bがaよりデカい")
-} myon.else {
-    myon.print("しらね")
-}
-
-p = Person(name=str("太郎"), age=20)
-p.greet()
-
-result, err = divide(10, 0)
-myon.if err != myon.nil then {
-    myon.print("エラー: {err}")
-} myon.else {
-    myon.print("結果: {result}")
-}
-
-xs = myon.array(int)
-xs.push(1)
-xs.push(2)
-myon.for item myon.in xs {
-    myon.print("{item}")
+numbers = myon.array(int)
+numbers.push(1)
+numbers.push(2)
+myon.for item myon.in numbers {
+    myon.print(item)
 }
 ```
+
+この例はツリーウォーク、または宣言ASTを保持する --run-mvm で実行できます。
+構造体を含む保存済み.mycの制約は MVM リファレンス7節を参照してください。

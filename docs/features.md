@@ -1,577 +1,145 @@
-# Myon 機能一覧・実装状況
+# 機能と実装・検証箇所
 
-このドキュメントは、Myon のこれまでの実装の歩み（フェーズ／ステップ単位の開発
-履歴）と実装状況をまとめたものです。ユーザー向けの導入・使い方は
-[`../README.md`](../README.md) を、言語仕様の正式な定義は
-[`myon_spec.md`](myon_spec.md)（言語仕様）と [`mvm_spec.md`](mvm_spec.md)
-（MVM バイトコード仕様）を参照してください。
+この文書は、Myon の機能を実装ファイルと回帰テストに対応付けるための一覧です。
+構文・関数の引数と戻り値は [言語リファレンス](myon_spec.md)、MVM の形式は
+[MVM リファレンス](mvm_spec.md) を参照してください。
+実装が存在することと、すべての入力・環境で検証されていることは区別します。
+未対応事項と既知の不具合は [既知の問題](../known-issues.md) に記載しています。
 
-## 実装状況の検証方法
+## 言語と値
 
-`make test` により、下表の各ステップ・項目に対応する回帰テストがすべてパスします。
-`make test` は次の 4 つのスイートを順に実行します。
+| 機能 | 主な実装 | 検証例・制約 |
+|---|---|---|
+| 字句解析・式・文の解析 | `lexer.c`、`parser.c`、`ast.c` | `p1_multiline_args`、`p_generic_comparison_lookahead` |
+| int / float / bool / str / char / error | `types.c`、`value.c` | int は符号付き64ビット、float は C の double。文字列は NUL 終端 |
+| 型チェックと明示キャスト | `interpreter.c` | `p_numeric_conversion_boundaries`、`numeric_regressions.sh` |
+| 整数演算と比較 | `interpreter.c` | `step12_overflow`、`p_int_comparison_precision`。比較は double を経由しない |
+| if / elif / else、while、for、break / continue | `parser.c`、`interpreter.c` | `step5_logic`、`examples/control_flow.myon` |
+| ブロックスコープ、`myon.expose` | `env.c`、`interpreter.c` | `step8_shadow`、`step8_expose`。MVM とのエラー発生段階の差は既知の問題26 |
+| 関数・複数戻り値・ラムダ | `interpreter.c`、`mvm_compiler.c`、`mvm_vm.c` | 関数型・捕捉・ネイティブ境界の制約は MVM 仕様7節 |
+| 構造体・継承・メソッド | `types.c`、`interpreter.c` | `step9_struct`。C FFI の構造体レイアウトとは別機能 |
+| ジェネリクス | `parser.c`、`interpreter.c`、`mvm_compiler.c` | `step15_generics`。型制約構文はない |
+| 文字列補間 | `interpreter.c`、`mvm_compiler.c` | `{expr}` を評価する。バックスラッシュエスケープは既知の問題14 |
 
-| スイート | 内容 |
+`value_copy` / `value_free` は参照カウントを操作します。到達不能な循環は、
+Obj と MVM の UpvalueCell を対象とするコレクタで回収します。
+この仕組みは、FFI の生アドレスや C 側で独立して確保された資源の管理を代行しません。
+出力時には循環と深さを検査し、`<cycle>` / `<...>` で再帰を打ち切ります。
+`runtime_memory_tests.c` と `p_tostr_cycle_guard` に対応する検査があります。
+
+## 標準ライブラリ
+
+| 分野 | API の例 | 動作・検証例 |
+|---|---|---|
+| 標準入出力 | `print`、`println`、`write`、`eprint`、`flush`、`is_tty`、`argv` | `p_stdio_writers`、`p_argv_empty`。write は末尾改行を追加しない |
+| ファイル | `myon.file.read/write/append/exists` | `p4_file_io`。read/write/append は結果と error を返す |
+| 数学 | `myon.math` | `p35_math_full`、`p35_math_int_precision`、`p4_math_integer` |
+| 文字列 | `myon.string` | `p35_string_full`、`p35_string_utf8_length`、`p_float_roundtrip` |
+| 配列 | `push/pop/length/sort/sort_desc/reverse/contains/index_of/slice/map/filter/reduce` | `p4_array_methods`、`p4_array_higher_order` |
+| Map | `set/get/has/delete/keys/values/length` | `p4_map_methods`。現実装は連結リスト。探索コストと列挙順序は既知の問題18 |
+| 時刻 | `myon.time.now/now_ms/sleep_ms`、ゲームループ用関数 | `p4_time_basic`、`p51_time_frame_helpers` |
+| 乱数 | `myon.random.seed/int/float/secure_int` | `p4_random_basic`。int/float は rand 系、secure_int は OS の乱数源を使う |
+
+`length` は文字列のバイト数、`length_chars` は Unicode コードポイント数です。
+`substring` と `index_of` の位置もコードポイント単位で、書記素クラスタ単位ではありません。
+`upper/lower` は Unicode の大小文字変換を実装していません。
+
+数値関数の戻り値型は関数ごとに異なります。例えば floor/ceil/round/trunc/sign は int、
+sqrt/pow は float を返します。最小 int の絶対値、表現不能な gcd、範囲外の整数変換は
+実行時エラーです。lcm/pow_int のオーバーフローは第2戻り値の error で報告します。
+
+## 非同期処理とネットワーク
+
+async 関数の呼び出しは Task 値を返します。実行は単一スレッドの協調的イベントループで、
+タスクは await・タイマー・I/O 待ちで中断します。CPU 処理のプリエンプションや
+マルチコア並列実行は行いません。
+
+| 機能 | 実装 | 検証例・制約 |
+|---|---|---|
+| POSIX コルーチン | `event_loop.c` の ucontext バックエンド | `p5_async_order`、`p5_async_wait_task` |
+| Windows コルーチン | 同ファイルの Win32 Fiber バックエンド | Windows 実機の Heavy checks |
+| タスクの再帰上限 | `interpreter.c`、`event_loop.h` | `p_async_recursion_limit`、`p_async_depth_isolation` |
+| 完了タスクの回収 | `event_loop.c`、`value.c` | `runtime_memory_tests.c`。スタックと結果ハンドルの寿命を分離 |
+| IPv4 TCP/UDP | `net.c`、`interpreter.c` | `p5_net_tcp_echo`、`p5_net_udp_echo` |
+| ホスト名解決 | `net.c` | `p51_net_dns_localhost`。getaddrinfo を使い、最初の候補を使用 |
+| HTTP 静的配信・ハンドラ | `http.c`、`interpreter.c` | `p5_http_serve_static`、`examples/http_router_server.myon` |
+| HTTP/HTTPS クライアント | `interpreter.c`、`tls.c` | `p_http_url_hardening`、`p_http_long_header_hardening` |
+
+HTTP は接続ごとに1リクエストを扱います。TLS サーバー、HTTP の Keep-Alive、IPv6 は未対応です。
+HTTPS クライアントは TLS 1.2 以降を使い、証明書チェーンと接続先名を検証します。
+OCSP/CRL、ピンニング、クライアント証明書は実装していません。
+検証処理の詳細は言語リファレンス10.8節と `tls.c` にあります。
+
+## C FFI
+
+FFI のローダーは POSIX の dlopen 系と Windows の LoadLibrary 系を使います。
+呼び出しはシグネチャ別の C ラッパーで行い、libffi には依存しません。
+
+| 機能 | 主な実装 | 検証例 |
+|---|---|---|
+| ライブラリ・関数呼び出し | `ffi_platform.c`、`ffi.c`、`ffi_call.c` | `p_ffi_basic`、`p_ffi_close` |
+| 管理メモリブロック・バイト列・整数読み出し | `ffi.c` | `p31_ffi_alloc_free`、`p31_ffi_bytes_crc32`、`p31_ffi_read_i64` |
+| C 文字列の読み出し | `ffi.c` | `p31_ffi_read_cstr` |
+| 型付きの読み書き | `ffi.c` | `p41_ffi_write_typed` |
+| 構造体レイアウト | `ffi.c` | `p41_ffi_struct_dsl` |
+| 配列の一括読み書き | `ffi.c` | `p41_ffi_array_bulk` |
+| C からのコールバック | `ffi_callback.c`、`interpreter.c` | `p41_ffi_callback`。最大4引数・整数/ポインタ系・int64戻り・16スロット |
+
+構造体レイアウトは i32/i64/f32/f64 のリストから計算します。C ヘッダ・ABI を自動検査する機能は
+ありません。管理ブロックの境界検査と、呼び出し先の C コードが行うアクセスは別です。
+生アドレスの不正利用や ABI の不一致ではクラッシュし得ます。
+NUL を含む値には型付き読み書きを使い、str を任意のバイナリ保存領域として扱わないでください。
+
+SDL2、SDL_mixer、SQLite の利用例は `examples/ffi_*` にあります。
+共有ライブラリの配置や型のレイアウトは実行環境で確認する必要があります。
+
+## MVM と実行経路
+
+| 機能 | 実装 |
 |---|---|
-| パッケージマネージャの C 単体テスト | `tests/pkg_unit_tests.c` / `pkg_zip_tests.c` / `pkg_ops_tests.c` |
-| メインスイート（`tests/run_tests.sh`） | `tests/cases/` 以下の `.myon` ケース群（現在 73 ファイル）＋ CLI・パッケージ取り込みの検証 |
-| MVM コンパイラテスト（`tests/mvm_compiler_tests.sh`） | バイトコード生成の検証 |
-| `.myon`／`.myc` 等価性スイート（`tests/run_mvm_tests.sh`） | ツリーウォーク実行と MVM バイトコード実行の出力一致 |
+| AST からのコンパイル・スコープ解決 | `mvm_compiler.c` |
+| 命令と定数・チャンク・MYC1形式 | `mvm_bytecode.h`、`mvm_chunk.c` |
+| オペランドスタック・呼び出しフレーム | `mvm_vm.c` |
+| ネイティブ関数との接続 | `interpreter.h` の `myon_bridge_*` と `interpreter.c` |
+| 上位変数の捕捉 | `UpvalueCell`、`MAKE_CLOSURE`、`LOAD_UPVALUE`、`STORE_UPVALUE` |
+| ジェネリクス | 型消去によるコンパイル |
+| async | タスクごとに VM のオペランド・フレームを保持し、イベントループを共有 |
 
-> **正確なケース数は環境で変わります**：ハーネスは 1 ファイルから複数の
-> アサーションを走らせたり、環境依存ケースを除外したりするため、
-> 「合格件数」はファイル数と一致しません。最新の数値は手元で `make test` を
-> 実行して確認してください。
+外部ファイル・パッケージの module 取り込み、VM 関数値をネイティブ側で実行する
+コールバック、MVM 版 REPL は未対応です。`.myc` 単体の構造体実行には、宣言 AST が
+保存されないことによる制約もあります。MVM 仕様7節を参照してください。
 
-> **環境依存ケースの扱い**：FFI（`libm`/`libz` 等の共有ライブラリを要する）や
-> ネットワーク（ソケットを開く）を伴う一部ケースは、実行環境によってはテスト
-> ハーネスが自動的に除外（excluded）します。除外されたケースは失敗ではなく、
-> 対応ライブラリ・権限のある環境で実行するとパスします。また `.so` 名を
-> ハードコードした FFI ケースは Linux 以外ではスキップされます
-> （`tests/run_tests.sh` の `LINUX_ONLY_SO_CASES`）。
+## パッケージ管理
 
-## Step 0〜18（コア実装）
-
-| ステップ | 内容 | 状態 |
+| 処理 | 実装 | 検査内容 |
 |---|---|---|
-| Step 0 | プロジェクト準備（Makefile・構成・LICENSE） | ✅ |
-| Step 1 | 字句解析器（Lexer） | ✅ |
-| Step 2 | AST 定義 | ✅ |
-| Step 3 | パーサー（変数代入・`myon.print`・式の優先順位） | ✅ |
-| Step 4 | 型システムの基礎（型チェック・キャスト・`myon.nil`） | ✅ |
-| Step 5 | 制御構文（if/elif/else・while・for・break/continue） | ✅ |
-| Step 6 | 関数（`myon.func`・複数戻り値・`error`・`myon.lambda`） | ✅ |
-| Step 7 | 配列（`myon.array`・push/pop/length・インデックスアクセス） | ✅ |
-| Step 8 | スコープ規則と `myon.expose`（ブロックスコープ・シャドーイング禁止） | ✅ |
-| Step 9 | 構造体（`myon.struct`・メソッド・`self`・`myon.extends`） | ✅ |
-| Step 10 | 文字列補間（`"... {式} ..."`） | ✅ |
-| Step 11 | モジュールシステム（`module myon.stdio` などの解決） | ✅ |
-| Step 12 | 整数オーバーフローチェック（実行時エラー） | ✅ |
-| Step 13 | 拡張リテラル（16進/8進/指数表記）と辞書型（`myon.map`） | ✅ |
-| Step 14 | 型推論（単一リテラル代入に限り型注釈省略を許可） | ✅ |
-| Step 15 | ジェネリクス（`myon.struct Box<T>` / `myon.func f<T>`） | ✅ |
-| Step 16 | 標準ライブラリ（`myon.math` / `myon.string`） | ✅ |
-| Step 17 | async/await（実験的・疑似非同期 → Phase5 で協調的イベントループへ本格化） | ✅ |
-| Step 18 | 総合テスト（回帰テストとして `tests/cases/` に集約） | ✅ |
-
-## Phase 2（追加実装 P1〜P7）
-
-| 項目 | 内容 | 状態 |
-|---|---|---|
-| P1 | `()`/`[]` 内の改行を文区切りにしない（複数行の引数リスト） | ✅ 実装 |
-| P2 | `myon.not` の前置専用ルールをドキュメントに明記 | ✅ ドキュメント |
-| P3 | `myon` 単体起動時の対話式実行（REPL） | ✅ 実装 |
-| P4 | ファイル I/O（`myon.file.read`/`write`/`append`/`exists`） | ✅ 実装 |
-| P5 | エラーメッセージの詳細化（列番号・ソース抜粋・`^` マーカー） | ✅ 実装 |
-| P6 | `myon.async`/`myon.await` の実行モデル → 当初は疑似非同期に確定、Phase5 で協調的イベントループへ本格化（OSスレッド化は引き続き不採用） | ✅ 設計確定 |
-| P7 | ジェネリクスの型制約 → 導入しないことに確定 | ✅ 設計確定 |
-
-P1・P3・P4・P5 には対応するテストケース（`tests/cases/p1_multiline_args`,
-`tests/cases/p4_file_io`, `tests/cases/p5_error_detail` ほか）を追加しています。
-P2・P6・P7 は仕様書（`myon_spec.md`）の更新で完了です。
-
-## Phase 3（C FFI — 外部共有ライブラリ呼び出し）
-
-| ステップ | 内容 | 状態 |
-|---|---|---|
-| Step 1 | プラットフォーム抽象化層（`dlopen`/`dlsym`/`dlclose` ラップ、`src/ffi_platform.{h,c}`） | ✅ 実装 |
-| Step 2 | FFI 型・ハンドル管理レイヤ（`src/ffi.{h,c}`） | ✅ 実装 |
-| Step 3 | 呼び出しテーブル（libffi 不使用、引数パターン別 C ラッパー、`src/ffi_call.{h,c}`） | ✅ 実装 |
-| Step 4 | Myon 言語結合（`module myon.ffi`：`load`/`close`/`call_i`/`call_d`/`call_p`/`call_v`） | ✅ 実装 |
-| Step 5 | 回帰テスト・ドキュメント仕上げ | ✅ 実装 |
-
-## Phase 3.1（FFI 拡張 — メモリ確保・文字列デリファレンス・バッファ引数）
-
-| ステップ | 内容 | 状態 |
-|---|---|---|
-| Step 1 | メモリ確保・解放プリミティブ（`myon.ffi.alloc` / `myon.ffi.free`、`src/ffi.{h,c}`） | ✅ 実装 |
-| Step 2 | sig シグネチャへの `'b'`（バッファ／ブロックID引数）追加、out 引数対応 | ✅ 実装 |
-| Step 3 | 文字列デリファレンス（`myon.ffi.read_cstr`、`ffi_read_cstring`） | ✅ 実装 |
-| Step 4 | バイト列読み書き（`myon.ffi.write_bytes` / `read_bytes`）＋ `read_i64` ヘルパー | ✅ 実装 |
-| Step 5 | 安全性の見直しとドキュメント整備 | ✅ 実装 |
-| Step 6 | 実地検証（`sqlite3_open`）とテスト追加 | ✅ 実装 |
-
-Phase 3.1 では、Myon 側から C に渡すための生メモリ領域を確保・解放できる
-`myon.ffi.alloc` / `myon.ffi.free`、確保したブロックを sig `'b'` で C 関数へ渡す
-仕組み（`sqlite3_open` のような「出力引数」対応）、`const char*` の戻り値を Myon の
-`str` に読み出す `myon.ffi.read_cstr`、確保ブロックへのバイト列読み書き
-`myon.ffi.write_bytes` / `myon.ffi.read_bytes`、および出力引数として書き込まれた
-ポインタ値を取り出す `myon.ffi.read_i64`（リトルエンディアン int64）を追加しました。
-回帰テストは環境非依存の `libz` を用い、文字列デリファレンス（`tests/cases/p31_ffi_read_cstr`）、
-バイト列書き込み＋`crc32`（`tests/cases/p31_ffi_bytes_crc32`）、`read_i64`
-（`tests/cases/p31_ffi_read_i64`）、純粋なメモリ管理（`tests/cases/p31_ffi_alloc_free`）
-をカバーします。文字列を返す C 関数の例は `examples/ffi_zlib_version.myon`、出力引数
-（`sqlite3_open`）の例は `examples/ffi_sqlite_open.myon` にあります（後者は `libsqlite3` が
-必要なため `examples/` のみ）。
-
-> str型はNUL終端の `char*` として表現されるため、`write_bytes` / `read_bytes` は
-> NULバイトを含むデータでは途切れる（バイナリセーフではない）という既知の制約が
-> あります。詳細は仕様書 10.3.1 節を参照してください。
-
-`module myon.ffi` を宣言すると、ビルド済みの共有ライブラリ（Linux の `.so` など）に
-含まれる C 関数を実行時に呼び出せます。対応する値の型は `int` / `float` / ポインタ（`int`
-として表現）/ `str` の4種類で、構造体の値渡し・値返しは対象外です。
-対応 OS は **Linux / macOS / \*BSD（`dlopen` 系）と Windows（`LoadLibraryA` 系）**
-で、それ以外では `myon.ffi.load` が「FFI is not supported on this platform」の
-`error` を返すスタブになります（当初は Linux のみで、Windows は Phase 6、
-macOS / \*BSD は `src/platform.h` 導入時に対応しました）。詳細と制約は
-仕様書 [`myon_spec.md`](myon_spec.md) の「10.3 C FFI」節を参照してください。
-テストは環境非依存の `libm`（数学ライブラリ）を用います（`tests/cases/p_ffi_basic`,
-`tests/cases/p_ffi_load_fail`, `tests/cases/p_ffi_close`）。SDL2 を使った非対話デモは
-`examples/ffi_sdl_window.myon` に置いてあります（回帰テストには含めません）。
-
-## Phase 3.5（`myon.math` / `myon.string` 拡張）
-
-Step 16 で最小実装した標準ライブラリ `myon.math` / `myon.string` を、実用的な
-ラインナップへ拡張・修正しました。
-
-| ステップ | 内容 | 状態 |
-|---|---|---|
-| Step 1 | 数値型保持ルールの統一（`max`/`min`/`floor`/`ceil` を int/float パスへ分岐、`both_int` ヘルパー、2^53超の int64 を正確に扱う） | ✅ 実装 |
-| Step 2 | UTF-8 文字数（コードポイント数）を返す `myon.string.length_chars` を新設（`utf8_char_count`）。`length` は後方互換のためバイト数のまま維持 | ✅ 実装 |
-| Step 3 | `myon.math` フルセット（三角/逆三角/`atan2`・`log`/`log2`/`log10`/`exp`・`round`/`trunc`/`mod`/`sign`/`clamp`・`pi`/`e`） | ✅ 実装 |
-| Step 4 | `myon.string` フルセット（`substring`/`split`/`join`/`trim`/`replace`/`index_of`/`starts_with`/`ends_with`/`repeat`/`to_int`/`to_float`/`from_int`/`from_float`、`utf8_byte_offset`） | ✅ 実装 |
-| Step 5 | 回帰テスト・ドキュメント整備 | ✅ 実装 |
-
-数値関数は「全引数が int なら int、1つでも float なら float」という暗黙昇格ルールに
-統一しました。整数のまま意味が保たれる関数（`abs`/`max`/`min`/`floor`/`ceil`/`round`/
-`trunc`/`mod`/`sign`/`clamp`）は `double` を経由せず、`2^53` を超える `int64` 値でも
-丸め誤差なく扱えます。文字列関数の `length` は **バイト数**（`strlen` 相当。既存動作を
-維持）、`length_chars` は **文字数**（Unicode コードポイント数）を返し、
-`substring` / `index_of` など索引系は全て **文字数ベース**（UTF-8 マルチバイト
-安全）です。`mod` / `substring` / `repeat` / `to_int` / `to_float` はゼロ除算・範囲外・
-パース失敗を `(value, error)` の2値で返します。回帰テストは
-`tests/cases/p35_math_int_precision`（境界値精度）、`p35_math_full`（数学フルセット）、
-`p35_string_utf8_length`（文字数/バイト数）、`p35_string_full`（文字列フルセット）で
-カバーします。全関数のシグネチャは仕様書
-[`myon_spec.md`](myon_spec.md) の「10.4 標準ライブラリ myon.math /
-myon.string（Phase3.5）」節にまとめてあります。
-
-## Phase 4（`myon.array` / `myon.map` メソッド拡充、`myon.math` 整数演算、`myon.time` / `myon.random` 新設）
-
-コレクション型のメソッドを実用的なラインナップへ拡充し、大きな整数の冪乗を正確に
-計算する整数演算と、時刻取得・乱数生成の新規モジュールを追加しました。
-
-| ステップ | 内容 | 状態 |
-|---|---|---|
-| Step 1 | `myon.array` に `sort` / `sort_desc` / `reverse` / `contains` / `index_of` / `slice` を追加（`sort`系は破壊的、`qsort`＋型判定`compar`、`slice`は範囲外を`error`） | ✅ 実装 |
-| Step 2 | `myon.map` に `keys` / `values` / `length` を追加（`MapEntry`連結リストを走査、順序保証なし） | ✅ 実装 |
-| Step 3 | `myon.array` に高階関数 `map` / `filter` / `reduce` を追加（`myon.lambda`対応、既存`call_function`を再利用） | ✅ 実装 |
-| Step 4 | `myon.math` に整数演算 `gcd` / `lcm` / `pow_int` を追加（繰り返し二乗法・オーバーフロー検出、`double`非経由で`2^62`も正確） | ✅ 実装 |
-| Step 5 | 新規モジュール `myon.time`（`now` / `now_ms` / `sleep_ms`） | ✅ 実装 |
-| Step 6 | 新規モジュール `myon.random`（`seed` / `int` / `float`、初回自動シード、`rand()`ベース） | ✅ 実装 |
-| Step 7 | ドキュメント整備・回帰テスト追加 | ✅ 実装 |
-
-`myon.array` は `sort` / `sort_desc` / `reverse`（破壊的）、`contains` / `index_of` /
-`slice`（非破壊）、および `map` / `filter` / `reduce`（`myon.lambda` を取る高階関数）を
-備えます。`myon.map` は `keys` / `values` / `length` で中身を列挙できます（順序は保証
-しないため、必要なら返り配列を `sort()` してから使います）。`myon.math.pow_int` は
-`double` を経由しないため `2^62`（`4611686018427387904`）のような大きな整数冪も桁落ち
-なく計算でき、負指数・オーバーフローは `error` を返します。`myon.time` は UNIX エポック
-秒/ミリ秒の取得とスリープ、`myon.random` は `srand`/`rand` を薄くラップした乱数生成を
-提供します（**暗号学的に安全ではありません**）。回帰テストは
-`tests/cases/p4_array_methods`（sort/reverse/contains/index_of/slice）、
-`p4_array_higher_order`（map/filter/reduce）、`p4_map_methods`（keys/values/length、
-順序非依存）、`p4_math_integer`（gcd/lcm/pow_int）、`p4_time_basic`・`p4_random_basic`
-（時刻・乱数は不変条件のみ検証し `.out` を決定的化）でカバーします。全シグネチャは
-仕様書 [`myon_spec.md`](myon_spec.md) の「7.1 配列メソッド」「14.2 辞書/マップ型」
-「10.4 myon.math」「10.5 myon.time」「10.6 myon.random」各節を参照してください。
-
-## Phase 4.1（GUI/ゲーム制作向け FFI 拡張 — 型付き書き込み・構造体レイアウト DSL・配列一括読み書き・コールバック）
-
-SDL/OpenGL のような GUI・ゲームライブラリを実用的に FFI から叩けるよう、Phase3.1
-までの「単純な値渡し＋バイト列」を4系統で拡張しました。いずれも C 側のヘッダは
-一切読まず、Myon 側が申告したレイアウト・型をそのまま信じる方針（Phase3 以来）です。
-
-| ステップ | 内容 | 状態 |
-|---|---|---|
-| Step 1 | 型付きメモリ書き込み `myon.ffi.write_i64`/`write_i32`/`write_f64`/`write_f32`（NULバイトを含む値も欠落なく書ける、`ffi_mem_write_*`） | ✅ 実装 |
-| Step 2 | 構造体レイアウト DSL `myon.ffi.struct_def`/`struct_alloc`/`struct_write`/`struct_read`（自然アライメント・末尾パディング自動計算、`ffi_struct_define`ほか） | ✅ 実装 |
-| Step 3 | 配列一括読み書き `myon.ffi.write_array_*`/`read_array_*`（i32/i64/f32/f64、`ffi_mem_write_array_*`/`ffi_mem_read_array_*`） | ✅ 実装 |
-| Step 4 | コールバック関数ポインタ（限定版）`myon.ffi.make_callback`/`free_callback`（libffi 不使用、静的トランポリン、`src/ffi_callback.{h,c}`） | ✅ 実装 |
-| Step 5 | 仕様書 10.3.2 節を追加 | ✅ 実装 |
-| Step 6 | 回帰テスト追加（`p41_*`、コールバックは fixture の `.so` を事前ビルド） | ✅ 実装 |
-| Step 7 | README 更新・`SDL_Rect` サンプル追加 | ✅ 実装 |
-
-型付き書き込みは値の生バイト列をリトルエンディアンで直接書き込むため、`int` の
-エンコードに NUL バイトが混ざっても途切れません（`write_bytes` の制約を解消）。
-構造体レイアウト DSL は `["i32","i32","i32","i32"]` のような型リストから各フィールドの
-オフセットと合計サイズを自動計算し、C のデフォルト構造体パディング（自然アライメント＋
-末尾パディング）に従います（`SDL_Rect` はパディングなしで16バイト、`i32`/`i64` 混在は
-自動でパディング）。`struct_read` の戻り値スカラー型はフィールド型から実行時に決まります
-（Myon のタプル返却が型なし配列パックのため単一関数で自然に扱える、という設計判断）。
-配列一括読み書きは頂点/色配列のような同型データを1回の呼び出しでやり取りします。
-コールバックは **引数最大4個・int64/ptr のみ・戻り値 int64 のみ・同時16スロット** の
-限定スコープで、libffi の closure を使わず静的トランポリン関数群を介して Myon 関数を
-呼び返します（シングルスレッド前提）。
-
-回帰テストは `tests/cases/p41_ffi_write_typed`（型付き書き込みの roundtrip、NUL バイトを
-含む値を明示）、`p41_ffi_struct_dsl`（i32 のみ／i32・i64 混在パディング）、
-`p41_ffi_array_bulk`（配列 roundtrip＋範囲外エラー）、`p41_ffi_callback`（C→Myon コール
-バック、スロット再利用）でカバーします。コールバックテストは CI 再現性のため
-`tests/fixtures/ffi_callback_test.c` を `tests/run_tests.sh` が実行前に `.so` へビルド
-します。構造体 DSL を使った `SDL_Rect` の組み立て例は `examples/ffi_sdl_rect.myon` に
-あり、SDL2 が無い環境でも構造体の組み立て・確認部分は独立して動作します。全シグネチャ
-と設計判断は仕様書 [`myon_spec.md`](myon_spec.md) の「10.3.2 GUI/ゲーム制作
-向け FFI 拡張（Phase4.1）」節を参照してください。
-
-## Phase 5（async/await 本格化 — 協調的イベントループ・`myon.net`・`myon.http`）
-
-Step17 の「疑似非同期（呼び出し即同期実行）」を廃止し、シングルスレッドの
-**協調的イベントループ**（`ucontext` ベースのコルーチン、`src/event_loop.{h,c}`）へ
-置き換えました。あわせて低水準ソケット `myon.net`（TCP/UDP）と、その上に構築した
-簡易 HTTP モジュール `myon.http`（静的配信／ルーティングサーバー＋自前 TCP クライアント）
-を追加しています。本物の OS スレッド化は Phase2 P6 の判断どおり採用せず（`refcount` の
-スレッドセーフ化が必要で侵襲が大きすぎるため）、切り替えは `await`／I/O 待ち地点のみで
-起こる協調的マルチタスク（Python asyncio / JS async-await と同じモデル）です。
-
-| ステップ | 内容 | 状態 |
-|---|---|---|
-| Step 1 | イベントループ基盤（`ucontext` コルーチン・`select(2)` 多重化・spawn/await/sleep/IO待ち、`src/event_loop.{h,c}`） | ✅ 実装 |
-| Step 2 | インタプリタ統合（`TYPE_TASK`/`OBJ_TASK`、`is_async` 関数が Task 値を返す、`EXPR_AWAIT` の本実装、トップレベルも1タスク化） | ✅ 実装 |
-| Step 3 | `myon.time.sleep_ms` の非同期対応（コルーチン内は `event_loop_sleep_ms`、同期文脈はブロッキングにフォールバック） | ✅ 実装 |
-| Step 4 | 新規モジュール `myon.net`（`tcp_socket`/`udp_socket`/`bind`/`listen`/`local_port`/`accept`/`connect`/`send`/`recv`/`send_to`/`recv_from`/`close`、ノンブロッキング＋協調待機、`src/net.{h,c}`） | ✅ 実装 |
-| Step 5 | 新規モジュール `myon.http`（`serve_static`/`serve`/`get`/`post`、HTTP/1.0・自前 TCP クライアント、`src/http.{h,c}`） | ✅ 実装 |
-| Step 6 | 仕様書更新（14.9 実行モデル書き換え・10.7 `myon.net`・10.8 `myon.http`・15 Open Questions） | ✅ 実装 |
-| Step 7 | 回帰テスト追加（`p5_async_order`／`p5_net_tcp_echo`／`p5_net_udp_echo`／`p5_http_serve_static`、いずれも自己完結でCI非依存） | ✅ 実装 |
-| Step 8 | README 更新・サンプル追加（`http_static_server`／`http_router_server`／`net_game_echo`） | ✅ 実装 |
-
-各ソケットは常にノンブロッキング（`O_NONBLOCK`）で作られ、`myon.async` 関数の中から
-呼ぶと would-block 時に自動でイベントループへ制御を譲り、他のタスクへ切り替わります。
-`myon.async` を使わないトップレベル（同期文脈）から呼んだ場合は、単一 fd の `select()`
-による同期待機にフォールバックするため、後方互換的な単純スクリプトでもそのまま使えます。
-`myon.http.serve_static`/`serve` の accept ループはデーモンタスクとしてマークされ、
-プログラム終了時のドレイン処理では無視されるため、サーバーを起動しつつ別タスクで
-クライアント処理をして終了する自己完結スクリプトがハングせず終了します。
-
-回帰テストは `tests/cases/p5_async_order`（3タスクが sleep 時間の短い順＝spawn 順とは
-異なる順で完了することを検証）、`p5_net_tcp_echo` / `p5_net_udp_echo`（同一プロセス内で
-サーバー役・クライアント役を両方 `myon.async` タスクとして立て、ポート0＋`local_port`
-で衝突を避けつつ1往復のエコーを検証）、`p5_http_serve_static`（`serve_static` を
-デーモンタスクとして起動しつつ `myon.http.get` で取得、ステータス・本文を検証）で
-カバーします。いずれも外部プロセス（`nc`/`curl`）に依存しない自己完結テストです。
-サンプルは `examples/http_static_server.myon`（`python -m http.server` 相当の静的配信）、
-`examples/http_router_server.myon`（パスに応じて分岐するルーティング＋404）、
-`examples/net_game_echo.myon`（UDP による1対1の座標 echo デモ）に置いてあります
-（常駐サーバー／ネットワークI/Oを伴うため回帰テストには含めません）。全シグネチャと
-実行モデルの詳細は仕様書 [`myon_spec.md`](myon_spec.md) の「14.9 並行処理・
-非同期処理」「10.7 ネットワーク myon.net」「10.8 HTTP myon.http」各節を参照してください。
-
-## Phase 5.1（ネットワーク実用化／ゲーム制作支援／多重代入のスコープ解決バグ修正）
-
-| ステップ | 内容 | 状態 |
-|---|---|---|
-| Step 1〜3 | 多重代入のスコープ解決バグ修正（`x, y = ...` が外側スコープの既存変数を更新せず誤ってローカルへシャドウしていた不具合を修正。単純代入と多重代入で共通ヘルパー `assign_or_define()` を使うようリファクタし、`{ }` ブロック内での多重代入シャドウイングも単純代入同様に禁止。仕様書 9.2 更新・回帰テスト `p51_scope_multi_assign_outer` / `p51_scope_multi_assign_shadow_forbidden` 追加） | ✅ 実装 |
-| Step 4〜5 | DNS 名前解決（`src/net.c` の `fill_addr()` を `getaddrinfo()` ベースへ書き換え。IPv4 リテラルは従来どおり `inet_pton()` の高速パスを維持し、ホスト名は `getaddrinfo()` で解決。`myon.net.connect`/`bind`/`send_to` がホスト名を受け付けるようになった。回帰テスト `p51_net_dns_localhost` 追加＝ループバックのみで CI 安全） | ✅ 実装 |
-| Step 6 | HTTPS/TLS 対応（新規 `src/tls.{h,c}` に OpenSSL の薄いラッパを実装し、`myon.http.get`/`post` が `https://` URL で TLS ハンドシェイクを行うよう分岐。SNI＋システム既定トラストストアによる証明書検証をベストエフォートで有効化。Makefile に `-lssl -lcrypto` を追加＝OpenSSL 開発パッケージが必須依存に。デモ `examples/http_https_get.myon` 追加） | ✅ 実装 |
-| Step 7〜9 | SDL_Event 読み取り支援（out 方向の構造体読み取りの実証）。`myon.ffi.read_i32`（4バイト読み出し、`write_i32` と対称）を追加し、`SDL_PollEvent(SDL_Event *)` で書き戻されたイベント種別（offset 0 の `Uint32 type`）等を読めるように。デモ `examples/ffi_sdl_event_loop.myon`、仕様書に SDL_Event レイアウト・オフセット・既知の制約を追記 | ✅ 実装 |
-| Step 10〜11 | ゲームループヘルパー（`myon.time.frame_start()` / `myon.time.frame_wait(frame_start_ms, target_fps)`）。毎フレームの dt 計算と目標 FPS 維持のためのスリープを定型化。`target_fps<=0` は FPS 制限なし。回帰テスト `p51_time_frame_helpers` 追加 | ✅ 実装 |
-| Step 12 | SDL_mixer オーディオ（FFI 経由）。`libSDL2_mixer` を `myon.ffi` から叩き、`SDL_Init(AUDIO)`→`Mix_OpenAudio`→`Mix_LoadWAV`→`Mix_PlayChannel`→後片付け、の流れを示すデモ `examples/ffi_sdl_audio.myon`（＋テスト用 `examples/beep.wav`）を追加。オーディオデバイスの無い環境では `Mix_OpenAudio` の失敗を検知してクラッシュせず終了。C 実装の追加はなく examples のみ | ✅ 実装 |
-
-多重代入（`x, y = pair()`）は従来、関数内で使うと外側スコープに同名変数が
-存在しても更新せず、関数ローカルに新しいシャドウ変数を作ってしまうバグが
-ありました（関数を抜けると外側変数が更新されない不整合）。単純代入が正しく
-実装していた spec 9.2 の解決規則（現在スコープに束縛があれば更新／外側に
-あればブロック内はシャドウ禁止・非ブロックは外側を更新／どこにも無ければ
-新規定義）を、単純代入・多重代入の両方から呼べる共通ヘルパー
-`assign_or_define()`（`src/interpreter.c`）に集約し、両者が再び乖離しない
-ようにしました。`myon.expose` は仕様 9.1 で「1階層だけ外側へ公開する」
-機能と定めているため、本修正の対象外（コード内コメントで明記）です。
-
-Phase 5.1 では加えて、`myon.net`／`myon.http` の実用性を高める2点を実装
-しました。**(1) DNS 名前解決**：`src/net.c` の `fill_addr()` を
-`getaddrinfo()` ベースへ書き換え、`myon.net.connect(sock, "example.com", 80)`
-のようにホスト名で接続できるようにしました（IPv4 リテラルは従来どおりの
-高速パスを維持）。**(2) HTTPS/TLS**：新規 `src/tls.{h,c}` に OpenSSL の
-薄いラッパ（`SSL_CTX_new`→`SSL_new`→`SSL_set_fd`→`SSL_connect`→
-`SSL_read`/`SSL_write`→`SSL_shutdown`）を実装し、`myon.http.get`/`post` が
-`https://` URL に対して TLS ハンドシェイクを行うよう分岐させました。SNI と、
-システム既定の証明書ストアに対する証明書検証・ホスト名照合を有効にしています
-（詳細は [`myon_spec.md`](myon_spec.md) の 10.7／10.8 節を参照）。
-
-> **セキュリティ（後の堅牢化で更新済み）**：Phase 5.1 当初の TLS クライアントは
-> 「ベストエフォートの検証」でしたが、その後の堅牢化フェーズで
-> **フェイルクローズ（検証に失敗したら接続を閉じる）** に変更されました。
-> 現在の保証内容は後述の「ネットワーク層の堅牢化」節と
-> [`myon_spec.md`](myon_spec.md) 10.8 節を参照してください。
-
-Phase 5.1 ではさらにゲーム制作支援として、**(3) SDL_Event の読み取り**
-（`myon.ffi.read_i32` の追加による out 方向構造体読み取り、
-`examples/ffi_sdl_event_loop.myon`）、**(4) ゲームループヘルパー**
-（`myon.time.frame_start` / `frame_wait` による dt 計算と FPS 制御）、
-**(5) SDL_mixer オーディオ**（FFI 経由での効果音・BGM 再生、
-`examples/ffi_sdl_audio.myon`）を実装しました。オーディオ再生は新しい C
-モジュールを増やさず、既存の `myon.ffi` から `libSDL2_mixer` を叩く方式です。
-`SDL_Init(AUDIO)`→`Mix_OpenAudio`→`Mix_LoadWAV`→`Mix_PlayChannel`→
-`Mix_FreeChunk`/`Mix_CloseAudio` の流れを示し、オーディオデバイスの無い環境
-（CI コンテナ等）では `Mix_OpenAudio` の失敗を検知してクラッシュせず終了します。
-
-> **実行時の任意依存**：SDL 系のデモ（`examples/ffi_sdl_*.myon`）を実行する
-> には `libSDL2-2.0.so.0` が、オーディオデモ `examples/ffi_sdl_audio.myon`
-> にはさらに `libSDL2_mixer-2.0.so.0` が必要です（Debian/Ubuntu では
-> `sudo apt-get install libsdl2-2.0-0 libsdl2-mixer-2.0-0`）。これらは FFI で
-> 実行時に読み込まれる**任意依存**であり、Myon 本体のビルドには不要です
-> （未インストールの環境ではデモがその旨を表示してスキップします）。
-
-## Phase 5.2（クリーンビルド修正／再帰スタックオーバーフロー対策／セキュリティ監査）
-
-| ステップ | 内容 | 状態 |
-|---|---|---|
-| Step 1 | `src/tls.c` のインクルード漏れ修正（`tls_connect()` が `fd_set`／`FD_ZERO`／`FD_SET`／`select()` を使うのに `<sys/select.h>` を include しておらず、クリーンな環境では未定義型・暗黙宣言でビルドが壊れる不具合。`event_loop.c`／`interpreter.c` と同様に `#include <sys/select.h>` を1行追加。`build/` を消してからの再ビルドを `-Wall -Wextra -Wpedantic -Wimplicit-function-declaration` で警告ゼロ確認） | ✅ 実装 |
-| Step 2 | 再帰深度リミット追加（スタックオーバーフロー対策）。ツリーウォーク型評価器は Myon の関数呼び出しをそのまま C の呼び出しスタックに乗せるため、深い再帰（約15,000〜20,000段）が C スタックを溢れさせ、診断を出す間もなく OS に `SIGSEGV`（exit 139）で殺されていた。`src/interpreter.c` の `call_function()` にネスト深度カウンタ `Interp.call_depth` を追加し、上限 `#define MYON_MAX_CALL_DEPTH 4000`（マジックナンバー直書き禁止・1箇所定義）を超えたら Step12 の整数オーバーフロー検出と同じ実行時エラー機構（`diag` による行番号・ソース抜粋付き、`exit 1`）で「call stack too deep」を報告し、クラッシュさせずに終了。カウンタは正常 return 経路で必ずデクリメントし、`runtime_error` の `longjmp` で飛ぶ経路はトップレベルの `setjmp` バリア（`interp_run`／`interpret`）で `call_depth=0` にリセット。コルーチン境界（`async`／HTTP コネクション）は独立した C スタックのため深度を save/reset/restore、FFI コールバックは同一 C スタック上なので save/restore（末尾再帰最適化はスコープ外）。回帰テスト `tests/cases/p52_recursion_limit.{myon,err}` 追加 | ✅ 実装 |
-| Step 3 | 一般セキュリティ監査（`src/` 全体）。`-Wimplicit-function-declaration` を明示有効化してクリーンビルド警告ゼロを確認。`valgrind --leak-check=full` を全56＋新規テストで実施し、今回追加した再帰チェック経路が新たな definite/indirect リークを生まないことを確認。バッファ境界・整数オーバーフロー・TLS 検証ロジック・エラーパスのリソースリークを目視監査（詳細は下記） | ✅ 実装 |
-| Step 4 | 監査で見つかった小修正：HTTP リクエストボディ長の上限追加（`src/interpreter.c` の `http_read_request()`。攻撃者が制御できる `Content-Length` により無制限の `myon_xrealloc` が走り、`Content-Length: 999999999999` 等でメモリを枯渇させられる DoS を防止。ヘッダ既存の 1 MiB 上限に倣い 16 MiB を上限に設定） | ✅ 実装 |
-
-Phase 5.2 は、実際にクリーンな環境（Ubuntu 24.04 + `libssl-dev`）で
-`make` → `make test` → valgrind で検証した際に見つかった **2件の具体的な
-不具合**の修正と、同種の問題が他に潜んでいないかの**一般監査**です。
-
-**(1) `tls.c` のインクルード漏れ**：`tls_connect()` は非ブロッキング
-ハンドシェイクの完了待ちに `select(2)` を使いますが、`<sys/select.h>` を
-include していなかったため、ヘッダの暗黙依存に頼れないクリーンな環境で
-`fd_set` が未定義型となりビルドが壊れていました。1行の include 追加で解消し、
-`build/` を消してからの再ビルドで警告ゼロを確認しています。
-
-**(2) 再帰スタックオーバーフロー**：ツリーウォーク型評価器は Myon の関数
-呼び出しを C の呼び出しスタックへ直接積むため、深い再帰がそのまま C スタック
-オーバーフローに直結し、`SIGSEGV`（exit 139）でプロセスが落ちていました。
-インタプリタ側に深度チェックが無かったのが原因です。`Interp.call_depth` で
-ネスト深度を追跡し、上限を超えたら Step12 の整数オーバーフロー
-チェックと同じ体裁の実行時エラー（行番号・ソース抜粋付き、`exit 1`）で
-丁寧に終了します。`runtime_error` は `longjmp` でトップレベルまで巻き戻る
-ため深いフレームのデクリメントは走りませんが、その場合はトップレベルの
-`setjmp` バリアで `call_depth` を 0 にリセットして辻褄を合わせています。
-
-なおこの上限は当初 `MYON_MAX_CALL_DEPTH` = 4000 の固定値で、既定 8 MiB の C
-スタックを前提にしていました。しかし `ulimit -s 1024`／`2048` の環境や
-サニタイザビルドでは実容量が 4000 フレームに届かず、**ガードが発動する前に
-SIGSEGV になる**という欠陥が残っていました（known-issues #8/#9 として修正）。
-現在は `myon_max_call_depth()` が `getrlimit(RLIMIT_STACK)` から実際の
-スタック上限を読み、1 フレームあたりの実測ベースの予算（-O2 で 2 KiB、
-サニタイザビルドで 8 KiB）とヘッドルーム 1/4 を差し引いて上限を算出します。
-`MYON_MAX_CALL_DEPTH` は「固定の上限」から「上限のクランプ値」に役割が
-変わり、下限は `MYON_MIN_CALL_DEPTH`（64）で確保しています。
-
-**一般監査の結果**：
-
-- **インクルード漏れの横展開**：`-Wall -Wextra -Wpedantic
-  -Wimplicit-function-declaration` でクリーンビルドし、`tls.c` 以外に暗黙宣言
-  警告が出るファイルは無いことを確認（警告ゼロ）。
-- **メモリ安全性**：全テストケースを `valgrind --leak-check=full` で実行。
-  今回追加した再帰チェック経路（深い再帰でエラー終了する経路を含む）で
-  `definitely lost`／`indirectly lost` は 0 バイトであることを確認しました。
-- **バッファ境界**：`http.c` のリクエストパースは、メソッドを固定長バッファへ
-  コピーする箇所でサイズをクランプし、パス・ボディは動的確保（`dupn`）、
-  ヘッダは 1 MiB 上限、ディレクトリトラバーサル（`..`）・制御バイトを拒否
-  しており堅牢でした。唯一、`http_read_request()` のボディ確保が
-  `Content-Length` を無制限に信頼していたため、上限（16 MiB）を追加しました
-  （上記 Step 4）。`ffi_call.c`／`net.c` の受信・引数コピーは境界チェック済みでした。
-- **整数オーバーフロー**：`myon.ffi.alloc`／`ffi_mem_alloc` は `size<=0` を弾き
-  `malloc` 失敗を検知、`ffi_struct_define` の合計サイズ計算はフィールド数が
-  ソース由来で現実的に小さく `long long` を溢れさせないことを確認しました。
-- **TLS 証明書検証**：`tls.c` は `SSL_VERIFY_PEER` ＋ `SSL_set1_host()` により
-  信頼できない証明書チェーン・ホスト名不一致で `SSL_connect` が失敗します。
-  エラーを握りつぶしてハンドシェイク成功扱いにする分岐は無く、検証ロジックに
-  論理バグは見当たりませんでした（IP／空ホスト時にホスト名照合を省くのは
-  仕様どおりの挙動）。（TLS 実装の全面的な堅牢化は本フェーズではスコープ外としたが、
-  後の「ネットワーク層の堅牢化」フェーズで実施済み。）
-- **エラーパスでのリソースリーク**：`ffi.c` の `load`/`close`（失敗時にハンドルを
-  残さず、`close` 済みスロットは NULL 化して二重 close/use-after-free を防止）、
-  `net.c` のソケット生成失敗パス（`getaddrinfo` の `freeaddrinfo`、登録失敗時の
-  `close(fd)`）はいずれも漏れなく後片付けしており、修正不要でした。
-
-### 既知の課題（対応見送り）
-
-- **エラー時（`longjmp`）のスタック巻き戻しで放棄されるメモリ**：Myon の実行時
-  エラーは `runtime_error()` が `longjmp` でトップレベルの `setjmp` バリアまで
-  一気に巻き戻す設計です。このため、エラーで終了するプログラム（`*.err` テスト
-  や深い再帰のリミット到達など）では、途中のスタックフレームが確保した
-  `call_env` や一時 `Value` が解放されずに残ります。valgrind 上は
-  `definitely/indirectly lost` として計上されますが、これは **Phase 5.2 以前
-  から存在する既存の設計上の性質**（同一の挙動を修正前コードでも確認済み）で
-  あり、プロセス終了時に OS が回収するため実害はありません。恒久対策には
-  各フレームに登録ベースのクリーンアップ（デストラクタチェーン／アリーナ
-  アロケータ）を導入する設計変更が必要で規模が大きいため、Phase 2 の P6/P7 と
-  同様に **本フェーズでは着手しない**と判断しました。
-- **TLS クライアントの堅牢化**（→ **後のフェーズで実施済み**）：
-  Phase 5.2 時点では `tls.c` はベストエフォート実装で、失効確認（OCSP/CRL）や
-  ピンニング等の強化はスコープ外としていました。その後の
-  「ネットワーク層の堅牢化」フェーズでフェイルクローズな検証へ置き換え済みです
-  （下記参照）。OCSP/CRL・ピンニング・クライアント証明書は引き続き非対応です。
-
-## Phase 6（Windows 対応 — FFI / ネットワーク / イベントループのクロスプラットフォーム化）
-
-Linux 専用だった実行時レイヤ（C FFI・ソケット・協調的イベントループ）を、
-`_WIN32` 分岐によって Windows でも動作するよう移植しました。言語仕様・
-ツリーウォーク実行の挙動は Linux と共通で、プラットフォーム依存部のみを
-差し替える方針です。ビルド手順は README の「Windows でのビルド」節に、実装詳細と
-プラットフォーム抽象化の設計は仕様書 [`myon_spec.md`](myon_spec.md)
-の 10.3（C FFI）・10.7（`myon.net`）・14.9（並行処理・イベントループ）各節に
-まとめてあります。
-
-| ステップ | 内容 | 状態 |
-|---|---|---|
-| Step 1 | C FFI の Windows 実装（`LoadLibraryA`/`GetProcAddress`/`FreeLibrary`、`src/ffi_platform.c` の `_WIN32` 分岐。`myon.ffi.load`/`close`/`call_*` が Windows DLL に対して動作） | ✅ 実装（クロスコンパイルまで検証） |
-| Step 2 | `myon.net` の Windows 実装（Winsock2 = `ws2_32`。`src/net.c` の `_WIN32` 分岐で `SOCKET`／`WSAStartup`/`WSACleanup`／`WSAGetLastError` を扱い、`SOCKET`(64bit) と `int` fd の橋渡しを局所化） | ✅ 実装（クロスコンパイルまで検証） |
-| Step 3 | 協調的イベントループの Windows 実装（`ucontext` の無い Windows では **Win32 Fiber API**＝`CreateFiber`/`SwitchToFiber`/`ConvertThreadToFiber` でコルーチンを実装。`src/event_loop.c` の `#elif defined(_WIN32)` 分岐、`MYON_EVENT_LOOP_FIBER`） | ✅ 実装（クロスコンパイル~Wine実行まで検証） |
-
-## Phase 7（MVM — Myon Virtual Machine バイトコード VM）
-
-ツリーウォーク型インタプリタに加えて、`.myon` を **MVM（Myon Virtual Machine）
-バイトコード**（`.myc`、マジック `MYC1`）へコンパイルし、スタックマシン型の
-バイトコード VM で実行する経路を追加しました。`.myon`（ツリーウォーク）実行の
-挙動は従来と一切変わりません。バイトコード仕様は
-[`mvm_spec.md`](mvm_spec.md)、CLI と実行モデルは
-[`myon_spec.md`](myon_spec.md) の 12.0 節に記載しています。
-
-| ステップ | 内容 | 状態 |
-|---|---|---|
-| Step 4 | MVM バイトコード仕様策定（[`mvm_spec.md`](mvm_spec.md) を新規作成：スタックマシン・命令セット・`.myc` フォーマット・静的スコープ解決） | ✅ 設計 |
-| Step 5 | AST→バイトコードコンパイラ（`src/mvm_compiler.{h,c}`、`src/mvm_chunk.{h,c}`、`src/mvm_bytecode.h`。`--compile` で `.myc` を書き出す） | ✅ 実装 |
-| Step 6 | バイトコード VM ランタイム（`src/mvm_vm.{h,c}`。`.myc` の読み込み → スタックマシン実行） | ✅ 実装 |
-| Step 7-a | CLI フラグ体系の最終確定（`--compile`/`-o`/`--dump-bytecode`/`--run-mvm`、ファイル引数の MYC1 マジック／拡張子による振り分け。`src/main.c`） | ✅ 実装 |
-| Step 7-b | `.myon`／`.myc` の等価性検証スイート（`tests/run_mvm_tests.sh`：同一ソースをツリーウォークと MVM の両経路で実行し出力一致を検証、対応済み機能のケースを対象） | ✅ 実装 |
-| Step 7-c | Windows ビルドの整備・検証（Makefile の `win-cross` ターゲット、MinGW-w64 クロスコンパイルでの `myon.exe` リンク確認） | ✅ 実装（クロスコンパイルまで検証） |
-| Step 7-d | README・仕様書の総仕上げ（実装状況表への Phase 6/7 追記、`mvm_spec.md` と実装のずれ解消、既知の制限の最終整理） | ✅ ドキュメント |
-
-`./myon foo.myon` は従来どおりツリーウォーク実行、`./myon foo.myc` は MVM VM
-実行、`./myon --compile foo.myon [-o out.myc]` はコンパイルのみ（実行しない）、
-`./myon --dump-bytecode foo.myon` は逆アセンブル表示です。`./myon --help`
-（`-h`）で使い方、`./myon --version`（`-v`）でバージョン（現在 0.9.0）を
-表示します。MVM が対応する
-言語機能（M0〜M8：リテラル・算術・比較・論理・変数・スコープ・制御構文・関数・
-複数戻り値・ネイティブ呼び出し・文字列補間・キャスト・配列/マップ・構造体/
-メソッド）の範囲では、ツリーウォークと MVM の出力が一致することを
-`tests/run_mvm_tests.sh` が回帰的に確認します（`make test` に統合済み）。
-async/await・`myon.net`／`myon.http`・FFI・ジェネリクス・クロージャ（上位変数
-キャプチャ）・高階関数は **MVM でも対応済み**です（`mvm_spec.md` 7 節）。イベント
-ループ・ネットワーク・FFI などの実行時機構はツリーウォーク実装をブリッジ経由で
-共有し、ジェネリクスは型消去、クロージャは boxed upvalue セル（`LOAD_UPVALUE`／
-`STORE_UPVALUE`／upvalue 付き `MAKE_CLOSURE`）で実現しています。ただし *VM で作った
-関数値をツリーウォークのネイティブに渡してコールバック実行させる*ケース
-（`array.map`／`filter`／`reduce` などの高階ネイティブメソッドや
-`myon.ffi.make_callback`）だけはエンジン境界をまたげないため MVM では実行時に明示
-エラーになります。外部モジュール取り込み（`module external.* as ...`）も MVM 非対応
-（コンパイル時エラー）です。これらは従来どおり `.myon` のツリーウォーク実行で
-動かします。
-
-> **MVM の既知の制限（`mvm_spec.md` 7 節参照）**
-> - REPL は当面ツリーウォークのみ対応（MVM 版 REPL は将来課題）。
-> - `.myc` の Source Info（`src_mtime`/`src_size`/`src_hash`）は書き込み済みで、
->   `./myon foo.myc` 実行時に「`.myon` より古い `.myc`」を検出する
->   **stale チェックも実装済み**（既定は警告、`--strict-stale` でエラー化）。
-> - VM で生成した関数値をツリーウォークのネイティブに渡すコールバック
->   （高階ネイティブメソッド `array.map`/`filter`/`reduce`、`myon.ffi.make_callback`）は
->   エンジン境界をまたげないため MVM では実行時に明示エラー。`.myon` で実行すること。
-> - 外部モジュール取り込み（`module external.* as ...`）は MVM 非対応（コンパイル時エラー）。
-
-## Phase 8（CLI ツール制作支援 — 標準出力の細分化とスクリプト引数）
-
-`myon.cli` 相当の「CLI ツールを書く」用途を実用可能にするため、標準入出力の
-組み込みとコマンドライン引数の受け渡しを拡充した。実装は `src/interpreter.c`
-（組み込み関数）と `src/main.c`（CLI 引数の素通し）に対称に加えられ、ツリー
-ウォーク実行と MVM バイトコード実行の双方で同一に動作する（ブリッジ
-`myon_bridge_call_native` 経由。`tests/run_mvm_tests.sh` で等価性を回帰確認）。
-
-| 項目 | 内容 | 状態 |
-|---|---|---|
-| 改行なし出力 | `myon.write(...)` を新設（末尾に `\n` を付けない）。`\r` による行の上書き（プログレスバー・スピナー）が可能になる。従来の `myon.print` は改行付きのまま互換維持 | ✅ 実装 |
-| 明示的な改行出力 | `myon.println(...)` を新設（`print` の明示的別名。末尾に改行） | ✅ 実装 |
-| 明示的フラッシュ | `myon.flush() ret void` を新設。stdout のバッファを即時書き出し、`write` での1行更新を確実に反映 | ✅ 実装 |
-| 標準エラー出力 | `myon.eprint(...) ret void` を新設。stderr へ改行付きで出力し、診断・進捗を stdout（パイプ加工対象）と分離 | ✅ 実装 |
-| TTY 判定 | `myon.is_tty() ret bool` を新設。stdout が端末なら true、パイプ・リダイレクト時は false。ANSI 制御文字の抑制判断に使う | ✅ 実装 |
-| スクリプト引数 | CLI 側で `myon <script> [args...]`／`myon <script> -- [args...]` の後続トークンをスクリプト用引数として素通し。言語側は `myon.argv() ret myon.array(str)` で取得（常に配列、`nil` は返さない） | ✅ 実装 |
-
-- `myon.print` の**既存の改行付き挙動は変更していない**（既存の回帰テスト全ケースと
-  全 `examples/` の互換性を保つため）。「改行なし出力」は新設の `myon.write` が担う。
-- スクリプト引数はプロセス argv への借用ポインタで保持し、インタプリタ側では
-  解放しない（`interpret_set_script_args()`）。スクリプトパス確定後の全トークン、
-  または `--` 以降の全トークンを引数とし、先頭が `-` でもインタプリタの未知
-  オプションエラーにはしない。
-- 回帰ケース：`tests/cases/p_stdio_writers.*`（`write`/`println`/`print`/`flush`）、
-  `tests/cases/p_argv_empty.*`（引数なし時の空配列・`is_tty` の false・`eprint` の
-  stderr 分離）。いずれもツリーウォーク／MVM の等価性込みで検証。
-
-## macOS 対応（`src/platform.h` によるプラットフォーム判定の一元化）
-
-それまでのコードは `#if defined(__linux__)` を各所に散らし、**Linux のみを POSIX
-として扱っていました**。このため macOS ではネットワーク・非同期イベントループ・
-FFI・暗号学的乱数が黙って無効化されていました。これを `src/platform.h` の
-一元的な OS 判定・機能マクロへ置き換え、macOS を正式サポートしました。
-
-| マクロ | 意味 |
-|---|---|
-| `MYON_OS_LINUX` / `MYON_OS_MACOS` / `MYON_OS_BSD` / `MYON_OS_WINDOWS` | OS ファミリの判定 |
-| `MYON_OS_POSIX` | 上記 POSIX 系の総称 |
-| `MYON_HAVE_UCONTEXT` | `ucontext` コルーチンが使えるか（イベントループ） |
-| `MYON_HAVE_DLOPEN` | `dlopen` 系が使えるか（FFI） |
-| `MYON_HAVE_POSIX_SOCKETS` | BSD ソケットが使えるか（`myon.net`） |
-| `MYON_HAVE_ARC4RANDOM` / `MYON_HAVE_DEV_URANDOM` | OS CSPRNG の入手経路（`myon.random.secure_int`） |
-| `MYON_HAVE_MSG_NOSIGNAL` / `MYON_HAVE_SO_NOSIGPIPE` | SIGPIPE 抑止の方法（Linux / macOS・BSD で異なる） |
-
-| 対象 | 変更内容 | 状態 |
-|---|---|---|
-| `interpreter.c` | `select()`/`stat()` のガードを POSIX 全体へ。`secure_int` は macOS/BSD で `arc4random_buf()`、Linux で `/dev/urandom` | ✅ 実装 |
-| `net.c` | BSD ソケットを **全 POSIX ターゲット**で有効化（従来は Linux 限定）。SIGPIPE 抑止は macOS/BSD が `SO_NOSIGPIPE`、Linux が `MSG_NOSIGNAL` | ✅ 実装 |
-| `event_loop.c` | macOS/BSD でも `ucontext` バックエンドを有効化 | ✅ 実装 |
-| `ffi_platform.c` | macOS で実際に `dlopen`/`dlsym`/`dlclose` を使うようにし、**Phase3 の「macOS 未対応」スタブを削除** | ✅ 実装 |
-| `Makefile` | Darwin 分岐（`-ldl` 不要、Homebrew の `openssl@3` を Apple Silicon / Intel 双方で自動探索）。ASan ビルドを Linux 限定からネイティブ全般へ | ✅ 実装 |
-| `tests/run_tests.sh` | Linux 以外では「`.so` 名を直書きした FFI ケース」だけをスキップ（`LINUX_ONLY_SO_CASES`）。ネット/async/http/メモリ FFI のケースは全 OS で実行 | ✅ 実装 |
-| CI | `heavy-checks.yml` に **Windows 実機（MSYS2）** と **macOS 実機（`macos-15` Apple Silicon）** のビルド＋テストジョブを追加。`release.yml` に `myon-macos-arm64` 成果物を追加 | ✅ 実装 |
-
-## ネットワーク層の堅牢化（TLS クライアント・URL サニタイズ）
-
-Phase 5.1 の TLS クライアントは「ベストエフォートの検証」でしたが、OpenSSL 3.x の
-TLS クライアントガイド・RFC 8996（TLS 1.0/1.1 の非推奨）・RFC 6066（SNI）に沿って
-**フェイルクローズ**な実装へ置き換えました。
-
-| 項目 | 内容 | 状態 |
-|---|---|---|
-| 最低プロトコル版 | TLS 1.2 を強制。SSLv3 / TLS 1.0 / 1.1 を拒否（RFC 8996） | ✅ 実装 |
-| レガシー機能の無効化 | TLS 圧縮（CRIME 対策）・再ネゴシエーションを無効化、security level 2 | ✅ 実装 |
-| ホスト名の必須化 | 検証対象のホスト名が空の場合は「無条件許可」せず拒否 | ✅ 実装 |
-| DNS 名 / IP リテラルの分離 | DNS 名は SNI＋`SSL_set1_host()`、IP リテラルは `X509_VERIFY_PARAM_set1_ip_asc()`（iPAddress SAN、SNI は送らない）。部分ワイルドカードは禁止 | ✅ 実装 |
-| 失敗理由の可視化 | `SSL_get_verify_result()` / `X509_verify_cert_error_string()` を使い「期限切れ」「ホスト名不一致」「自己署名」等を明示。ハンドシェイク後に再確認 | ✅ 実装 |
-| ハンドシェイクのタイムアウト | 応答しないピアでインタプリタが固まらないよう期限を設定（既定 30 秒） | ✅ 実装 |
-| 読み書き API | `SSL_read_ex` / `SSL_write_ex` へ移行し、負の長さを拒否 | ✅ 実装 |
-| URL サニタイズ | `myon.http.get`/`post` の URL でホスト・ポート・パスの制御文字（CR/LF）と範囲外ポートを拒否し、ヘッダ／リクエストインジェクションを防止 | ✅ 実装 |
-
-未対応（意図的なスコープ外）：OCSP/CRL による失効確認・証明書ピンニング・
-クライアント証明書（mTLS）・TLS サーバー（`serve` の HTTPS 化）。
-
-## パッケージ管理（`myon pkg` — GitHub ベースのパッケージマネージャ）
-
-GitHub の public repository を配布元とする、プロジェクトローカルなパッケージ管理を
-C ネイティブで実装しました（既存のインタプリタ／MVM の挙動は変更していません）。
-仕様と内部実装は [`package_manager.md`](package_manager.md)、パッケージを作る側の
-作法は [`package_development.md`](package_development.md) を参照してください。
-
-```sh
-myon pkg install https://github.com/owner/repository   # URL 指定で導入
-myon pkg lock       # 依存を解決して myon.lock を（再）生成
-myon pkg install    # myon.lock だけを信頼して再現インストール
-myon pkg verify     # myon.toml / myon.lock / 展開物の整合性を検査
-myon pkg tree       # ロック済み依存グラフを表示（ネットワーク不要）
-```
-
-| レイヤ | ファイル | 内容 | 状態 |
-|---|---|---|---|
-| データモデル・パーサ | `src/package.{h,c}` | `myon.toml` / `package.myon` / `myon.lock` の厳格サブセット TOML パーサ、識別子バリデータ、`github:<owner>/<repo>@<40-hex-sha>` 形式、決定的なロックファイル書き出し、`PkgError`→終了コード対応 | ✅ 実装 |
-| ハッシュ | `src/pkg_hash.{h,c}` | OpenSSL EVP による SHA-256 と定数時間 hex 比較 | ✅ 実装 |
-| ファイルシステム | `src/pkg_fs.{h,c}` | project root の探索、`mkdir -p`、symlink 安全な rmtree、パス要素の検証、CSPRNG 名の staging ディレクトリ、バックアップ＋ロールバック付きの atomic promote | ✅ 実装 |
-| ZIP 展開 | `src/pkg_zip.{h,c}` | zlib 非依存の自前 DEFLATE 展開（RFC 1951）＋安全性優先の ZIP リーダ。ZIP Slip／絶対パス／ドライブレター／バックスラッシュ／symlink エントリ／複数ルート／重複／制御バイトを拒否し、エントリ・総量・圧縮率・件数の上限で展開爆弾を防止。エントリ毎に CRC-32 を検証 | ✅ 実装 |
-| ネットワーク | `src/pkg_fetch.{h,c}` | `myon.http` とは独立したバイナリ安全な HTTPS GET。HTTPS のみ許可、GitHub host の allow-list、`https`→`http` ダウングレード拒否、`Location` の CRLF 拒否、redirect 最大 5 回、`Content-Length`／総量の上限（64 MiB）、chunked デコード。差し替え可能な `PkgTransport` 継ぎ目によりオフラインで単体テスト可能 | ✅ 実装 |
-| 解決ロジック | `src/pkg_ops.{h,c}` | `install` / `lock` / `verify` / `tree` の依存解決 | ✅ 実装 |
-| module 取り込み | `src/interpreter.c` | 宣言 module namespace の最長一致で所属パッケージを決定。alias 必須、`myon.lock` 外のパッケージは拒否、循環 import は検出。project root は**実行スクリプトのディレクトリ**から上方向に `myon.toml` を探して決定（cwd 非依存） | ✅ 実装 |
-| テスト | `tests/pkg_unit_tests.c` / `pkg_zip_tests.c` / `pkg_ops_tests.c` | `make test` / `make test-pkg` で実行される C 単体テスト。加えて `tests/run_tests.sh` がパッケージ取り込みの fixture テストを実行 | ✅ 実装 |
-
-- 実体は `<project-root>/.myon/packages/<package-name>/` にプロジェクトローカルで
-  配置され、グローバルキャッシュや PATH 変更は行いません。
-- バージョンは**フルコミット SHA でピン留め**されます（タグの付け替えに影響されない）。
-- 運用上は `.myon/packages/` を `.gitignore` に入れ、`myon.toml` と `myon.lock` を
-  Git 管理することを推奨します。
-- **⚠️ パッケージのコードは sandbox されません。** module を import することは
-  任意の Myon コード（file I/O・network・FFI を含む）を実行することと同じです。
-- **MVM 非対応**：`--compile`／`--run-mvm`／`.myc` 実行ではパッケージ module 取り込みは
-  未対応で、曖昧にフォールバックせず明示的なエラーになります（仕様 §6.3）。
-  詳細は [`../known-issues.md`](../known-issues.md) を参照。
+| マニフェストとロック | `package.c` | 受理する TOML サブセット、名前、ソース形式 |
+| SHA-256 | `pkg_hash.c` | 取得アーカイブとロックのハッシュ一致 |
+| 取得 | `pkg_fetch.c` | HTTPS、許可ホスト、リダイレクト、応答量、chunked応答 |
+| ファイル配置 | `pkg_fs.c` | ステージング、バックアップ、配置切り替え |
+| ZIP | `pkg_zip.c` | パス・エントリ形式・サイズ・件数・圧縮率・CRC |
+| 依存解決 | `pkg_ops.c` | フル SHA、依存競合・循環、install/lock/verify/tree |
+| module 取り込み | `interpreter.c` | スクリプト起点のプロジェクト探索、名前空間の最長一致、alias |
+
+検証は `pkg_unit_tests.c`、`pkg_zip_tests.c`、`pkg_ops_tests.c` と
+`tests/cases/pkgproj*/` にあります。install/lock にコード実行フックはありません。
+import されたコードのファイル・ネットワーク・FFI アクセスは制限されません。
+
+## プラットフォームと検証範囲
+
+OS 判定と機能マクロは `src/platform.h` にあります。Linux・macOS・Windows には
+ビルドとテストの CI ジョブがあります。BSD 向けの実装分岐はありますが、同等の
+実機 CI ジョブはありません。CI の成功は、そのジョブで実行されたテストに関する結果です。
+
+`make test` は C 単体テスト、所有権・診断・数値・ハーネス検査、ソース実行、
+コンパイラ、等価性スイートを実行します。`make test-asan` は ASan/UBSan を有効にし、
+全体の LSan は無効にします。個別の LSan 検査は [README](../README.md#テスト) を参照してください。
+
+メインスイートの `.out` は出力と終了コード0、`.err` は終了コード1/65を検査します。
+等価性スイートは両エンジンを1回ずつ実行し、未対応診断を除外として記録します。
+エラーの発生段階や全文が一致することまでは全ケースで検査していません。
+
+## 変更記録の参照
+
+過去の文書で使われた Step / Phase は実装当時の区分です。現在の対応範囲は上の一覧、
+個々の変更は Git の履歴、修正内容と再現条件は [既知の問題](../known-issues.md) で確認できます。
