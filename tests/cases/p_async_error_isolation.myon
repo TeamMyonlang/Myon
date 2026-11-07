@@ -1,0 +1,16 @@
+module myon.time
+myon.async myon.func fail(delay: int) ret int {
+    myon.time.sleep_ms(delay)
+    myon.print(1 / 0)
+    ret 0
+}
+myon.async myon.func healthy(payload: str, delay: int) ret str {
+    myon.time.sleep_ms(delay)
+    ret payload
+}
+failed = fail(5)
+survivor = healthy(str("still alive"), 15)
+myon.print(myon.await survivor)
+survivor2 = healthy(str("also alive"), 5)
+failed2 = fail(15)
+myon.print(myon.await survivor2)

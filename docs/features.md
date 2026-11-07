@@ -59,7 +59,7 @@ async 関数の呼び出しは Task 値を返します。実行は単一スレ�
 | POSIX コルーチン | `event_loop.c` の ucontext バックエンド | `p5_async_order`、`p5_async_wait_task` |
 | Windows コルーチン | 同ファイルの Win32 Fiber バックエンド | Windows 実機の Heavy checks |
 | タスクの再帰上限 | `interpreter.c`、`event_loop.h` | `p_async_recursion_limit`、`p_async_depth_isolation` |
-| 完了タスクの回収 | `event_loop.c`、`value.c` | `runtime_memory_tests.c`。スタックと結果ハンドルの寿命を分離 |
+| 完了タスク・未完了コンテキストの回収 | `event_loop.c`、`value.c` | `runtime_memory_tests.c`。スタックと結果ハンドルの寿命を分離。終了時に userdata を解放 |
 | IPv4 TCP/UDP | `net.c`、`interpreter.c` | `p5_net_tcp_echo`、`p5_net_udp_echo` |
 | ホスト名解決 | `net.c` | `p51_net_dns_localhost`。getaddrinfo を使い、最初の候補を使用 |
 | HTTP 静的配信・ハンドラ | `http.c`、`interpreter.c` | `p5_http_serve_static`、`examples/http_router_server.myon` |
@@ -133,7 +133,8 @@ OS 判定と機能マクロは `src/platform.h` にあります。Linux・macOS�
 
 `make test` は C 単体テスト、所有権・診断・数値・ハーネス検査、ソース実行、
 コンパイラ、等価性スイートを実行します。`make test-asan` は ASan/UBSan を有効にし、
-全体の LSan は無効にします。個別の LSan 検査は [README](../README.md#テスト) を参照してください。
+全体の LSan は無効にします。Linux の `make test-lsan` は正常終了と選択したタスク異常終了を
+検査し、PR の gcc CI と Heavy checks で実行します。範囲は [README](../README.md#テスト) を参照してください。
 
 メインスイートの `.out` は出力と終了コード0、`.err` は終了コード1/65を検査します。
 等価性スイートは両エンジンを1回ずつ実行し、未対応診断を除外として記録します。

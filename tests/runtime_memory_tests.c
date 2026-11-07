@@ -121,10 +121,60 @@ static void task_result_cycle(void) {
     event_loop_destroy(loop);
 }
 
+static int userdata_disposed;
+typedef struct {
+    EventLoop *loop;
+    int wait;
+    Task *target;
+    Value owned;
+} OwnedTask;
+static void owned_cleanup(void *ud) {
+    OwnedTask *ctx = ud;
+    value_free(&ctx->owned);
+    userdata_disposed++;
+    free(ctx);
+}
+static void owned_entry(void *ud) {
+    OwnedTask *ctx = ud;
+    if (ctx->target) event_loop_wait_task(ctx->loop, ctx->target);
+    else if (ctx->wait) event_loop_sleep_ms(ctx->loop, 60000);
+}
+static Task *spawn_owned(EventLoop *loop, int wait, Task *target) {
+    OwnedTask *ctx = malloc(sizeof(*ctx));
+    ctx->loop = loop; ctx->wait = wait; ctx->target = target;
+    ctx->owned = value_str(myon_strdup("task userdata"));
+    Task *task = event_loop_spawn(loop, owned_entry, ctx);
+    event_loop_task_set_cleanup(task, owned_cleanup);
+    return task;
+}
+static void userdata_lifetime(void) {
+    if (!event_loop_supported()) return;
+    size_t base = value_live_allocations();
+    EventLoop *loop = event_loop_create();
+    spawn_owned(loop, 0, NULL);
+    assert(event_loop_run_once(loop) == 0);
+    assert(userdata_disposed == 1);
+    Task *sleeping = spawn_owned(loop, 1, NULL);
+    event_loop_task_ref(sleeping);
+    assert(event_loop_run_once(loop) == 1);
+    spawn_owned(loop, 0, sleeping);
+    assert(event_loop_run_once(loop) == 2);
+    spawn_owned(loop, 0, NULL); /* destroy before the entry ever runs */
+    assert(userdata_disposed == 1);
+    event_loop_destroy(loop);
+    assert(userdata_disposed == 4);
+    assert(event_loop_task_done(sleeping));
+    event_loop_task_unref(sleeping); /* cleanup must not run a second time */
+    assert(userdata_disposed == 4);
+    value_collect_cycles();
+    assert(value_live_allocations() == base);
+}
+
 int main(void) {
     cycles();
     tasks();
     task_result_cycle();
+    userdata_lifetime();
     puts("runtime memory tests passed");
     return 0;
 }

@@ -382,14 +382,31 @@ typedef struct {
     Value     fn;          /* owned closure value (for its upvalues) */
     Value    *args;        /* owned */
     int       argc;
+    VM       *vm;
 } AsyncVMCtx;
+
+static void async_vm_cleanup(void *ud) {
+    AsyncVMCtx *ctx = ud;
+    VM *vm = ctx->vm;
+    if (vm) {
+        for (int i = vm->frame_count - 1; i >= 0; i--) frame_close_cells(&vm->frames[i]);
+        while (vm->sp > 0) { Value d = vm->stack[--vm->sp]; value_free(&d); }
+        free(vm->stack);
+        free(vm);
+    }
+    value_free(&ctx->fn);
+    for (int i = 0; i < ctx->argc; i++) value_free(&ctx->args[i]);
+    free(ctx->args);
+    free(ctx);
+}
 
 static void async_vm_body(void *ud, Value *out_result, int *out_has_error) {
     AsyncVMCtx *ctx = (AsyncVMCtx *)ud;
-    VM tvm;
-    memset(&tvm, 0, sizeof(tvm));
-    tvm.sh = ctx->sh;
-    tvm.keep_top_return = 1;   /* deliver the task's return value (spec §14.9) */
+    VM *tvm = myon_xmalloc(sizeof(VM));
+    memset(tvm, 0, sizeof(VM));
+    ctx->vm = tvm;
+    tvm->sh = ctx->sh;
+    tvm->keep_top_return = 1;   /* deliver the task's return value (spec §14.9) */
 
     /* Build the task's frame: push args as slots 0..argc-1, then locals.
      *
@@ -404,18 +421,18 @@ static void async_vm_body(void *ud, Value *out_result, int *out_has_error) {
     volatile Value result_v = value_nil();
     volatile int   has_error = 0;
 
-    if (setjmp(tvm.on_error) == 0) {
-        for (int i = 0; i < ctx->argc; i++) vm_push(&tvm, value_copy(&ctx->args[i]));
-        for (int i = ctx->argc; i < (int)c->num_locals; i++) vm_push(&tvm, value_nil());
-        Frame *f = &tvm.frames[tvm.frame_count++];
+    if (setjmp(tvm->on_error) == 0) {
+        for (int i = 0; i < ctx->argc; i++) vm_push(tvm, value_copy(&ctx->args[i]));
+        for (int i = ctx->argc; i < (int)c->num_locals; i++) vm_push(tvm, value_nil());
+        Frame *f = &tvm->frames[tvm->frame_count++];
         f->chunk = c; f->ip = c->code; f->base = 0; f->fn_slot = -1;
         f->upvalues = ctx->fn.as.obj->as.fn.upvalues;
         f->upvalue_count = ctx->fn.as.obj->as.fn.upvalue_count;
         f->globals_frame = 0;
-        frame_open_cells(&tvm, f);
-        run(&tvm);
+        frame_open_cells(tvm, f);
+        run(tvm);
         /* run() leaves the single return value (RET normalizes 0->nil) on top */
-        if (tvm.sp > 0) result_v = tvm.stack[--tvm.sp];
+        if (tvm->sp > 0) result_v = tvm->stack[--tvm->sp];
     } else {
         has_error = 1;
         result_v = value_error(myon_strdup("async task failed"));
@@ -424,19 +441,11 @@ static void async_vm_body(void *ud, Value *out_result, int *out_has_error) {
     /* Copy out of the volatile lvalue once the jump target is settled. */
     Value result = result_v;
 
-    /* drain any stragglers on the task stack */
-    while (tvm.sp > 0) { Value d = tvm.stack[--tvm.sp]; value_free(&d); }
-    free(tvm.stack);
-
-    value_free(&ctx->fn);
-    for (int i = 0; i < ctx->argc; i++) value_free(&ctx->args[i]);
-    free(ctx->args);
     /* Deliver the outcome via the task-local out-params (see bridge header):
      * out_result already holds a value_nil() we may overwrite. */
     value_free(out_result);
     *out_result = result;         /* ownership transfers to the task */
     *out_has_error = has_error;
-    free(ctx);
 }
 
 /*
@@ -450,6 +459,7 @@ static void do_spawn_async(VM *vm, int line, int argc) {
     int cidx = vm_closure_chunk(callee);
 
     AsyncVMCtx *ctx = (AsyncVMCtx *)myon_xmalloc(sizeof(AsyncVMCtx));
+    ctx->vm = NULL;
     ctx->sh = vm->sh;
     ctx->chunk_idx = cidx;
     ctx->fn = value_copy(callee);
@@ -462,7 +472,7 @@ static void do_spawn_async(VM *vm, int line, int argc) {
     for (int i = 0; i < argc; i++) { Value d = vm_pop(vm); value_free(&d); }
     { Value d = vm_pop(vm); value_free(&d); }
 
-    Value task = myon_bridge_spawn_task(vm->sh->bridge, async_vm_body, ctx);
+    Value task = myon_bridge_spawn_task(vm->sh->bridge, async_vm_body, ctx, async_vm_cleanup);
     vm_push(vm, task);
 }
 
@@ -1016,6 +1026,7 @@ int mvm_run_module(Module *m, Program *program, const char *source) {
     }
 
     /* clean up any values left on the operand stack + the globals */
+    for (int i = vm.frame_count - 1; i >= 0; i--) frame_close_cells(&vm.frames[i]);
     while (vm.sp > 0) { Value d = vm.stack[--vm.sp]; value_free(&d); }
     free(vm.stack);
     for (int i = 0; i < sh.global_count; i++) value_free(&sh.globals[i]);

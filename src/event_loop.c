@@ -37,6 +37,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <setjmp.h>
 
 /*
  * Cooperative-coroutine backend selection.
@@ -80,8 +81,10 @@ struct Task {
 
     void      (*entry)(void *ud);
     void       *ud;
+    void      (*ud_cleanup)(void *);
 
     int         call_depth;
+    jmp_buf     on_error;
     int         refs;
     void      (*result_cleanup)(void *);
     TaskState   state;
@@ -131,7 +134,19 @@ static void release_stack(Task *t) {
     free(t->stack); t->stack = NULL;
 }
 
+void event_loop_task_set_cleanup(Task *t, void (*cleanup)(void *)) {
+    if (t) t->ud_cleanup = cleanup;
+}
+static void release_userdata(Task *t) {
+    void *ud = t->ud;
+    void (*cleanup)(void *) = t->ud_cleanup;
+    t->ud = NULL;
+    t->ud_cleanup = NULL;
+    if (cleanup) cleanup(ud);
+}
+
 int *event_loop_task_call_depth(Task *t) { return &t->call_depth; }
+void *event_loop_task_error_buf(Task *t) { return &t->on_error; }
 void event_loop_task_ref(Task *t) { if (t) t->refs++; }
 void event_loop_task_unref(Task *t) {
     if (!t || --t->refs != 0) return;
@@ -151,6 +166,7 @@ static void reap_done(EventLoop *loop) {
         if (t->state != TASK_DONE) { prev = t; link = &t->next; continue; }
         *link = t->next;
         if (loop->tail == t) loop->tail = prev;
+        release_userdata(t);
         release_stack(t);
         event_loop_task_unref(t); /* release active-list ownership */
     }
@@ -161,6 +177,7 @@ void event_loop_destroy(EventLoop *loop) {
     Task *t = loop->tasks;
     while (t) {
         Task *n = t->next;
+        release_userdata(t);
         release_stack(t);
         t->state = TASK_DONE;
         if (t->waiting_on) event_loop_task_unref(t->waiting_on);
@@ -553,8 +570,10 @@ struct Task {
 
     void      (*entry)(void *ud);
     void       *ud;
+    void      (*ud_cleanup)(void *);
 
     int         call_depth;
+    jmp_buf     on_error;
     int         refs;
     void      (*result_cleanup)(void *);
     TaskState   state;
@@ -638,7 +657,19 @@ static void release_stack(Task *t) {
     if (t->fiber) DeleteFiber(t->fiber); t->fiber = NULL;
 }
 
+void event_loop_task_set_cleanup(Task *t, void (*cleanup)(void *)) {
+    if (t) t->ud_cleanup = cleanup;
+}
+static void release_userdata(Task *t) {
+    void *ud = t->ud;
+    void (*cleanup)(void *) = t->ud_cleanup;
+    t->ud = NULL;
+    t->ud_cleanup = NULL;
+    if (cleanup) cleanup(ud);
+}
+
 int *event_loop_task_call_depth(Task *t) { return &t->call_depth; }
+void *event_loop_task_error_buf(Task *t) { return &t->on_error; }
 void event_loop_task_ref(Task *t) { if (t) t->refs++; }
 void event_loop_task_unref(Task *t) {
     if (!t || --t->refs != 0) return;
@@ -658,6 +689,7 @@ static void reap_done(EventLoop *loop) {
         if (t->state != TASK_DONE) { prev = t; link = &t->next; continue; }
         *link = t->next;
         if (loop->tail == t) loop->tail = prev;
+        release_userdata(t);
         release_stack(t);
         event_loop_task_unref(t); /* release active-list ownership */
     }
@@ -668,6 +700,7 @@ void event_loop_destroy(EventLoop *loop) {
     Task *t = loop->tasks;
     while (t) {
         Task *n = t->next;
+        release_userdata(t);
         release_stack(t);
         t->state = TASK_DONE;
         if (t->waiting_on) event_loop_task_unref(t->waiting_on);
@@ -1022,8 +1055,10 @@ void event_loop_task_set_result(Task *task, void *result, int has_error) {
     (void)task; (void)result; (void)has_error;
 }
 int *event_loop_task_call_depth(Task *t) { (void)t; return NULL; }
+void *event_loop_task_error_buf(Task *t) { (void)t; return NULL; }
 void event_loop_task_ref(Task *t) { (void)t; }
 void event_loop_task_unref(Task *t) { (void)t; }
+void event_loop_task_set_cleanup(Task *t, void (*c)(void *)) { (void)t; (void)c; }
 void event_loop_set_result_cleanup(EventLoop *l, void (*c)(void *)) { (void)l; (void)c; }
 Task *event_loop_current(EventLoop *loop) { (void)loop; return NULL; }
 int  event_loop_run_once(EventLoop *loop) { (void)loop; return 0; }
