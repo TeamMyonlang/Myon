@@ -30,7 +30,16 @@ fi
 # Per-case wall-clock guard so a (hypothetical) VM infinite loop cannot hang
 # the whole suite.
 TIMEOUT="${MVM_TEST_TIMEOUT:-30}"
-run_to() { timeout "$TIMEOUT" "$@"; }
+# Homebrew installs GNU timeout as gtimeout; never silently drop the guard.
+if command -v timeout >/dev/null 2>&1; then
+    TIMEOUT_BIN=timeout
+elif command -v gtimeout >/dev/null 2>&1; then
+    TIMEOUT_BIN=gtimeout
+else
+    echo "error: GNU timeout is required (coreutils; gtimeout on macOS)" >&2
+    exit 1
+fi
+run_to() { "$TIMEOUT_BIN" "$TIMEOUT" "$@"; }
 
 # Current limitations; actual exclusions still come from VM diagnostics.
 EXCLUDED_KNOWN=(p41_ffi_callback p4_array_higher_order p_module_alias)

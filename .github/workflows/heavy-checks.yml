@@ -208,6 +208,8 @@ jobs:
           # them, so no WIN_OPENSSL_LDLIBS override is needed on real Windows.
           install: >-
             make
+            diffutils
+            coreutils
             mingw-w64-x86_64-gcc
             mingw-w64-x86_64-openssl
 
@@ -262,6 +264,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Install test tools (Homebrew)
+        # macOS has BSD diff/cmp, but the timed VM tests need GNU timeout.
+        run: brew install coreutils
 
       - name: Install OpenSSL (Homebrew)
         # openssl@3 is keg-only on macOS; the Makefile's Darwin branch runs

@@ -3,7 +3,7 @@
 set -eu
 ulimit -c 0
 scratch=$(mktemp -d)
-trap 'rm -rf "$scratch"' EXIT
+trap 'rc=$?; if [ "$rc" -ne 0 ] && [ -f "$scratch/log" ]; then cat "$scratch/log"; fi; rm -rf "$scratch"; exit "$rc"' EXIT
 mkdir -p "$scratch/tests/cases"
 cp tests/run_tests.sh tests/run_mvm_tests.sh "$scratch/tests/"
 cat > "$scratch/myon" <<'FAKE'
