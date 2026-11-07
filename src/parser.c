@@ -29,7 +29,6 @@ typedef struct {
     int          count;
     int          pos;
     jmp_buf      escape;
-    int          suppress_errors; /* >0 while doing speculative parsing */
 } Parser;
 
 static Expr *parse_expression(Parser *p);
@@ -57,17 +56,11 @@ static int match(Parser *p, TokenType t) {
 }
 
 static void perror_at(Parser *p, const Token *t, const char *msg) {
-    /* During speculative parsing (e.g. distinguishing a generic
-     * instantiation "Foo<int>(...)" from the comparison "i < 10") a failed
-     * parse is expected and recovered from, so don't leak its diagnostic. */
-    if (p->suppress_errors == 0) {
-        /* P5: include the column and a friendly name for the offending token,
-         * then print the source line with a caret under the failure column. */
-        fprintf(stderr,
-                "myon: syntax error at line %d, column %d: %s (got %s)\n",
-                t->line, t->col, msg, diag_token_friendly(t->type));
-        diag_print_snippet(t->line, t->col);
-    }
+    /* Include the column and source snippet for actual syntax errors. */
+    fprintf(stderr,
+            "myon: syntax error at line %d, column %d: %s (got %s)\n",
+            t->line, t->col, msg, diag_token_friendly(t->type));
+    diag_print_snippet(t->line, t->col);
     longjmp(p->escape, 1);
 }
 
@@ -190,6 +183,27 @@ static TypeSpec *parse_type(Parser *p) {
 /* ------------------------------------------------------------------ */
 /* Primary / postfix expressions                                       */
 /* ------------------------------------------------------------------ */
+
+/* Allocation-free lookahead for a possible <types...>( call. The actual
+ * type parser validates the candidate afterwards. Failed speculation must not
+ * create TypeSpecs that a longjmp would abandon on an ordinary comparison. */
+static int generic_call_ahead(const Parser *p) {
+    int angles = 0, parens = 0;
+    for (int i = p->pos; i < p->count; i++) {
+        TokenType t = p->toks[i].type;
+        if (t == TOK_LT) angles++;
+        else if (t == TOK_GT) {
+            if (--angles == 0)
+                return parens == 0 && i + 1 < p->count &&
+                       p->toks[i + 1].type == TOK_LPAREN;
+        } else if (t == TOK_LPAREN) parens++;
+        else if (t == TOK_RPAREN) { if (--parens < 0) return 0; }
+        else if (t != TOK_IDENT && t != TOK_COMMA &&
+                 t != TOK_MYON_ARRAY && t != TOK_MYON_MAP &&
+                 prim_token_to_type(t) == TYPE_UNKNOWN) return 0;
+    }
+    return 0;
+}
 
 static Expr *parse_ctor(Parser *p, ExprKind kind) {
     int line = peek(p)->line;
@@ -322,28 +336,11 @@ static Expr *parse_primary(Parser *p) {
              * Only treat as generic if the '<' is followed by a type and the
              * matching '>' is immediately followed by '(' (a constructor call)
              * so we don't misparse the comparison operator. */
-            if (check(p, TOK_LT)) {
-                int save = p->pos;
-                /* lookahead: try parsing type args; if it fails, rewind */
-                TypeSpec **args = NULL; int count = 0;
-                jmp_buf saved; memcpy(&saved, &p->escape, sizeof(jmp_buf));
-                p->suppress_errors++;
-                if (setjmp(p->escape) == 0) {
-                    parse_type_args(p, &args, &count);
-                    memcpy(&p->escape, &saved, sizeof(jmp_buf));
-                    p->suppress_errors--;
-                    if (check(p, TOK_LPAREN)) {
-                        return expr_generic(myon_strdup(t->lexeme), args, count, line);
-                    }
-                    /* Not a constructor call: rewind, treat '<' as comparison. */
-                    for (int i = 0; i < count; i++) typespec_free(args[i]);
-                    free(args);
-                    p->pos = save;
-                } else {
-                    memcpy(&p->escape, &saved, sizeof(jmp_buf));
-                    p->suppress_errors--;
-                    p->pos = save;
-                }
+            if (check(p, TOK_LT) && generic_call_ahead(p)) {
+                TypeSpec **args = NULL;
+                int count = 0;
+                parse_type_args(p, &args, &count);
+                return expr_generic(myon_strdup(t->lexeme), args, count, line);
             }
             return expr_ident(myon_strdup(t->lexeme), line);
         }
@@ -933,7 +930,6 @@ Program *parser_parse(const TokenList *tokens) {
     p.toks = tokens->items;
     p.count = tokens->count;
     p.pos = 0;
-    p.suppress_errors = 0;
 
     Program *volatile prog = (Program *)myon_xmalloc(sizeof(Program));
     stmtlist_init(&prog->stmts);

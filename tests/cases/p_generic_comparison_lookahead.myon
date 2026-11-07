@@ -1,0 +1,24 @@
+module myon.stdio
+myon.struct Box<T> { value: T }
+myon.struct Pair<A, B> { first: A; second: B }
+a = 1
+b = 2
+c = 3
+myon.print(a < b)
+myon.print(a < b + c)
+myon.print(a < (b + c))
+myon.print((a < b) == (b < c))
+# Nested named types, primitive types, and collection types still instantiate.
+inner = Box<int>(value=7)
+outer = Box<Box<int>>(value=inner)
+myon.print(outer.value.value)
+xs = myon.array(int)
+xs.push(9)
+with_array = Box<myon.array(int)>(value=xs)
+myon.print(with_array.value)
+m = myon.map(str, int)
+m.set(str("x"), 11)
+with_map = Box<myon.map(str, int)>(value=m)
+myon.print(with_map.value.get(str("x")))
+pair = Pair<myon.array(int), Box<int>>(first=xs, second=inner)
+myon.print(pair.second.value)
