@@ -21,6 +21,13 @@ case "$name" in
     output_error) echo A; exit 1 ;;
     output_crash) echo A; kill -SEGV $$ ;;
     runtime_error) exit 1 ;;
+    stage_mismatch|stage_expected|stage_bad_metadata)
+        [ "$mode" = vm ] && exit 65
+        exit 1 ;;
+    stage_drift) exit 1 ;;
+    stage_reversed)
+        [ "$mode" = tree ] && exit 65
+        exit 1 ;;
     source_error) exit 65 ;;
     error_crash) kill -SEGV $$ ;;
     error_abort) kill -ABRT $$ ;;
@@ -48,10 +55,14 @@ for name in output_ok output_error output_crash unsupported_compile unsupported_
     : > "$scratch/tests/cases/$name.myon"
     printf 'A\n' > "$scratch/tests/cases/$name.out"
 done
-for name in runtime_error source_error error_crash error_abort error_timeout error_missing unsupported_crash unsupported_tree_crash; do
+for name in runtime_error source_error error_crash error_abort error_timeout error_missing unsupported_crash unsupported_tree_crash stage_mismatch stage_expected stage_reversed stage_drift stage_bad_metadata; do
     : > "$scratch/tests/cases/$name.myon"
     : > "$scratch/tests/cases/$name.err"
 done
+for name in stage_expected stage_drift; do
+    printf '1 65\n' > "$scratch/tests/cases/$name.mvm-exit"
+done
+printf '1 65 extra\n' > "$scratch/tests/cases/stage_bad_metadata.mvm-exit"
 : > "$scratch/tests/cases/missing_fixture.myon"
 
 for harness in run_tests run_mvm_tests; do
@@ -70,6 +81,10 @@ for harness in run_tests run_mvm_tests; do
         grep -Eq "  ok   $name( |$)" "$scratch/log"
     done
     if [ "$harness" = run_mvm_tests ]; then
+        for name in stage_mismatch stage_reversed stage_drift stage_bad_metadata; do
+            grep -Eq "  FAIL $name( |$)" "$scratch/log"
+        done
+        grep -Eq '  ok   stage_expected( |$)' "$scratch/log"
         for name in unsupported_compile unsupported_runtime; do
             grep -Eq "  excl $name( |$)" "$scratch/log"
         done
