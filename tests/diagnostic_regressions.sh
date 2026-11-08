@@ -26,7 +26,7 @@ check_lexical $'\xc0\x80' 'unexpected byte 0xc0 (invalid UTF-8)'
 check_lexical $'\xed\xa0\x80' 'unexpected byte 0xed (invalid UTF-8)'
 check_lexical $'\xf4\x90\x80\x80' 'unexpected byte 0xf4 (invalid UTF-8)'
 
-printf 'myon.print(1 / 0)\n' > "$scratch/input.myon"
+printf 'module myon.stdio\nmyon.print(1 / 0)\n' > "$scratch/input.myon"
 for engine in tree mvm; do
     rc=0
     if [ "$engine" = tree ]; then
@@ -35,7 +35,7 @@ for engine in tree mvm; do
         "$MYON" --run-mvm "$scratch/input.myon" >"$scratch/out" 2>"$scratch/$engine.err" || rc=$?
     fi
     [ "$rc" -eq 1 ]
-    grep -q '^myon: runtime error at line 1:' "$scratch/$engine.err"
+    grep -q '^myon: runtime error at line 2:' "$scratch/$engine.err"
 done
 cmp "$scratch/tree.err" "$scratch/mvm.err"
 echo 'diagnostic regression tests passed'

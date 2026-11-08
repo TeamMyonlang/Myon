@@ -5,6 +5,7 @@
 #    crc32(0, "hello", 5) == 907060870 (matches Python zlib.crc32(b"hello")).
 module myon.ffi
 
+module myon.stdio
 id, aerr = myon.ffi.alloc(16)
 myon.if aerr != myon.nil then { myon.print(str("alloc_err")) } myon.else { myon.print(str("alloc_ok")) }
 

@@ -8,7 +8,7 @@ MVM の命令とファイル形式は [MVM リファレンス](mvm_spec.md)、�
 [機能一覧](features.md) を参照してください。
 
 言語の規則と実装の不一致は [既知の問題](../known-issues.md) に記録しています。
-特に module 宣言による機能制限と、実行エンジン間のエラー段階には制約があります。
+実行エンジン間のエラー段階や全エラー経路のリーク検査には制約があります。
 
 ### 0.1 表記
 
@@ -57,6 +57,7 @@ API 表の `int|float`・`?`・`func`・`array of T` は説明上の表記を含
 `{}` の内側では文の区切りとして改行を使えます。
 
 ```myon
+module myon.stdio
 x = 1; y = 2
 myon.print(
     x,
@@ -163,6 +164,7 @@ and/or は右辺を評価しない場合があります。not を後置には書
 文字列内の `{expr}` を評価して文字列化します。`{{` と `}}` はリテラルの波括弧です。
 
 ```myon
+module myon.stdio
 name = str("myon")
 count = 2
 myon.print("name={name}, next={count + 1}")
@@ -179,6 +181,7 @@ myon.print("name={name}, next={count + 1}")
 if の then は省略可能、elif の then は必須、else には条件を付けません。
 
 ```myon
+module myon.stdio
 a = 2
 b = 1
 myon.if a > b {
@@ -195,6 +198,7 @@ myon.if a > b {
 range の終点は含みません。配列の for-in は要素を順に束縛します。
 
 ```myon
+module myon.stdio
 myon.for i myon.in range(0, 3) {
     myon.print(i)
 }
@@ -216,6 +220,7 @@ break は最も内側のループを抜け、continue は次の反復へ進み�
 引数は `名前: 型`、戻り値は `ret 型` と書きます。
 
 ```myon
+module myon.stdio
 myon.func add(a: int, b: int) ret int {
     ret a + b
 }
@@ -227,6 +232,7 @@ myon.print(add(2, 3))
 ### 6.2 複数戻り値
 
 ```myon
+module myon.stdio
 myon.func divide(a: int, b: int) ret int, error {
     myon.if b == 0 then { ret 0, error("division by zero") }
     ret a / b, myon.nil
@@ -258,6 +264,7 @@ REPL はエラー後も次の入力を受け付けます。ファイル実行で
 ### 6.3 ラムダ
 
 ```myon
+module myon.stdio
 threshold = 10
 is_over = myon.lambda(x: int) ret bool { ret x > threshold }
 myon.print(is_over(15))
@@ -271,6 +278,8 @@ MVM の捕捉セルとネイティブへの受け渡し制約は MVM リファ�
 `myon.array(T)` は要素型情報を持つ空配列を作ります。
 
 ```myon
+module myon.array
+module myon.stdio
 xs = myon.array(int)
 xs.push(1)
 xs.push(2)
@@ -303,6 +312,8 @@ slice/map/filter は新しい配列を返します。map/filter/reduce の関数
 MVM からネイティブ側へ渡す処理には未対応の境界があります。
 
 ```myon
+module myon.array
+module myon.stdio
 xs = myon.array(int)
 xs.push(3)
 xs.push(1)
@@ -316,6 +327,7 @@ myon.print(part)
 フィールドとメソッドを宣言し、フィールド名付きの引数でインスタンスを作ります。
 
 ```myon
+module myon.stdio
 myon.struct Person {
     name: str
     age: int
@@ -339,6 +351,7 @@ p.greet()
 `myon.expose` は束縛を1つ外側へ持ち出します。
 
 ```myon
+module myon.stdio
 {
     exported = 7
     myon.expose exported
@@ -365,7 +378,7 @@ myon.print(exported)
 ### 10.1 標準入出力
 
 出力関数は各引数を文字列化し、順に連結します。名前付き引数には対応しません。
-組み込み宣言 `module myon.stdio` を例で使用しますが、現実装は宣言を利用ゲートにしていません。
+これらの入出力関数にはトップレベルの `module myon.stdio` 宣言が必要です。
 
 | 関数 | シグネチャ | 説明 |
 |------|-----------|------|
@@ -393,7 +406,7 @@ myon script.myon -- --help
 
 ### 10.2 ファイル入出力
 
-`module myon.file` を宣言できます。読み書き API は結果と error を返します。
+`module myon.file` を宣言して使用します。読み書き API は結果と error を返します。
 処理対象のパスは実行環境のファイルシステムに解決され、サンドボックスによる制限はありません。
 
 | 関数 | シグネチャ | 説明 |
@@ -405,6 +418,7 @@ myon script.myon -- --help
 
 ```myon
 module myon.file
+module myon.stdio
 ok, err = myon.file.write("/tmp/myon-example.txt", "hello")
 myon.if err == myon.nil then {
     content, read_err = myon.file.read("/tmp/myon-example.txt")
@@ -450,6 +464,7 @@ ABI と符号・値域を利用者が確認してください。「下位32ビ�
 
 ```myon
 module myon.ffi
+module myon.stdio
 h, err = myon.ffi.load(str("libm.so.6"))
 myon.if err == myon.nil then {
     result, call_err = myon.ffi.call_d(h, str("sqrt"), str("d"), 16.0)
@@ -647,6 +662,8 @@ upper/lower はUnicode 17.0.0のDefault Case Conversion（full mapping）を使�
 | `from_float` | `(f: float) ret str` | 浮動小数点数を文字列化（15〜17桁から往復を確認して選択。下記参照） |
 
 ```myon
+module myon.stdio
+module myon.string
 myon.print(myon.string.length("あ"))
 myon.print(myon.string.length_chars("あ"))
 part, err = myon.string.substring("こんにちは", 1, 3)
@@ -743,6 +760,7 @@ serve は method/path/body の3文字列をハンドラへ渡します。
 
 ```myon
 module myon.http
+module myon.array
 myon.func handler(method: str, path: str, body: str) ret myon.array(str) {
     response = myon.array(str)
     response.push("404")
@@ -788,7 +806,16 @@ URLのホスト・ポート・パスに含まれる制御文字と範囲外ポ�
 | パッケージ | `module example.tools as tools` | ロック内の module 名前空間と配置済みソース |
 
 パッケージは alias が必要です。module名とパッケージ名・リポジトリ名を区別します。
-組み込み module 宣言で機能を制限する処理は未実装です。
+組み込み関数には対応するmoduleの宣言が必要です。入出力は `myon.stdio`、
+`myon.math.*` などは各名前空間の宣言を要求します。`myon.array(...)` / `myon.map(...)` の
+明示的な生成にはそれぞれ `myon.array` / `myon.map` を宣言します。
+スカラー型変換・制御構文・型注釈・既存コレクションのメソッドはこの条件に含めません。
+
+トップレベルの組み込み宣言は、本文と外部取り込みの実行に先立って有効になります。
+重複宣言は無害で、宣言の効果はインタプリタ内で累積します。REPLでは次の入力へ引き継ぎ、
+取り込んだモジュールの宣言も同じセッションへ共有します。新しいインタプリタでは初期化します。
+ブロック・関数内でmodule宣言を実行するとエラーです。宣言の検査は引数の評価前に行います。
+これはAPIの利用条件であり、ファイル・ネットワークなどの権限分離ではありません。
 external とパッケージの取り込みはツリーウォーク専用です。
 
 形式・解決規則は [パッケージマネージャー](package_manager.md)、
@@ -898,6 +925,8 @@ int の範囲を超えた整数リテラルはパース時に拒否します。
 ### 14.2 Map
 
 ```myon
+module myon.map
+module myon.stdio
 m = myon.map(str, int)
 m.set("age", 20)
 myon.print(m.get("age"))
@@ -913,8 +942,11 @@ myon.print(m.get("age"))
 | `values` | `() ret myon.array(V)` | 全値を要素型`V`の配列で返す |
 | `length` | `() ret int` | エントリ数 |
 
-キー型は str/int を想定した API です。現実装の列挙順序を挿入順として利用しないでください。
-keys/values の順序は保証しません。探索コストと順序の課題は既知の問題18です。
+キー型は str/int を想定したAPIです。比較は従来どおり型を区別する `value_equal` を使います。
+ハッシュ索引による検索・更新・削除は平均O(1)、拡張時の再ハッシュはO(n)、lengthはO(1)です。
+衝突が集中した場合はO(n)になります。文字列キーのハッシュ計算と比較はバイト長に比例します。
+keys/valuesとMapの表示は挿入順です。既存キーの更新は位置を維持し、削除後の再追加は末尾になります。
+keysとvaluesは対応する順序で返します。
 
 ### 14.3 関数内の制御フロー
 
@@ -945,6 +977,8 @@ ret で関数から戻ります。任意位置への goto 構文はありませ�
 ### 14.8 ジェネリクス
 
 ```myon
+module myon.array
+module myon.stdio
 myon.struct Box<T> { value: T }
 box = Box<int>(value=5)
 myon.print(box.value)
@@ -961,6 +995,7 @@ MVM は型消去でコンパイルし、型引数ごとの単相化は行いま�
 
 ```myon
 module myon.time
+module myon.stdio
 myon.async myon.func fetch() ret str {
     myon.await myon.time.sleep_ms(10)
     ret str("done")
@@ -989,7 +1024,7 @@ WindowsのFiberエントリはreturnせず、完了を記録してmain_fiberへ�
 
 未対応なのは IPv6、TLSサーバー、HTTP Keep-Alive、MVMのmoduleリンクとREPL、
 VM関数値をネイティブ側で実行するコールバックなどです。
-module宣言の利用制限や異常終了時のリークなど、実装上の問題は既知一覧で状態を管理します。
+異常終了時のリークなど、実装上の問題は既知一覧で状態を管理します。
 マルチスレッド化や追加の型制約は、現実装の仕様ではありません。
 
 HTTPハンドラのステータス/Content-Type指定、HTTPSクライアント、クロージャ、
@@ -1001,6 +1036,7 @@ asyncのMVM対応は既に実装されており、未実装項目とは区別し
 system myon.useversion=1
 module myon.stdio
 
+module myon.array
 myon.struct Person {
     name: str
     myon.func greet() ret void {

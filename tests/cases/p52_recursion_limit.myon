@@ -1,3 +1,4 @@
+module myon.stdio
 /*
  * Phase5.2 regression: unbounded (effectively-infinite for our purposes)
  * recursion must be caught by the interpreter's call-depth guard and reported

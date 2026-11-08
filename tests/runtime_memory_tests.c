@@ -6,6 +6,7 @@
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <math.h>
 
 static void cycles(void) {
     size_t base = value_live_allocations();
@@ -170,7 +171,112 @@ static void userdata_lifetime(void) {
     assert(value_live_allocations() == base);
 }
 
+static void map_index(void) {
+    size_t base = value_live_allocations();
+    Value m = value_map(NULL, NULL), got;
+    for (int i = 0; i < 20000; i++) map_set(&m, value_int(i), value_int(i * 3));
+    MapData *data = &m.as.obj->as.map;
+    assert(data->count == 20000 && data->bucket_count >= 20000);
+    int collisions = 0;
+    for (size_t i = 0; i < data->bucket_count; i++)
+        if (data->buckets[i] && data->buckets[i]->hash_next) collisions++;
+    assert(collisions > 0);
+    int order = 0;
+    for (MapEntry *e = data->head; e; e = e->next) assert(e->key.as.i == order++);
+    assert(order == 20000);
+    for (int i = 0; i < 20000; i++) {
+        Value key = value_int(i);
+        assert(map_get(&m, &key, &got) && got.as.i == i * 3);
+        value_free(&got);
+        if (i % 2) assert(map_delete(&m, &key));
+    }
+    assert(data->count == 10000);
+    order = 0;
+    for (MapEntry *e = data->head; e; e = e->next) { assert(e->key.as.i == order); order += 2; }
+    for (int i = 1; i < 20000; i += 2) map_set(&m, value_int(i), value_int(-i));
+    map_set(&m, value_int(0), value_int(99));
+    assert(data->head->key.as.i == 0 && data->tail->key.as.i == 19999);
+    Value key = value_int(0); assert(map_delete(&m, &key));
+    key = value_int(19999); assert(map_delete(&m, &key));
+    key = value_int(1000); assert(map_delete(&m, &key));
+    assert(!map_delete(&m, &key) && !map_has(&m, &key));
+    assert(data->head->prev == NULL && data->tail->next == NULL && data->count == 19997);
+    value_free(&m);
+
+    m = value_map(NULL, NULL);
+    for (int i = 0; i < 1000; i++) {
+        char name[32]; snprintf(name, sizeof(name), "key-%d", i);
+        map_set(&m, value_str(myon_strdup(name)), value_int(i));
+    }
+    for (int i = 999; i >= 0; i--) {
+        char name[32]; snprintf(name, sizeof(name), "key-%d", i);
+        Value k = value_str(myon_strdup(name));
+        assert(map_get(&m, &k, &got) && got.as.i == i);
+        value_free(&got);
+        if (i % 3 == 0) assert(map_delete(&m, &k));
+        value_free(&k);
+    }
+    assert(m.as.obj->as.map.count == 666);
+    value_free(&m);
+
+    /* Preserve the existing value_equal contract, including type distinctions,
+     * float signed zero, and identity keys whose contents can change. */
+    m = value_map(NULL, NULL);
+    map_set(&m, value_float(0.0), value_int(1));
+    map_set(&m, value_float(-0.0), value_int(2));
+    key = value_float(0.0);
+    assert(map_get(&m, &key, &got) && got.as.i == 2);
+    value_free(&got);
+    map_set(&m, value_int(0), value_int(3));
+    map_set(&m, value_bool(0), value_int(4));
+    map_set(&m, value_str(myon_strdup("same")), value_int(5));
+    map_set(&m, value_char(myon_strdup("same")), value_int(6));
+    map_set(&m, value_error(myon_strdup("same")), value_int(7));
+    key = value_str(myon_strdup("same"));
+    assert(map_get(&m, &key, &got) && got.as.i == 5);
+    value_free(&got); value_free(&key);
+    key = value_array(NULL);
+    map_set(&m, value_copy(&key), value_int(8));
+    array_push(&key, value_int(42));
+    assert(map_get(&m, &key, &got) && got.as.i == 8);
+    value_free(&got); value_free(&key);
+    assert(m.as.obj->as.map.count == 7);
+    value_free(&m);
+
+    /* A dense independent oracle exercises replacement/deletion/lookup. */
+    m = value_map(NULL, NULL);
+    int present[257] = {0};
+    long long expected[257] = {0};
+    size_t count = 0;
+    uint32_t rng = 7;
+    for (int i = 0; i < 60000; i++) {
+        rng = rng * UINT32_C(1664525) + UINT32_C(1013904223);
+        unsigned int k = (rng >> 8) % 257, operation = rng % 3;
+        key = value_int(k);
+        if (operation == 0) {
+            map_set(&m, key, value_int(i));
+            if (!present[k]) count++;
+            present[k] = 1; expected[k] = i;
+        } else if (operation == 1) {
+            assert(map_delete(&m, &key) == present[k]);
+            if (present[k]) count--;
+            present[k] = 0;
+        } else {
+            assert(map_get(&m, &key, &got) == present[k]);
+            if (present[k]) { assert(got.as.i == expected[k]); value_free(&got); }
+        }
+        assert(m.as.obj->as.map.count == count);
+    }
+    value_free(&m);
+    m = value_map(NULL, NULL);
+    map_set(&m, value_copy(&m), value_copy(&m));
+    value_free(&m);
+    value_collect_cycles();
+    assert(value_live_allocations() == base);
+}
+
 int main(void) {
+    map_index();
     cycles();
     tasks();
     task_result_cycle();

@@ -38,6 +38,7 @@ for expected in tests/cases/*.out; do
     run_case "$src" mvm 0
 done
 cat > "$scratch/ready.myon" <<'MYON'
+module myon.stdio
 myon.async myon.func pending(payload: str) ret str {
     ret payload
 }
@@ -46,6 +47,7 @@ myon.print(1 / 0)
 MYON
 cat > "$scratch/suspended.myon" <<'MYON'
 module myon.time
+module myon.stdio
 myon.async myon.func pending(payload: str) ret str {
     myon.func capture() ret str { ret payload }
     myon.time.sleep_ms(60000)

@@ -1,3 +1,4 @@
+module myon.stdio
 n = int("123")
 s = str(456)
 c = char(65)

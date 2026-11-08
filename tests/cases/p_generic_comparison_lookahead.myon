@@ -1,4 +1,6 @@
 module myon.stdio
+module myon.array
+module myon.map
 myon.struct Box<T> { value: T }
 myon.struct Pair<A, B> { first: A; second: B }
 a = 1

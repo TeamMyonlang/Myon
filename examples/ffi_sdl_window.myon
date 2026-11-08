@@ -17,6 +17,7 @@ module myon.ffi
 # SDL_WINDOWPOS_UNDEFINED  = 0x1FFF0000 = 536805376
 # SDL_WINDOW_SHOWN         = 0x00000004 = 4
 
+module myon.stdio
 handle, err = myon.ffi.load(str("libSDL2-2.0.so.0"))
 myon.if err != myon.nil then {
     myon.print(str("SDL2 not available; skipping demo"))

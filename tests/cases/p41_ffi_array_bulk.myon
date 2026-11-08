@@ -2,6 +2,7 @@
 module myon.ffi
 module myon.stdio
 
+module myon.array
 id, e = myon.ffi.alloc(64)
 
 xs = myon.array(int)

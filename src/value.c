@@ -233,6 +233,7 @@ static void obj_destroy_payload(Obj *o) {
                 free(e);
                 e = n;
             }
+            free(o->as.map.buckets);
             typespec_free(o->as.map.key_type);
             typespec_free(o->as.map.val_type);
             break;
@@ -630,52 +631,110 @@ int array_pop(Value *av, Value *out) {
 /* Map helpers                                                         */
 /* ------------------------------------------------------------------ */
 
-static MapEntry *map_find(MapData *m, const Value *key) {
-    for (MapEntry *e = m->head; e; e = e->next)
-        if (value_equal(&e->key, key)) return e;
+static uint64_t map_hash(const Value *key) {
+    uint64_t h = 0;
+    switch (key->type) {
+        case TYPE_STR: case TYPE_CHAR: case TYPE_ERROR: {
+            h = UINT64_C(14695981039346656037);
+            const unsigned char *s = (const unsigned char *)key->as.obj->as.str;
+            while (*s) { h ^= *s++; h *= UINT64_C(1099511628211); }
+            break;
+        }
+        case TYPE_INT: h = (uint64_t)key->as.i; break;
+        case TYPE_BOOL: h = (uint64_t)key->as.b; break;
+        case TYPE_FLOAT:
+            /* value_equal considers +0 and -0 equal; hash them identically. */
+            if (key->as.f != 0.0) memcpy(&h, &key->as.f, sizeof(h));
+            break;
+        case TYPE_NIL: break;
+        default: h = (uint64_t)(uintptr_t)key->as.obj; break;
+    }
+    h ^= (uint64_t)key->type * UINT64_C(0x9e3779b97f4a7c15);
+    h = (h ^ (h >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
+    h = (h ^ (h >> 27)) * UINT64_C(0x94d049bb133111eb);
+    return h ^ (h >> 31);
+}
+static MapEntry *map_find(MapData *m, const Value *key, uint64_t hash) {
+    if (!m->bucket_count) return NULL;
+    for (MapEntry *e = m->buckets[hash & (m->bucket_count - 1)]; e; e = e->hash_next)
+        if (e->hash == hash && value_equal(&e->key, key)) return e;
     return NULL;
+}
+static void map_grow(MapData *m) {
+    size_t count = 16, bytes;
+    if ((m->bucket_count && !checked_mul_size(m->bucket_count, 2, &count)) ||
+        !checked_mul_size(count, sizeof(MapEntry *), &bytes)) {
+        fprintf(stderr, "myon: map index size overflow\n");
+        exit(70);
+    }
+    MapEntry **buckets = myon_xmalloc(bytes);
+    memset(buckets, 0, bytes);
+    for (MapEntry *e = m->head; e; e = e->next) {
+        size_t bucket = e->hash & (count - 1);
+        e->hash_next = buckets[bucket];
+        buckets[bucket] = e;
+    }
+    free(m->buckets);
+    m->buckets = buckets;
+    m->bucket_count = count;
 }
 
 void map_set(Value *mv, Value key, Value val) {
     MapData *m = &mv->as.obj->as.map;
-    MapEntry *e = map_find(m, &key);
+    uint64_t hash = map_hash(&key);
+    MapEntry *e = map_find(m, &key, hash);
     if (e) {
         value_free(&e->val);
         e->val = val;
         value_free(&key);
         return;
     }
-    e = (MapEntry *)myon_xmalloc(sizeof(MapEntry));
+    if (!m->bucket_count || m->count >= m->bucket_count - m->bucket_count / 4)
+        map_grow(m);
+    e = myon_xmalloc(sizeof(MapEntry));
     e->key = key;
     e->val = val;
-    e->next = m->head;
-    m->head = e;
+    e->hash = hash;
+    e->next = NULL;
+    e->prev = m->tail;
+    if (m->tail) m->tail->next = e;
+    else m->head = e;
+    m->tail = e;
+    size_t bucket = hash & (m->bucket_count - 1);
+    e->hash_next = m->buckets[bucket];
+    m->buckets[bucket] = e;
+    m->count++;
 }
 
 int map_get(Value *mv, const Value *key, Value *out) {
-    MapEntry *e = map_find(&mv->as.obj->as.map, key);
+    MapEntry *e = map_find(&mv->as.obj->as.map, key, map_hash(key));
     if (!e) return 0;
     *out = value_copy(&e->val);
     return 1;
 }
-
 int map_has(Value *mv, const Value *key) {
-    return map_find(&mv->as.obj->as.map, key) != NULL;
+    return map_find(&mv->as.obj->as.map, key, map_hash(key)) != NULL;
 }
-
 int map_delete(Value *mv, const Value *key) {
     MapData *m = &mv->as.obj->as.map;
-    MapEntry **pp = &m->head;
-    while (*pp) {
-        if (value_equal(&(*pp)->key, key)) {
-            MapEntry *dead = *pp;
-            *pp = dead->next;
-            value_free(&dead->key);
-            value_free(&dead->val);
-            free(dead);
+    if (!m->bucket_count) return 0;
+    uint64_t hash = map_hash(key);
+    MapEntry **link = &m->buckets[hash & (m->bucket_count - 1)];
+    while (*link) {
+        MapEntry *e = *link;
+        if (e->hash == hash && value_equal(&e->key, key)) {
+            *link = e->hash_next;
+            if (e->prev) e->prev->next = e->next;
+            else m->head = e->next;
+            if (e->next) e->next->prev = e->prev;
+            else m->tail = e->prev;
+            m->count--;
+            value_free(&e->key);
+            value_free(&e->val);
+            free(e);
             return 1;
         }
-        pp = &(*pp)->next;
+        link = &e->hash_next;
     }
     return 0;
 }

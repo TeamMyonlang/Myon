@@ -5,6 +5,8 @@
 # library somehow "loads", we exit normally, which fails the .err expectation.
 module myon.ffi
 
+module myon.array
+module myon.stdio
 handle, err = myon.ffi.load(str("/nonexistent/path/libdoesnotexist.so"))
 
 myon.if err != myon.nil then {

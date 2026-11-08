@@ -19,6 +19,7 @@
 
 #include "types.h"
 #include <stddef.h>
+#include <stdint.h>
 
 /*
  * Runtime value representation (spec.md section 2 and beyond).
@@ -76,15 +77,22 @@ typedef struct {
     TypeSpec *elem_type;   /* declared element type (owned) */
 } ArrayData;
 
-/* map entry list (linear; keys are str or int) */
+/* Hash index with a separate insertion-order list; buckets borrow entries. */
 typedef struct MapEntry {
     Value            key;
     Value            val;
     struct MapEntry *next;
+    struct MapEntry *prev;
+    struct MapEntry *hash_next;
+    uint64_t         hash;
 } MapEntry;
 
 typedef struct {
     MapEntry *head;
+    MapEntry *tail;
+    MapEntry **buckets;
+    size_t bucket_count;
+    size_t count;
     TypeSpec *key_type;
     TypeSpec *val_type;
 } MapData;

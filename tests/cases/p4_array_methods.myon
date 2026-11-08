@@ -3,6 +3,7 @@
 module myon.stdio
 
 # sort / sort_desc on ints (in-place, destructive)
+module myon.array
 xs = myon.array(int)
 xs.push(3)
 xs.push(1)

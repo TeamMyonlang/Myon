@@ -159,8 +159,9 @@ typedef enum {
  * Minor 1: added the per-chunk `is_async` flag and the variable-length
  * MOP_MAKE_CLOSURE (upvalue capture) / MOP_LOAD_UPVALUE / MOP_STORE_UPVALUE /
  * MOP_SPAWN_ASYNC / MOP_AWAIT instructions for closures & async/await support.
+ * Minor 2: builtin module activation/checks are emitted as native calls.
  */
-#define MVM_VERSION_MINOR 1
+#define MVM_VERSION_MINOR 2
 #define MVM_ENDIAN_LITTLE 1
 
 /*

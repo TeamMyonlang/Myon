@@ -3,6 +3,7 @@
 # a second free of the same id surfaces an error (false); alloc(0) errors.
 module myon.ffi
 
+module myon.stdio
 id, err = myon.ffi.alloc(64)
 myon.if err != myon.nil then { myon.print(str("alloc_err")) } myon.else { myon.print(str("alloc_ok")) }
 myon.if id >= 0 then { myon.print(str("id_ok")) } myon.else { myon.print(str("id_bad")) }

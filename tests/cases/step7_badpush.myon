@@ -1,3 +1,4 @@
 module myon.stdio
+module myon.array
 xs = myon.array(int)
 xs.push(str("no"))

@@ -36,7 +36,7 @@ Obj と MVM の UpvalueCell を対象とするコレクタで回収します。
 | 数学 | `myon.math` | `p35_math_full`、`p35_math_int_precision`、`p4_math_integer` |
 | 文字列 | `myon.string` | `p35_string_full`、`p35_string_utf8_length`、`p_float_roundtrip` |
 | 配列 | `push/pop/length/sort/sort_desc/reverse/contains/index_of/slice/map/filter/reduce` | `p4_array_methods`、`p4_array_higher_order` |
-| Map | `set/get/has/delete/keys/values/length` | `p4_map_methods`。現実装は連結リスト。探索コストと列挙順序は既知の問題18 |
+| Map | `set/get/has/delete/keys/values/length` | `p4_map_methods`、`p_map_index_order`。ハッシュ索引と挿入順のリスト、lengthはO(1) |
 | 時刻 | `myon.time.now/now_ms/sleep_ms`、ゲームループ用関数 | `p4_time_basic`、`p51_time_frame_helpers` |
 | 乱数 | `myon.random.seed/int/float/secure_int` | `p4_random_basic`。int/float は rand 系、secure_int は OS の乱数源を使う |
 
@@ -110,6 +110,10 @@ SDL2、SDL_mixer、SQLite の利用例は `examples/ffi_*` にあります。
 外部ファイル・パッケージの module 取り込み、VM 関数値をネイティブ側で実行する
 コールバック、MVM 版 REPL は未対応です。`.myc` 単体の構造体実行には、宣言 AST が
 保存されないことによる制約もあります。MVM 仕様7節を参照してください。
+
+組み込みmoduleはトップレベルの宣言が必要です。標準ライブラリ呼び出しと明示的な配列/Map生成を
+両エンジンで検査します。`module_regressions.sh` は保存済みMYC1 1.2、REPL、外部取り込み、
+引数の副作用より先の検査も確認します。宣言はセッション内で共有し、権限分離は行いません。
 
 ## パッケージ管理
 

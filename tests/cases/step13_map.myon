@@ -1,4 +1,5 @@
 module myon.stdio
+module myon.map
 m = myon.map(str, int)
 m.set(str("age"), 20)
 myon.print(m.get(str("age")))
