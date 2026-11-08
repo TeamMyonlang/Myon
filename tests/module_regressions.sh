@@ -1,8 +1,20 @@
 #!/usr/bin/env bash
-set -eu
+set -eEu
 MYON=${1:-./myon}
 scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT
+report_failure() {
+    local rc=$1 line=$2 command=$3
+    echo "FAIL module regression at line $line (exit $rc): $command" >&2
+    for name in input.myon compile err repl.err; do
+        if [ -s "$scratch/$name" ]; then
+            echo "--- $name ---" >&2
+            cat "$scratch/$name" >&2
+        fi
+    done
+    return "$rc"
+}
+trap 'report_failure "$?" "$LINENO" "$BASH_COMMAND"' ERR
 checks=0
 run() {
     local engine=$1 expected=$2 rc=0
