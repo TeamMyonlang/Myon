@@ -308,6 +308,8 @@ struct Interp {
      * returns value_copy() of the requested slot, matching the ownership the
      * dispatchers expect from a normally-evaluated argument.
      */
+    MyonVMCaller vm_caller;
+    void        *vm_context;
     Value       *bridge_args;
     int          bridge_argc;
     /*
@@ -532,7 +534,7 @@ static Value cast_to_int(Interp *it, int line, Value v) {
             if (end == v.as.obj->as.str || *end != '\0') {
                 char *bad = myon_strdup(v.as.obj->as.str);
                 value_free(&v);
-                runtime_error(it, line, "int(): cannot parse '%s' as integer", bad);
+                runtime_error_free(it, line, bad, "int(): cannot parse '%s' as integer", bad);
             }
             value_free(&v);
             if (range_error) runtime_error(it, line, "int(): integer string out of range");
@@ -1970,19 +1972,6 @@ static int call_ffi(Interp *it, Env *env, const char *name, Expr *call, Value *o
                 "ffi.make_callback expects (func fn, int arg_count)")));
             return 1;
         }
-        /* A VM (MVM) closure encodes a chunk index in as.fn.mvm_chunk rather
-         * than a real FuncDecl*, so the tree-walk callback dispatcher (which
-         * runs FFI callbacks via call_function) cannot execute it.  Registering
-         * one would misbehave, so refuse cleanly: passing a VM function/lambda
-         * as an FFI callback is an MVM cross-engine limitation (spec §7).  Run
-         * the .myon source (tree-walk) for FFI-callback programs. */
-        if (fnv.as.obj->as.fn.mvm_chunk != 0) {
-            value_free(&fnv); value_free(&acv);
-            *out = make_result_pair(value_int(0), value_error(myon_strdup(
-                "MVM does not support passing a function/lambda as an FFI "
-                "callback (myon.ffi.make_callback); run the .myon source instead")));
-            return 1;
-        }
         int arg_count = (int)acv.as.i;
         value_free(&acv);
         if (arg_count < 0 || arg_count > MYON_FFI_CB_MAX_ARGS) {
@@ -3328,59 +3317,42 @@ static Value call_method(Interp *it, Env *env, Expr *call, Value recv,
                 array_push(&res, value_copy(&a->items[i]));
             return make_result_pair(res, value_nil());
         }
-        /* ---- Phase4, Step3: map / filter / reduce (higher-order,
-         *      lambda-friendly; reuse call_function) ---- */
-        if (strcmp(method, "map") == 0) {
-            if (argc != 1) runtime_error(it, line, "map expects 1 argument");
-            Value f = eval_arg(it, env, call, 0);
-            /* Element type of the result is inferred from the first mapped
-             * value's runtime type; an empty input yields an untyped array. */
-            Value res = value_array(NULL);
-            int typed = 0;
+        if (strcmp(method, "map") == 0 || strcmp(method, "filter") == 0 ||
+            strcmp(method, "reduce") == 0) {
+            int reduce = strcmp(method, "reduce") == 0;
+            int filter = strcmp(method, "filter") == 0;
+            if (argc != (reduce ? 2 : 1))
+                runtime_error(it, line, "%s expects %d argument(s)", method, reduce ? 2 : 1);
+            OwnedValues *owned = owned_values_new(it, 3);
+            for (int i = 0; i < 3; i++) owned->values[i] = value_nil();
+            owned->count = 3;
+            Value *v = owned->values; /* function, accumulator/result, element */
+            v[0] = eval_arg(it, env, call, 0);
+            if (reduce) v[1] = eval_arg(it, env, call, 1);
+            else v[1] = value_array(filter && a->elem_type ? typespec_clone(a->elem_type) : NULL);
             for (int i = 0; i < a->count; i++) {
-                Value elem = value_copy(&a->items[i]);
-                Value r = call_function(it, line, f, &elem, 1, NULL);
-                value_free(&elem);
-                if (!typed) {
-                    res.as.obj->as.arr.elem_type = typespec_prim(r.type);
-                    typed = 1;
+                v[2] = value_copy(&a->items[i]);
+                Value result;
+                if (reduce) {
+                    result = call_function(it, line, v[0], v + 1, 2, NULL);
+                    value_free(&v[1]);
+                    v[1] = result;
+                } else {
+                    result = call_function(it, line, v[0], v + 2, 1, NULL);
+                    if (filter) {
+                        if (value_truthy(&result)) array_push(&v[1], value_copy(&v[2]));
+                        value_free(&result);
+                    } else {
+                        if (i == 0) v[1].as.obj->as.arr.elem_type = typespec_prim(result.type);
+                        array_push(&v[1], result);
+                    }
                 }
-                array_push(&res, r);
+                value_free(&v[2]);
             }
-            value_free(&f);
-            return res;
-        }
-        if (strcmp(method, "filter") == 0) {
-            if (argc != 1) runtime_error(it, line, "filter expects 1 argument");
-            Value f = eval_arg(it, env, call, 0);
-            Value res = value_array(a->elem_type ? typespec_clone(a->elem_type) : NULL);
-            for (int i = 0; i < a->count; i++) {
-                Value elem = value_copy(&a->items[i]);
-                Value r = call_function(it, line, f, &elem, 1, NULL);
-                int keep = value_truthy(&r);
-                value_free(&r);
-                if (keep) array_push(&res, elem);
-                else value_free(&elem);
-            }
-            value_free(&f);
-            return res;
-        }
-        if (strcmp(method, "reduce") == 0) {
-            if (argc != 2) runtime_error(it, line, "reduce expects 2 arguments");
-            Value f = eval_arg(it, env, call, 0);
-            Value acc = eval_arg(it, env, call, 1);
-            for (int i = 0; i < a->count; i++) {
-                Value args2[2];
-                args2[0] = value_copy(&acc);
-                args2[1] = value_copy(&a->items[i]);
-                Value r = call_function(it, line, f, args2, 2, NULL);
-                value_free(&args2[0]);
-                value_free(&args2[1]);
-                value_free(&acc);
-                acc = r;
-            }
-            value_free(&f);
-            return acc;
+            Value result = v[1];
+            v[1] = value_nil();
+            owned_values_release(it, owned);
+            return result;
         }
         runtime_error(it, line, "unknown array method '%s'", method);
     }
@@ -3573,7 +3545,7 @@ static Value call_function(Interp *it, int line, Value fn, Value *args, int argc
         runtime_error(it, line, "attempt to call a non-function value (%s)", type_name(fn.type));
 
     FuncDecl *fd = fn.as.obj->as.fn.decl;
-    if (argc != fd->param_count)
+    if (!fn.as.obj->as.fn.mvm_chunk && argc != fd->param_count)
         runtime_error(it, line, "function '%s' expects %d argument(s), got %d",
                       fd->name ? fd->name : "<lambda>", fd->param_count, argc);
 
@@ -3592,12 +3564,21 @@ static Value call_function(Interp *it, int line, Value fn, Value *args, int argc
          * Do not apply the main-stack minimum (64) to sanitizer stacks. */
         max_depth = (int)(MYON_TASK_STACK_SIZE / 4 * 3 / MYON_CALL_FRAME_BYTES);
     }
+    /* Native -> VM -> native reentry adds a dispatch loop to each C frame. */
+    if (fn.as.obj->as.fn.mvm_chunk) max_depth /= 4;
     if (*call_depth >= max_depth)
         runtime_error(it, line,
             "call stack too deep: recursion exceeded %d nested calls "
             "(possible infinite recursion in '%s')",
-            max_depth, fd->name ? fd->name : "<lambda>");
+            max_depth, fd && fd->name ? fd->name : "<lambda>");
     (*call_depth)++;
+
+    if (fn.as.obj->as.fn.mvm_chunk) {
+        if (!it->vm_caller) runtime_error(it, line, "bytecode callback has no active VM");
+        Value result = it->vm_caller(it->vm_context, fn, args, argc, line);
+        (*call_depth)--;
+        return result;
+    }
 
     Env *call_env = env_new(fn.as.obj->as.fn.closure);
     /* Known-issue #1: register this frame so a runtime_error() longjmp from any
@@ -4592,7 +4573,11 @@ long long myon_ffi_callback_dispatch(int slot, int argc, const long long *args) 
      * accumulating here (no reset).  But if the body raises, the longjmp to the
      * barrier below skips the per-frame decrements, so snapshot the depth and
      * restore it on the way out to keep the counter balanced. */
-    int saved_depth = it->call_depth;
+    Task *running = interp_current_task(it);
+    int *depth = running ? event_loop_task_call_depth(running) : &it->call_depth;
+    int saved_depth = *depth;
+    Value *saved_args = it->bridge_args;
+    int saved_argc = it->bridge_argc;
     /* Known-issue #1: free the call frames a callback-body error longjmps over. */
     uint64_t cleanup_at = cleanup_mark(it);
 
@@ -4611,7 +4596,9 @@ long long myon_ffi_callback_dispatch(int slot, int argc, const long long *args) 
         ret = 0;
     }
 
-    it->call_depth = saved_depth;
+    *depth = saved_depth;
+    it->bridge_args = saved_args;
+    it->bridge_argc = saved_argc;
     /* restore the outer barrier */
     memcpy(interp_error_buf(it), &saved, sizeof(jmp_buf));
 
@@ -5904,6 +5891,19 @@ int interp_run(Interp *it, Program *program) {
 Interp *myon_bridge_interp_new(void)  { return interp_create(); }
 void    myon_bridge_interp_free(Interp *it) { interp_free(it); }
 void   *myon_bridge_error_buf(Interp *it) { return (void *)interp_error_buf(it); }
+void myon_bridge_set_vm_caller(Interp *it, MyonVMCaller caller, void *context) {
+    it->vm_caller = caller; it->vm_context = context;
+}
+void myon_bridge_own_resource(Interp *it, void *resource, void (*dispose)(void *)) {
+    cleanup_register(it, resource, dispose);
+}
+void myon_bridge_release_resource(Interp *it, void *resource) {
+    cleanup_forget(it, resource);
+}
+_Noreturn void myon_bridge_propagate_error(Interp *it) {
+    longjmp(*interp_error_buf(it), 1);
+}
+
 
 Value myon_bridge_binary(Interp *it, int line, int op, Value l, Value r) {
     /* eval_binary consumes l and r (spec §2.2 strict typing). */

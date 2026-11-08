@@ -1,0 +1,4 @@
+module myon.array
+xs = myon.array(str)
+xs.push("value")
+xs.reduce(myon.lambda(a: str, x: str) ret str { ret str(1 / 0) }, "initial")

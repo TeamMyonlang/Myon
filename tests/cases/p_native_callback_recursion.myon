@@ -1,0 +1,6 @@
+module myon.array
+xs = myon.array(int)
+xs.push(1)
+myon.func again(x: int) ret int { xs.map(again)
+    ret x }
+xs.map(again)

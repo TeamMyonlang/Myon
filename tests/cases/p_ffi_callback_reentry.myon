@@ -1,0 +1,37 @@
+module myon.ffi
+module myon.array
+module myon.stdio
+h, e = myon.ffi.load(str("tests/fixtures/libffi_callback_test.so"))
+total = 5
+f = myon.lambda() ret int { total = total + 1
+    ret total }
+p, ep = myon.ffi.make_callback(f, 0)
+r, er = myon.ffi.call_i(h, "call_noarg", "p", p)
+myon.print(r)
+r2, er2 = myon.ffi.call_i(h, "call_noarg", "p", p)
+myon.print(r2)
+# Errors in bytecode and in native functions stay inside the foreign barrier.
+bad = myon.lambda() ret int { ret 1 / 0 }
+bp, eb = myon.ffi.make_callback(bad, 0)
+b, be = myon.ffi.call_i(h, "call_noarg", "p", bp)
+myon.print(b)
+bad_native = myon.lambda() ret int { ret int("invalid") }
+bnp, ebn = myon.ffi.make_callback(bad_native, 0)
+bn, bne = myon.ffi.call_i(h, "call_noarg", "p", bnp)
+myon.print(bn)
+# Nested foreign callback reentry and another higher-order call afterward.
+myon.func outer() ret int {
+    inner, ie = myon.ffi.call_i(h, "call_noarg", "p", p)
+    ret inner + 100
+}
+op, eo = myon.ffi.make_callback(outer, 0)
+v, ve = myon.ffi.call_i(h, "call_noarg", "p", op)
+myon.print(v)
+xs = myon.array(int)
+xs.push(10)
+myon.print(xs.map(myon.lambda(x: int) ret int { ret x + 1 }))
+myon.ffi.free_callback(p)
+myon.ffi.free_callback(bp)
+myon.ffi.free_callback(bnp)
+myon.ffi.free_callback(op)
+myon.ffi.close(h)

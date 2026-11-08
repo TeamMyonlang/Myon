@@ -308,8 +308,8 @@ myon.print(xs.length())
 | `reduce` | `(f, init) ret ?` | `acc=init`から左畳み込み（各要素で`acc = f(acc, elem)`）。空配列は`init`をそのまま返す |
 
 sort/sort_desc/reverse は元の配列を変更します。push/pop も要素数を変更します。
-slice/map/filter は新しい配列を返します。map/filter/reduce の関数引数を
-MVM からネイティブ側へ渡す処理には未対応の境界があります。
+slice/map/filter は新しい配列を返します。map/filter/reduce はツリーウォークと MVM の
+両方の関数値を呼び出せます。MVM のコールバックは捕捉セルとグローバル変数を共有します。
 
 ```myon
 module myon.array
@@ -555,8 +555,9 @@ i32/f32 は1要素4バイト、i64/f64 は8バイトです。
 
 最大4引数、整数/ポインタ系、int64戻り値、同時16スロットのコールバックに対応します。
 double 引数や外部スレッドからの呼び出しには対応しません。
-静的トランポリンからツリーウォークの関数を呼び、関数内の実行時エラーは診断を表示して0を返します。
-C 側が参照している間は free_callback しないでください。MVM 関数値はこの境界に渡せません。
+静的トランポリンからツリーウォークまたは MVM の関数を呼びます。
+関数内の実行時エラーは診断を表示して0を返し、後続の C 呼び出しを継続します。
+C 側が参照している間は free_callback しないでください。
 
 ##### SDL の例
 
@@ -1022,8 +1023,7 @@ WindowsのFiberエントリはreturnせず、完了を記録してmain_fiberへ�
 
 ## 15. 現在の制約と検討対象
 
-未対応なのは IPv6、TLSサーバー、HTTP Keep-Alive、MVMのmoduleリンクとREPL、
-VM関数値をネイティブ側で実行するコールバックなどです。
+未対応なのは IPv6、TLSサーバー、HTTP Keep-Alive、MVMのmoduleリンクとREPLなどです。
 対応範囲と不具合の修正記録は既知一覧で管理します。
 マルチスレッド化や追加の型制約は、現実装の仕様ではありません。
 

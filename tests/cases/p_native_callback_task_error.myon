@@ -1,0 +1,13 @@
+module myon.array
+module myon.time
+xs = myon.array(str)
+xs.push("retained argument")
+myon.func wait(x: str) ret str {
+    myon.time.sleep_ms(60000)
+    ret x
+}
+myon.async myon.func pending() ret int { xs.map(wait)
+    ret 0 }
+myon.async myon.func fail() ret int { ret 1 / 0 }
+task = pending()
+myon.await fail()
