@@ -1,4 +1,5 @@
 module myon.stdio
+module myon.array
 myon.struct Hero {
     name: str
     hp: int

@@ -6,6 +6,7 @@
 # "did not crash").
 module myon.stdio
 
+module myon.array
 a = myon.array(int)
 a.push(1)
 a.push(2)

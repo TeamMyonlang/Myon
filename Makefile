@@ -152,7 +152,7 @@ endif
 
 asan: $(ASAN_BIN)
 
-$(ASAN_BIN): $(SOURCES) src/unicode_case_data.inc src/unicode.h
+$(ASAN_BIN): $(SOURCES) src/unicode_case_data.inc src/unicode.h src/value.h src/builtin_modules.h src/mvm_bytecode.h
 	$(ASAN_CC) $(ASAN_CFLAGS) -I$(SRC_DIR) $(SOURCES) -o $@ $(ASAN_LDLIBS)
 
 # Run the full regression suite against the sanitizer binary.
@@ -178,6 +178,7 @@ test-asan: $(ASAN_BIN) $(BUILD)/unicode_case_asan | $(BUILD)
 	export ASAN_OPTIONS="abort_on_error=1:halt_on_error=1:detect_leaks=0"; \
 	export UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=1:abort_on_error=1"; \
 	$(BUILD)/unicode_case_asan; \
+	bash tests/module_regressions.sh ./myon; \
 	bash tests/runtime_regressions.sh ./myon; \
 	bash tests/diagnostic_regressions.sh ./myon; \
 	bash tests/string_regressions.sh ./myon; \
@@ -283,6 +284,7 @@ RUNTIME_TEST_SRCS = tests/runtime_memory_tests.c src/value.c src/types.c \
 test-runtime: all test-unicode | $(BUILD)
 	$(CC) $(CFLAGS) -Isrc $(RUNTIME_TEST_SRCS) $(LDLIBS) -o $(BUILD)/runtime_memory_tests
 	$(BUILD)/runtime_memory_tests
+	bash tests/module_regressions.sh ./$(BIN)
 	bash tests/runtime_regressions.sh ./$(BIN)
 	bash tests/diagnostic_regressions.sh ./$(BIN)
 	bash tests/string_regressions.sh ./$(BIN)
@@ -307,3 +309,7 @@ test-unicode: | $(BUILD)
 
 $(BUILD)/unicode_case_asan: tests/unicode_case_tests.c src/unicode.c src/unicode.h src/unicode_case_data.inc src/common.c src/common.h | $(BUILD)
 	$(ASAN_CC) $(ASAN_CFLAGS) -Isrc tests/unicode_case_tests.c src/unicode.c src/common.c -o $@
+
+$(OBJECTS): src/value.h
+$(BUILD)/interpreter.o $(BUILD)/mvm_compiler.o: src/builtin_modules.h
+$(BUILD)/mvm_chunk.o $(BUILD)/mvm_vm.o $(BUILD)/mvm_compiler.o: src/mvm_bytecode.h

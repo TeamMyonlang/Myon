@@ -10,6 +10,7 @@
 # tests/cases/.
 module myon.ffi
 
+module myon.stdio
 handle, err = myon.ffi.load(str("libsqlite3.so.0"))
 myon.if err != myon.nil then { myon.print(str("load failed")) } myon.else { myon.print(str("loaded")) }
 

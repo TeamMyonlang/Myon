@@ -16,6 +16,7 @@
 
 #include "mvm_compiler.h"
 #include "common.h"
+#include "builtin_modules.h"
 #include "diag.h"
 #include "lexer.h"
 #include "parser.h"
@@ -383,7 +384,8 @@ static void register_struct(Compiler *c, StructDecl *sd) {
  * any future out-of-scope native.
  */
 static void check_native_supported(Compiler *c, int line, const char *name) {
-    (void)c; (void)line; (void)name;
+    if (strncmp(name, "myon.__", 7) == 0)
+        compile_error(c, line, "reserved MVM intrinsic name");
 }
 
 /* ================================================================== */
@@ -472,10 +474,24 @@ static OpCode binary_opcode(OpKind k) {
     }
 }
 
+static void emit_module_instruction(Compiler *c, int line, const char *name, const char *module) {
+    Chunk *ch = cur_chunk(c);
+    if (module) {
+        int idx = module_add_const_str(c->module, module);
+        chunk_emit_op_u16(ch, MOP_PUSH_CONST, (uint16_t)idx, line);
+    }
+    int nid = module_add_native(c->module, name);
+    chunk_emit_op_u16(ch, MOP_CALL_NATIVE, (uint16_t)nid, line);
+    chunk_emit_byte(ch, module ? 1 : 0, line);
+    chunk_emit_op(ch, MOP_POP, line);
+}
+
 /* Compile a call whose callee is a builtin/native namespace (myon.*). */
 static void compile_native_call(Compiler *c, Expr *e, const char *name) {
     Chunk *ch = cur_chunk(c);
     check_native_supported(c, e->line, name);
+    const char *module = myon_call_module(name);
+    if (module) emit_module_instruction(c, e->line, "myon.__module_require", module);
     /*
      * Explicit type arguments (e.g. a generic native/user call `f<int>(...)`)
      * are type-erased in Myon (spec §14.8/§15): they never affect runtime
@@ -737,11 +753,13 @@ static void compile_expr(Compiler *c, Expr *e) {
             break;
         }
         case EXPR_ARRAY_CTOR: {
+            emit_module_instruction(c, e->line, "myon.__module_require", "myon.array");
             int tidx = module_add_const_typespec(c->module, e->as.array_elem);
             chunk_emit_op_u16(ch, MOP_NEW_ARRAY, (uint16_t)tidx, e->line);
             break;
         }
         case EXPR_MAP_CTOR: {
+            emit_module_instruction(c, e->line, "myon.__module_require", "myon.map");
             /* store a synthetic map typespec whose elem=val, key=key */
             TypeSpec *ms = typespec_new(TYPE_MAP);
             ms->key  = typespec_clone(e->as.map_types.key);
@@ -1154,33 +1172,20 @@ static void compile_stmt(Compiler *c, Stmt *s) {
             /* compile-time metadata only (spec §4.14 note); no code emitted */
             break;
         case STMT_MODULE: {
-            /*
-             * Builtin (`myon.*`) modules are compile-time metadata only — no
-             * code is emitted, matching the tree-walker.  *External* modules
-             * (`module external.*`), however, must actually load and inject
-             * their definitions; the MVM backend does not yet implement that
-             * (see ../known-issues.md).  Previously these were silently
-             * skipped, so any use of an external symbol later compiled to an
-             * "undefined" error or, worse, produced a .myc that behaved
-             * differently from the .myon.  Reject them explicitly instead so
-             * the divergence is loud, not silent (spec §11 / §2 equivalence). */
-            const char *mpath = s->as.module_decl.path;
-            if (mpath && strncmp(mpath, "external.", 9) == 0)
+            const char *path = s->as.module_decl.path;
+            if (c->fn->enclosing || c->fn->scope_depth != 0) {
+                emit_module_instruction(c, s->line, "myon.__module_nested", NULL);
+            } else if (myon_builtin_module_bit(path)) {
+                emit_module_instruction(c, s->line, "myon.__module_enable", path);
+            } else if (strcmp(path, "external") == 0 || strncmp(path, "external.", 9) == 0) {
                 unsupported(c, s->line, "external module imports (module external.*)",
-                    "The MVM backend cannot yet load external modules; run it as "
-                    ".myon (tree-walking) instead.");
-            /*
-             * Installed package modules (spec §6.2, e.g. `module example.tools
-             * as tools`) are neither a builtin `myon.*` module nor an
-             * `external.*` module.  The MVM has no package-module linking yet
-             * (spec §6.3), so — exactly as for external modules — reject them
-             * explicitly rather than silently skipping the import and letting a
-             * later symbol use diverge from the .myon behaviour. */
-            else if (mpath && strncmp(mpath, "myon.", 5) != 0 &&
-                     strcmp(mpath, "myon") != 0)
+                    "The MVM backend cannot yet load external modules; run the source instead.");
+            } else if (strcmp(path, "myon") == 0 || strncmp(path, "myon.", 5) == 0) {
+                compile_error(c, s->line, "unknown builtin module '%s'", path);
+            } else {
                 unsupported(c, s->line, "installed package module imports",
-                    "The MVM backend cannot yet load installed package modules "
-                    "(spec §6.3); run it as .myon (tree-walking) instead.");
+                    "The MVM backend cannot yet load installed package modules; run the source instead.");
+            }
             break;
         }
         case STMT_ASSIGN:
@@ -1425,7 +1430,11 @@ Module *mvm_compile_program(Program *program, const char *source_path) {
     }
 
     for (int i = 0; i < program->stmts.count; i++)
-        compile_stmt(&c, program->stmts.items[i]);
+        if (program->stmts.items[i]->kind == STMT_MODULE)
+            compile_stmt(&c, program->stmts.items[i]);
+    for (int i = 0; i < program->stmts.count; i++)
+        if (program->stmts.items[i]->kind != STMT_MODULE)
+            compile_stmt(&c, program->stmts.items[i]);
 
     /* main returns nothing */
     chunk_emit_op_u8(cur_chunk(&c), MOP_RET, 0, 0);

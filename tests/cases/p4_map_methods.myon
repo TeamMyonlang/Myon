@@ -1,8 +1,9 @@
 # Phase4 Step2: myon.map keys / values / length.
-# Map iteration order is not guaranteed, so keys()/values() are sorted
-# before comparison to keep the expected output deterministic.
+# This case checks membership independently of order. Insertion order is
+# checked separately by p_map_index_order.
 module myon.stdio
 
+module myon.map
 m = myon.map(str, int)
 m.set(str("a"), 1)
 m.set(str("b"), 2)

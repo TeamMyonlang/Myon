@@ -9,6 +9,7 @@
 # identical on every OS where FFI is supported.
 module myon.ffi
 
+module myon.stdio
 handle, err = myon.ffi.load(str("this_library_does_not_exist_zzz.so"))
 
 myon.print(handle)

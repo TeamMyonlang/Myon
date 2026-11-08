@@ -7,7 +7,7 @@ trap 'rm -rf "$scratch"' EXIT
 checks=0
 check_error() {
     local source="$1" diagnostic="$2" engine rc
-    printf 'module myon.math\n%s\n' "$source" > "$scratch/input.myon"
+    printf 'module myon.stdio\nmodule myon.math\n%s\n' "$source" > "$scratch/input.myon"
     for engine in tree mvm; do
         rc=0
         if [ "$engine" = tree ]; then

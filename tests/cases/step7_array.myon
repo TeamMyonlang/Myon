@@ -1,4 +1,5 @@
 module myon.stdio
+module myon.array
 xs = myon.array(int)
 xs.push(10)
 xs.push(20)

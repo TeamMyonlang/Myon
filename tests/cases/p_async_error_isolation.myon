@@ -1,4 +1,5 @@
 module myon.time
+module myon.stdio
 myon.async myon.func fail(delay: int) ret int {
     myon.time.sleep_ms(delay)
     myon.print(1 / 0)

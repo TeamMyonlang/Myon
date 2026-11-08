@@ -3,6 +3,7 @@
 module myon.ffi
 module myon.stdio
 
+module myon.array
 rf = myon.array(str)
 rf.push(str("i32"))
 rf.push(str("i32"))

@@ -5,6 +5,7 @@
 # than the exact string.
 module myon.ffi
 
+module myon.stdio
 handle, err = myon.ffi.load(str("libz.so.1"))
 myon.if err != myon.nil then { myon.print(str("LOAD_FAIL")) } myon.else { myon.print(str("loaded")) }
 

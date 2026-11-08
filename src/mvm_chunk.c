@@ -719,10 +719,10 @@ Module *mvm_module_read_file(const char *path) {
     if (rd8(&r) != MVM_MAGIC0 || rd8(&r) != MVM_MAGIC1 ||
         rd8(&r) != MVM_MAGIC2 || rd8(&r) != MVM_MAGIC3) { free(data); return NULL; }
     uint8_t major = rd8(&r);
-    (void)rd8(&r);            /* minor */
+    uint8_t minor = rd8(&r);
     uint8_t endian = rd8(&r);
     (void)rd8(&r);            /* flags */
-    if (major != MVM_VERSION_MAJOR || endian != MVM_ENDIAN_LITTLE) { free(data); return NULL; }
+    if (major != MVM_VERSION_MAJOR || minor != MVM_VERSION_MINOR || endian != MVM_ENDIAN_LITTLE) { free(data); return NULL; }
 
     uint32_t const_off = rd32(&r);
     (void)rd32(&r);           /* const size */

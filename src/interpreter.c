@@ -30,6 +30,7 @@
 #include "value.h"
 #include "env.h"
 #include "common.h"
+#include "builtin_modules.h"
 #include "unicode.h"
 #include "lexer.h"
 #include "parser.h"
@@ -256,6 +257,7 @@ struct Interp {
     Env         *global;
     StructReg    structs;
     ModuleEntry *modules;
+    uint32_t     enabled_modules;
     jmp_buf      on_error;
     /* return-value transport */
     Value       *ret_values;
@@ -399,6 +401,16 @@ static void runtime_error_owned(Interp *it, int line, char *message) {
     free(message);
     diag_print_snippet(line, 1);
     longjmp(*interp_error_buf(it), 1);
+}
+
+static void require_module(Interp *it, int line, const char *module) {
+    uint32_t bit = myon_builtin_module_bit(module);
+    if (!bit || !(it->enabled_modules & bit))
+        runtime_error(it, line, "module '%s' is not declared; add 'module %s'", module, module);
+}
+static void require_native_module(Interp *it, int line, const char *name) {
+    const char *module = myon_call_module(name);
+    if (module) require_module(it, line, module);
 }
 
 static Value eval_expr(Interp *it, Env *env, Expr *e);
@@ -3355,9 +3367,7 @@ static Value call_method(Interp *it, Env *env, Expr *call, Value recv,
         }
         if (strcmp(method, "length") == 0) {
             if (argc != 0) runtime_error(it, line, "length expects 0 arguments");
-            long long n = 0;
-            for (MapEntry *e = m->head; e; e = e->next) n++;
-            return value_int(n);
+            return value_int((long long)m->count);
         }
         runtime_error(it, line, "unknown map method '%s'", method);
     }
@@ -4551,6 +4561,7 @@ static Value eval_call(Interp *it, Env *env, Expr *e) {
     /* builtin ident callees */
     if (callee->kind == EXPR_IDENT) {
         const char *name = callee->as.ident;
+        require_native_module(it, line, name);
         if (strcmp(name, "myon.print") == 0) return builtin_print(it, env, e);
         if (strcmp(name, "myon.println") == 0) return builtin_println(it, env, e);
         if (strcmp(name, "myon.write") == 0) return builtin_write(it, env, e);
@@ -4687,8 +4698,10 @@ static Value eval_expr(Interp *it, Env *env, Expr *e) {
         }
 
         case EXPR_ARRAY_CTOR:
+            require_module(it, e->line, "myon.array");
             return value_array(typespec_clone(e->as.array_elem));
         case EXPR_MAP_CTOR:
+            require_module(it, e->line, "myon.map");
             return value_map(typespec_clone(e->as.map_types.key),
                              typespec_clone(e->as.map_types.val));
 
@@ -4979,7 +4992,7 @@ static Flow exec_stmt(Interp *it, Env *env, Stmt *s) {
         case STMT_SYSTEM:
             return FLOW_NORMAL;
         case STMT_MODULE:
-            /* module loading handled in interpret() preamble; no-op here */
+            runtime_error(it, s->line, "module declarations are only allowed at top level");
             return FLOW_NORMAL;
 
         case STMT_FUNC: {
@@ -5223,16 +5236,8 @@ static Flow exec_block(Interp *it, Env *env, StmtList *body) {
 /* Module loading (Step 11)                                            */
 /* ------------------------------------------------------------------ */
 
-static const char *BUILTIN_MODULES[] = {
-    "myon.stdio", "myon.math", "myon.string", "myon.ffi",
-    "myon.time", "myon.random", "myon.net", "myon.http",
-    "myon.file", "myon.array", "myon.map", NULL
-};
-
 static int is_builtin_module(const char *path) {
-    for (int i = 0; BUILTIN_MODULES[i]; i++)
-        if (strcmp(BUILTIN_MODULES[i], path) == 0) return 1;
-    return 0;
+    return myon_builtin_module_bit(path) != 0;
 }
 
 static ModuleEntry *find_module(Interp *it, const char *path) {
@@ -5264,7 +5269,7 @@ static void interp_retain_program(Interp *it, Program *prog);
  * responsibilities stay separated (legacy `external.*`, installed package, and
  * builtin) rather than being tangled into a single function:
  *
- *   myon.*        -> builtin module (recorded only)
+ *   myon.*        -> builtin module (enabled and recorded)
  *   external.*    -> legacy external resolver, relative to the script directory
  *   <anything>    -> installed package module resolver (validated against the
  *                    project's myon.lock and the on-disk .myon/packages tree)
@@ -5272,7 +5277,8 @@ static void interp_retain_program(Interp *it, Program *prog);
 static void handle_module_decl(Interp *it, Stmt *s) {
     const char *path = s->as.module_decl.path;
     if (is_builtin_module(path)) {
-        /* builtin: just record it */
+        it->enabled_modules |= myon_builtin_module_bit(path);
+        if (find_module(it, path)) return;
         ModuleEntry *m = (ModuleEntry *)myon_xmalloc(sizeof(ModuleEntry));
         m->path = myon_strdup(path);
         m->alias = s->as.module_decl.alias ? myon_strdup(s->as.module_decl.alias) : NULL;
@@ -5289,6 +5295,17 @@ static void handle_module_decl(Interp *it, Stmt *s) {
     }
     /* installed package module: resolved from myon.lock + .myon/packages/. */
     load_package_module(it, s);
+}
+
+/* Enable all builtin declarations before executing any imported module body. */
+static void load_program_modules(Interp *it, Program *program) {
+    for (int builtin = 1; builtin >= 0; builtin--)
+        for (int i = 0; i < program->stmts.count; i++) {
+            Stmt *stmt = program->stmts.items[i];
+            if (stmt->kind == STMT_MODULE &&
+                is_builtin_module(stmt->as.module_decl.path) == builtin)
+                handle_module_decl(it, stmt);
+        }
 }
 
 /*
@@ -5328,12 +5345,10 @@ static void exec_module_file(Interp *it, Stmt *decl, ModuleEntry *m,
      * their own namespace env (`m.<name>` access); unaliased ones flatten into
      * global (historical simple namespace model). */
     prescan(it, target, mp);
-    for (int i = 0; i < mp->stmts.count; i++) {
-        if (mp->stmts.items[i]->kind == STMT_MODULE)
-            handle_module_decl(it, mp->stmts.items[i]);
-        else
+    load_program_modules(it, mp);
+    for (int i = 0; i < mp->stmts.count; i++)
+        if (mp->stmts.items[i]->kind != STMT_MODULE)
             exec_stmt(it, target, mp->stmts.items[i]);
-    }
 
     /* Retain the module AST for the interpreter's lifetime: function/struct
      * values captured above reference its nodes, so it must outlive the run and
@@ -5737,9 +5752,7 @@ void interp_free(Interp *it) {
  */
 static int run_toplevel(Interp *it, Program *program) {
     /* load modules first (so external decls hoist) */
-    for (int i = 0; i < program->stmts.count; i++)
-        if (program->stmts.items[i]->kind == STMT_MODULE)
-            handle_module_decl(it, program->stmts.items[i]);
+    load_program_modules(it, program);
 
     /* hoist struct/function declarations */
     prescan(it, it->global, program);
@@ -5854,6 +5867,20 @@ static Expr bridge_make_call_expr(int line, int argc) {
 
 int myon_bridge_call_native(Interp *it, const char *name,
                             Value *args, int argc, int line, Value *out) {
+    if (strcmp(name, "myon.__module_nested") == 0)
+        runtime_error(it, line, "module declarations are only allowed at top level");
+    if (strcmp(name, "myon.__module_enable") == 0 || strcmp(name, "myon.__module_require") == 0) {
+        if (argc != 1 || args[0].type != TYPE_STR)
+            runtime_error(it, line, "invalid builtin module instruction");
+        const char *module = args[0].as.obj->as.str;
+        uint32_t bit = myon_builtin_module_bit(module);
+        if (!bit) runtime_error(it, line, "unknown builtin module '%s'", module);
+        if (strcmp(name, "myon.__module_enable") == 0) it->enabled_modules |= bit;
+        else require_module(it, line, module);
+        *out = value_void();
+        return 1;
+    }
+    require_native_module(it, line, name);
     Expr call = bridge_make_call_expr(line, argc);
     Value *saved_args = it->bridge_args;
     int    saved_argc = it->bridge_argc;

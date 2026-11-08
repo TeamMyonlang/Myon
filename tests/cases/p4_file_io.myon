@@ -1,4 +1,5 @@
 module myon.stdio
+module myon.file
 path = "/tmp/myon_p4_testcase.txt"
 ok, werr = myon.file.write(path, "line1")
 myon.if werr != myon.nil then { myon.print("WRITE_FAIL") } myon.else { myon.print("wrote") }

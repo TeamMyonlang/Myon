@@ -5,6 +5,7 @@
 # 0x4847464544434241 == 5208208757389214273.
 module myon.ffi
 
+module myon.stdio
 id, aerr = myon.ffi.alloc(16)
 myon.if aerr != myon.nil then { myon.print(str("alloc_err")) } myon.else { myon.print(str("alloc_ok")) }
 

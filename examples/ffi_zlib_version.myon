@@ -9,6 +9,7 @@
 
 module myon.ffi
 
+module myon.stdio
 handle, err = myon.ffi.load(str("libz.so.1"))
 myon.if err != myon.nil then {
     myon.print(str("load failed"))

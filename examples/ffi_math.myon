@@ -5,6 +5,7 @@
 
 module myon.ffi
 
+module myon.stdio
 handle, err = myon.ffi.load(str("libm.so.6"))
 myon.if err != myon.nil then {
     myon.print(str("load failed"))

@@ -19,6 +19,7 @@ module myon.stdio
 # 1. Struct-layout DSL (works everywhere, no SDL needed)
 # --------------------------------------------------------------------------
 # SDL_Rect (x, y, w, h) — four 32-bit int fields.
+module myon.array
 fields = myon.array(str)
 fields.push(str("i32"))   # x
 fields.push(str("i32"))   # y

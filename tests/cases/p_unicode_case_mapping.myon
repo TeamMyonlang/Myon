@@ -1,4 +1,5 @@
 module myon.string
+module myon.stdio
 myon.print(myon.string.upper(""))
 myon.print(myon.string.lower(""))
 myon.print(myon.string.upper("Hello 123"))

@@ -2,6 +2,7 @@
 module myon.stdio
 module myon.math
 
+module myon.array
 xs = myon.array(int)
 xs.push(1)
 xs.push(2)

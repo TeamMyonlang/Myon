@@ -10,6 +10,7 @@
 # tracks the current recursion *path*, not every object ever seen.
 module myon.stdio
 
+module myon.array
 myon.struct Node {
     name: str
     next: Node
