@@ -117,7 +117,7 @@ int main(int argc, char **argv) {
         "total = 2\nf = myon.lambda(x: int) ret int { total = total + x\nret total }\n"
         "ys = xs.map(f)\nret ys[0] }\nscoped()";
     for (int repeat = 0; repeat < 3; repeat++) check_source(success, "callback-success", mvm, 0);
-    if (mvm) { /* VM cells also outlive a returned closure's defining frame. */
+    { /* Both engines retain a returned closure's defining variables. */
         const char *escape = "module myon.array\n"
             "myon.func make() ret func { n = 1\n"
             "ret myon.lambda(x: int) ret int { n = n + x\nret n } }\n"

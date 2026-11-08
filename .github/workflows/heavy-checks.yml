@@ -201,6 +201,9 @@ jobs:
         uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW64
+          # Reuse the runner image's MSYS2 installation; avoid a second base
+          # installer download (upstream release downloads can return HTTP 504).
+          release: false
           update: true
           # make + a native MinGW GCC toolchain + OpenSSL dev package. The
           # mingw-w64-x86_64-openssl package ships libssl/libcrypto and their

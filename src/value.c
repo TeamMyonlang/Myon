@@ -16,6 +16,7 @@
 
 #include "value.h"
 #include "ast.h"
+#include "env.h"
 #include "event_loop.h"
 #include "common.h"
 
@@ -64,9 +65,9 @@ static ValueGC *gc_head;
 static size_t gc_live, gc_since_collect, gc_threshold = 256;
 static int gc_collecting;
 
-static void gc_register(ValueGC *g, void *owner, int *refs, int is_cell) {
+static void gc_register(ValueGC *g, void *owner, int *refs, ValueGCKind kind) {
     memset(g, 0, sizeof(*g));
-    g->owner = owner; g->refs = refs; g->is_cell = is_cell;
+    g->owner = owner; g->refs = refs; g->kind = kind;
     g->next = gc_head;
     if (gc_head) gc_head->prev = g;
     gc_head = g;
@@ -94,8 +95,44 @@ static Obj *obj_new(ObjKind kind) {
     memset(o, 0, sizeof(Obj));
     o->kind = kind;
     o->refcount = 1;
-    gc_register(&o->gc, o, &o->refcount, 0);
+    gc_register(&o->gc, o, &o->refcount, GC_OBJECT);
     return o;
+}
+
+/* Environments are graph nodes: active scopes own a reference, closures own
+ * their defining scope, and children own their parent. Keeping their lifecycle
+ * here lets the collector reclaim Env <-> function/container cycles together. */
+Env *env_ref(Env *env) {
+    if (env) env->refcount++;
+    return env;
+}
+Env *env_new(Env *parent) {
+    gc_before_alloc();
+    Env *env = myon_xmalloc(sizeof(*env));
+    memset(env, 0, sizeof(*env));
+    env->parent = env_ref(parent);
+    env->refcount = 1;
+    gc_register(&env->gc, env, &env->refcount, GC_ENV);
+    return env;
+}
+static void env_destroy_payload(Env *env) {
+    Binding *b = env->head;
+    while (b) {
+        Binding *next = b->next;
+        myon_free(b->name);
+        value_free(&b->value);
+        myon_free(b);
+        b = next;
+    }
+    env_free(env->parent);
+}
+void env_free(Env *env) {
+    if (!env || (gc_collecting && !env->gc.marked)) return;
+    if (--env->refcount == 0) {
+        gc_unregister(&env->gc);
+        env_destroy_payload(env);
+        myon_free(env);
+    }
 }
 
 static Value obj_value(Type t, Obj *o) {
@@ -151,7 +188,7 @@ Value value_struct(const char *type_name, StructDecl *decl) {
 Value value_func(FuncDecl *decl, Env *closure) {
     Obj *o = obj_new(OBJ_FUNC);
     o->as.fn.decl = decl;
-    o->as.fn.closure = closure;
+    o->as.fn.closure = env_ref(closure);
     o->as.fn.is_bound = 0;
     o->as.fn.bound_self = NULL;
     o->as.fn.mvm_chunk = 0;
@@ -167,7 +204,7 @@ UpvalueCell *upvalue_cell_new(Value initial) {
     UpvalueCell *c = (UpvalueCell *)myon_xmalloc(sizeof(UpvalueCell));
     c->value = initial;   /* takes ownership */
     c->refcount = 1;
-    gc_register(&c->gc, c, &c->refcount, 1);
+    gc_register(&c->gc, c, &c->refcount, GC_UPVALUE);
     return c;
 }
 
@@ -264,7 +301,8 @@ static void obj_destroy_payload(Obj *o) {
                     upvalue_cell_unref(o->as.fn.upvalues[i]);
                 myon_free(o->as.fn.upvalues);
             }
-            /* decl and closure are not owned by the function value */
+            env_free(o->as.fn.closure);
+            /* The declaration AST is retained by the interpreter. */
             break;
         case OBJ_TASK:
             event_loop_task_unref((Task *)o->as.task.task);
@@ -288,14 +326,20 @@ void value_free(Value *v) {
     }
 }
 
-/* Visit strong edges only: ASTs and tree-walk closure environments are borrowed.
- * Upvalue cells are graph nodes themselves so shared cells are counted once. */
+/* Visit strong edges only. ASTs are borrowed; environments and upvalue cells
+ * are distinct graph nodes so shared captures are counted once per owner. */
 static void gc_value_edge(Value *v, void (*visit)(ValueGC *, void *), void *ud) {
     if (is_obj(v) && v->as.obj) visit(&v->as.obj->gc, ud);
 }
 static void gc_edges(ValueGC *g, void (*visit)(ValueGC *, void *), void *ud) {
-    if (g->is_cell) {
+    if (g->kind == GC_UPVALUE) {
         gc_value_edge(&((UpvalueCell *)g->owner)->value, visit, ud);
+        return;
+    }
+    if (g->kind == GC_ENV) {
+        Env *env = g->owner;
+        if (env->parent) visit(&env->parent->gc, ud);
+        for (Binding *b = env->head; b; b = b->next) gc_value_edge(&b->value, visit, ud);
         return;
     }
     Obj *o = (Obj *)g->owner;
@@ -315,6 +359,7 @@ static void gc_edges(ValueGC *g, void (*visit)(ValueGC *, void *), void *ud) {
             gc_value_edge(&o->as.st.field_vals[i], visit, ud);
         break;
     case OBJ_FUNC:
+        if (o->as.fn.closure) visit(&o->as.fn.closure->gc, ud);
         if (o->as.fn.bound_self) gc_value_edge(o->as.fn.bound_self, visit, ud);
         for (int i = 0; i < o->as.fn.upvalue_count; i++)
             if (o->as.fn.upvalues[i]) visit(&o->as.fn.upvalues[i]->gc, ud);
@@ -369,7 +414,8 @@ void value_collect_cycles(void) {
     /* Suppress decrements between dead nodes during payload destruction, and
      * delay freeing node storage until every edge has been released. */
     for (ValueGC *g = dead; g; g = g->work) {
-        if (g->is_cell) value_free(&((UpvalueCell *)g->owner)->value);
+        if (g->kind == GC_UPVALUE) value_free(&((UpvalueCell *)g->owner)->value);
+        else if (g->kind == GC_ENV) env_destroy_payload((Env *)g->owner);
         else obj_destroy_payload((Obj *)g->owner);
     }
     while (dead) {

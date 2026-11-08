@@ -1,0 +1,61 @@
+module myon.stdio
+module myon.array
+myon.func make_counter() ret func {
+    n = 10
+    ret myon.lambda(x: int) ret int { n = n + x
+        ret n }
+}
+f = make_counter()
+myon.print(f(2))
+myon.print(f(3))
+# Siblings capture one shared variable after their defining call has returned.
+myon.func siblings() ret func, func {
+    n = 0
+    inc = myon.lambda(x: int) ret int { n = n + x
+        ret n }
+    get = myon.lambda() ret int { ret n }
+    ret inc, get
+}
+inc, get = siblings()
+myon.print(inc(4))
+myon.print(get())
+myon.print(inc(6))
+myon.print(get())
+# Parent scopes survive through a returned nested function.
+myon.func outer() ret func {
+    n = 20
+    myon.func middle() ret func {
+        ret myon.lambda(x: int) ret int { n = n + x
+            ret n }
+    }
+    ret middle()
+}
+g = outer()
+myon.print(g(2))
+xs = myon.array(int)
+xs.push(1)
+xs.push(2)
+myon.print(xs.map(f))
+# Collect unrelated short-lived cycles while an escaped closure is live.
+myon.for i myon.in range(0, 2000) { unused = make_counter() }
+myon.print(f(4))
+# A block can finish while a stored callback retains its local bindings.
+myon.func block_factory() ret func {
+    callbacks = myon.array(func)
+    {
+        local = 30
+        callbacks.push(myon.lambda(x: int) ret int { local = local + x
+            ret local })
+    }
+    ret callbacks[0]
+}
+h = block_factory()
+myon.print(h(2))
+# Finishing an async task also releases its call scope's owner reference.
+myon.async myon.func async_factory() ret func {
+    n = 40
+    ret myon.lambda(x: int) ret int { n = n + x
+        ret n }
+}
+af = myon.await async_factory()
+myon.print(af(2))

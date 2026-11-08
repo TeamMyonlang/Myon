@@ -5874,7 +5874,11 @@ int interp_run(Interp *it, Program *program) {
         cleanup_unwind(it, 0);
         return 1;
     }
-    return run_toplevel(it, program);
+    /* Keep this frame alive until run_toplevel returns. MinGW's setjmp uses
+     * its frame address for Windows unwinding; a sibling tail call would leave
+     * a runtime error with a jump target in a frame that no longer exists. */
+    volatile int rc = run_toplevel(it, program);
+    return rc;
 }
 
 /* ------------------------------------------------------------------ */

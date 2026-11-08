@@ -19,7 +19,13 @@ fi
 # Cross-native recursion must honor a small C stack as well as the VM limit.
 "$MYON" --compile tests/cases/p_native_callback_recursion.myon -o "$scratch/recursive.myc"
 rc=0
-(ulimit -s 1024; "$MYON" "$scratch/recursive.myc") > "$scratch/out" 2> "$scratch/err" || rc=$?
+case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*)
+        # POSIX ulimit cannot resize a native Windows executable's PE stack.
+        "$MYON" "$scratch/recursive.myc" > "$scratch/out" 2> "$scratch/err" || rc=$? ;;
+    *)
+        (ulimit -s 1024; "$MYON" "$scratch/recursive.myc") > "$scratch/out" 2> "$scratch/err" || rc=$? ;;
+esac
 if [ "$rc" -ne 1 ] || ! grep -q 'call stack too deep' "$scratch/err"; then
     cat "$scratch/err" >&2
     echo "FAIL native callback recursion: expected exit 1, got $rc" >&2

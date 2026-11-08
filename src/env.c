@@ -20,28 +20,6 @@
 #include <string.h>
 #include <stdlib.h>
 
-Env *env_new(Env *parent) {
-    Env *e = (Env *)myon_xmalloc(sizeof(Env));
-    e->head = NULL;
-    e->parent = parent;
-    e->is_block = 0;
-    e->is_fn_boundary = 0;
-    return e;
-}
-
-void env_free(Env *env) {
-    if (!env) return;
-    Binding *b = env->head;
-    while (b) {
-        Binding *next = b->next;
-        free(b->name);
-        value_free(&b->value);
-        free(b);
-        b = next;
-    }
-    free(env);
-}
-
 static Binding *find_local(Env *env, const char *name) {
     for (Binding *b = env->head; b; b = b->next)
         if (strcmp(b->name, name) == 0) return b;

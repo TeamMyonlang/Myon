@@ -1,8 +1,20 @@
 #!/usr/bin/env bash
-set -eu
+set -eEu
 MYON=${1:-./myon}
 scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT
+report_failure() {
+    local rc=$1 line=$2 command=$3
+    echo "FAIL module regression at line $line (exit $rc): $command" >&2
+    for name in input.myon compile err repl.err; do
+        if [ -s "$scratch/$name" ]; then
+            echo "--- $name ---" >&2
+            cat "$scratch/$name" >&2
+        fi
+    done
+    return "$rc"
+}
+trap 'report_failure "$?" "$LINENO" "$BASH_COMMAND"' ERR
 checks=0
 run() {
     local engine=$1 expected=$2 rc=0
@@ -86,6 +98,20 @@ printf 'module myon.stdio\nmyon.print(myon.math.abs(-9))\nmodule myon.math\nmyon
 grep -Fq "module 'myon.math' is not declared" "$scratch/repl.err"
 grep -Eq 'myon> 9$' "$scratch/repl.out"
 [ "$(grep -Fc "module 'myon.math' is not declared" "$scratch/repl.err")" -eq 1 ]
+# A returned closure remains callable across REPL inputs and error recovery.
+cat > "$scratch/session" <<'MYON'
+module myon.stdio
+myon.func make() ret func { n = 0; ret myon.lambda(x: int) ret int { n = n + x; ret n } }
+f = make()
+myon.print(f(1))
+myon.print(1 / 0)
+myon.print(f(2))
+quit
+MYON
+"$MYON" < "$scratch/session" > "$scratch/repl.out" 2> "$scratch/repl.err"
+grep -Eq 'myon> 1$' "$scratch/repl.out"
+grep -Eq 'myon> 3$' "$scratch/repl.out"
+[ "$(grep -Fc 'division by zero' "$scratch/repl.err")" -eq 1 ]
 # Imported declarations are shared by the interpreter session. Parent builtin
 # declarations are enabled before an external module's top-level side effects.
 cat > "$scratch/lib.myon" <<'MYON'

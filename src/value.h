@@ -60,13 +60,16 @@ typedef enum {
     OBJ_TASK      /* Phase5: async task handle (wraps event-loop Task*) */
 } ObjKind;
 
-/* Intrusive cycle-collector metadata, shared by objects and upvalue cells.
+typedef enum { GC_OBJECT, GC_UPVALUE, GC_ENV } ValueGCKind;
+
+/* Intrusive cycle-collector metadata for objects, upvalue cells and environments.
  * External references are inferred by subtracting owned heap edges from RC. */
 typedef struct ValueGC {
     struct ValueGC *prev, *next, *work;
     int *refs;
     void *owner;
-    int is_cell, trial, marked;
+    ValueGCKind kind;
+    int trial, marked;
 } ValueGC;
 
 /* dynamic array of values */
@@ -129,7 +132,7 @@ typedef struct UpvalueCell {
 /* function object: closure over a definition environment */
 typedef struct {
     struct FuncDecl *decl;  /* the declaration/lambda AST (not owned) */
-    struct Env      *closure; /* captured environment (ref, not owned/freed) */
+    struct Env      *closure; /* captured environment (owned reference) */
     /* If this is a bound method, `self` holds the receiver (owned copy). */
     int              is_bound;
     Value           *bound_self;

@@ -1,12 +1,14 @@
 /* Regression tests for known-issues 11/12. No timing/RSS thresholds: assert
  * ownership and reclamation directly, including shared live graph edges. */
 #include "value.h"
+#include "env.h"
 #include "common.h"
 #include "event_loop.h"
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
+#include <string.h>
 
 static void cycles(void) {
     size_t base = value_live_allocations();
@@ -275,7 +277,56 @@ static void map_index(void) {
     assert(value_live_allocations() == base);
 }
 
+static void closure_environments(void) {
+    size_t base = value_live_allocations();
+    Env *parent = env_new(NULL);
+    assert(env_define(parent, "label", value_str(myon_strdup("alive"))));
+    Env *child = env_new(parent);
+    Value first = value_func(NULL, child);
+    Value second = value_func(NULL, child);
+    assert(env_define(child, "self", value_copy(&first)));
+    assert(env_define(child, "sibling", value_copy(&second)));
+    env_free(child);
+    env_free(parent);
+    value_free(&first);
+    value_collect_cycles(); /* second roots child, parent and both functions */
+    Value label;
+    assert(env_get(second.as.obj->as.fn.closure, "label", &label));
+    assert(strcmp(label.as.obj->as.str, "alive") == 0);
+    value_free(&label);
+    assert(env_set(second.as.obj->as.fn.closure, "label", value_str(myon_strdup("changed"))));
+    assert(value_live_allocations() == base + 5);
+    value_free(&second);
+    value_collect_cycles();
+    assert(value_live_allocations() == base);
+
+    /* A cycle's outgoing edge to an externally-owned scope must drop once. */
+    parent = env_new(NULL);
+    child = env_new(parent);
+    first = value_func(NULL, child);
+    assert(env_define(child, "self", first));
+    env_free(child);
+    value_collect_cycles();
+    assert(value_live_allocations() == base + 1);
+    assert(parent->refcount == 1);
+    env_free(parent);
+    assert(value_live_allocations() == base);
+
+    for (int i = 0; i < 10000; i++) {
+        parent = env_new(NULL);
+        child = env_new(parent);
+        first = value_func(NULL, child);
+        assert(env_define(parent, "callback", first));
+        env_free(child);
+        env_free(parent);
+    }
+    assert(value_live_allocations() < base + 1024);
+    value_collect_cycles();
+    assert(value_live_allocations() == base);
+}
+
 int main(void) {
+    closure_environments();
     map_index();
     cycles();
     tasks();
