@@ -217,6 +217,7 @@ ASAN_OPTIONS=detect_leaks=1 bash tests/numeric_regressions.sh ./myon_asan
 | `tests/` | 回帰テストとフィクスチャ |
 | [myon_spec.md](docs/myon_spec.md) | 構文・型・標準ライブラリのリファレンス |
 | [mvm_spec.md](docs/mvm_spec.md) | 命令・スタック・バイトコード形式 |
+| [unicode.md](docs/unicode.md) | Unicode大小文字変換・データと再生成手順 |
 | [features.md](docs/features.md) | 機能と実装・検証箇所の対応 |
 | [package_manager.md](docs/package_manager.md) | パッケージ取得・配置・検証の規則 |
 | [package_development.md](docs/package_development.md) | パッケージの作成と公開 |
@@ -225,3 +226,4 @@ ASAN_OPTIONS=detect_leaks=1 bash tests/numeric_regressions.sh ./myon_asan
 ## ライセンス
 
 [Apache License 2.0](LICENSE)。Copyright 2026 TeamMyonlang。
+Unicode変換表は [Unicode License V3](third_party/unicode/LICENSE.txt) に従います。

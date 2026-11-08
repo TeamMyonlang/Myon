@@ -42,7 +42,9 @@ Obj と MVM の UpvalueCell を対象とするコレクタで回収します。
 
 `length` は文字列のバイト数、`length_chars` は Unicode コードポイント数です。
 `substring` と `index_of` の位置もコードポイント単位で、書記素クラスタ単位ではありません。
-`upper/lower` は Unicode の大小文字変換を実装していません。
+`upper/lower` は `unicode.c` と同梱のUnicode 17.0.0表でfull mappingを行います。
+Σの文脈と複数文字への展開を扱い、言語別tailoring・正規化は行いません。
+[Unicode大小文字変換](unicode.md) にデータと検証範囲を記載しています。
 
 数値関数の戻り値型は関数ごとに異なります。例えば floor/ceil/round/trunc/sign は int、
 sqrt/pow は float を返します。最小 int の絶対値、表現不能な gcd、範囲外の整数変換は

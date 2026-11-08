@@ -30,6 +30,7 @@
 #include "value.h"
 #include "env.h"
 #include "common.h"
+#include "unicode.h"
 #include "lexer.h"
 #include "parser.h"
 #include "diag.h"
@@ -2763,11 +2764,10 @@ static int call_stdlib(Interp *it, Env *env, const char *name, Expr *call, Value
     if (strcmp(name, "myon.string.upper") == 0 || strcmp(name, "myon.string.lower") == 0) {
         Value a = eval_arg(it, env, call, 0);
         if (a.type != TYPE_STR) { value_free(&a); runtime_error(it, line, "expects str"); }
-        int up = (name[strlen(name)-1] == 'r' && strstr(name, "upper"));
-        char *s = myon_strdup(a.as.obj->as.str);
-        for (char *c = s; *c; c++)
-            *c = up ? (char)toupper((unsigned char)*c) : (char)tolower((unsigned char)*c);
+        bool up = strcmp(name, "myon.string.upper") == 0;
+        char *s = myon_unicode_case(a.as.obj->as.str, up);
         value_free(&a);
+        if (!s) runtime_error(it, line, "Unicode case conversion is too large");
         *out = value_str(s); return 1;
     }
 
