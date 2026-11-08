@@ -931,11 +931,12 @@ Program *parser_parse(const TokenList *tokens) {
     p.count = tokens->count;
     p.pos = 0;
 
+    MyonAllocScope *scope = myon_alloc_scope_begin();
     Program *volatile prog = (Program *)myon_xmalloc(sizeof(Program));
     stmtlist_init(&prog->stmts);
 
     if (setjmp(p.escape)) {
-        program_free(prog);
+        myon_alloc_scope_end(scope, true);
         return NULL;
     }
 
@@ -948,5 +949,6 @@ Program *parser_parse(const TokenList *tokens) {
         }
         skip_terminators(&p);
     }
+    myon_alloc_scope_end(scope, false);
     return prog;
 }

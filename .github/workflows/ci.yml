@@ -2,7 +2,7 @@
 #
 # Runs on every push to main and on every pull request, building the
 # interpreter with two compilers (gcc and clang) and running the full
-# `make test` suite plus LSan regressions on gcc. The full ASan/UBSan,
+# `make test` suite plus the complete sanitizer suite on gcc. The full ASan/UBSan,
 # cross / benchmark / macOS checks live in heavy-checks.yml.
 name: CI
 
@@ -54,6 +54,6 @@ jobs:
         # callback .so), mvm_compiler_tests.sh and run_mvm_tests.sh.
         run: make CC=${{ matrix.cc }} test
 
-      - name: Leak regression checks
+      - name: Full ASan/UBSan/LSan suite
         if: matrix.cc == 'gcc'
         run: make CC=gcc test-lsan

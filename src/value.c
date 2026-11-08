@@ -181,7 +181,7 @@ void upvalue_cell_unref(UpvalueCell *c) {
     if (--c->refcount <= 0) {
         gc_unregister(&c->gc);
         value_free(&c->value);
-        free(c);
+        myon_free(c);
     }
 }
 
@@ -216,12 +216,12 @@ Value value_copy(const Value *v) {
 static void obj_destroy_payload(Obj *o) {
     switch (o->kind) {
         case OBJ_STR:
-            free(o->as.str);
+            myon_free(o->as.str);
             break;
         case OBJ_ARRAY:
             for (int i = 0; i < o->as.arr.count; i++)
                 value_free(&o->as.arr.items[i]);
-            free(o->as.arr.items);
+            myon_free(o->as.arr.items);
             typespec_free(o->as.arr.elem_type);
             break;
         case OBJ_MAP: {
@@ -230,39 +230,39 @@ static void obj_destroy_payload(Obj *o) {
                 MapEntry *n = e->next;
                 value_free(&e->key);
                 value_free(&e->val);
-                free(e);
+                myon_free(e);
                 e = n;
             }
-            free(o->as.map.buckets);
+            myon_free(o->as.map.buckets);
             typespec_free(o->as.map.key_type);
             typespec_free(o->as.map.val_type);
             break;
         }
         case OBJ_STRUCT:
-            free(o->as.st.type_name);
+            myon_free(o->as.st.type_name);
             for (int i = 0; i < o->as.st.field_count; i++) {
-                free(o->as.st.field_names[i]);
+                myon_free(o->as.st.field_names[i]);
                 value_free(&o->as.st.field_vals[i]);
             }
-            free(o->as.st.field_names);
-            free(o->as.st.field_vals);
+            myon_free(o->as.st.field_names);
+            myon_free(o->as.st.field_vals);
             for (int i = 0; i < o->as.st.tparam_count; i++) {
-                free(o->as.st.tparam_names[i]);
+                myon_free(o->as.st.tparam_names[i]);
                 typespec_free(o->as.st.tparam_types[i]);
             }
-            free(o->as.st.tparam_names);
-            free(o->as.st.tparam_types);
+            myon_free(o->as.st.tparam_names);
+            myon_free(o->as.st.tparam_types);
             break;
         case OBJ_FUNC:
             if (o->as.fn.bound_self) {
                 value_free(o->as.fn.bound_self);
-                free(o->as.fn.bound_self);
+                myon_free(o->as.fn.bound_self);
             }
             /* MVM closures own a ref on each captured upvalue cell (spec §7.3). */
             if (o->as.fn.upvalues) {
                 for (int i = 0; i < o->as.fn.upvalue_count; i++)
                     upvalue_cell_unref(o->as.fn.upvalues[i]);
-                free(o->as.fn.upvalues);
+                myon_free(o->as.fn.upvalues);
             }
             /* decl and closure are not owned by the function value */
             break;
@@ -275,7 +275,7 @@ static void obj_destroy_payload(Obj *o) {
 static void obj_free(Obj *o) {
     gc_unregister(&o->gc);
     obj_destroy_payload(o);
-    free(o);
+    myon_free(o);
 }
 
 void value_free(Value *v) {
@@ -374,7 +374,7 @@ void value_collect_cycles(void) {
     }
     while (dead) {
         ValueGC *next = dead->work;
-        free(dead->owner);
+        myon_free(dead->owner);
         dead = next;
     }
     gc_collecting = 0;
@@ -484,7 +484,7 @@ static char *value_to_cstr_rec(const Value *v, ToStrPath *path) {
                 if (i) s = append(s, ", ");
                 char *e = value_to_cstr_rec(&a->items[i], path);
                 s = append(s, e);
-                free(e);
+                myon_free(e);
             }
             s = append(s, "]");
             path->depth--;
@@ -506,7 +506,7 @@ static char *value_to_cstr_rec(const Value *v, ToStrPath *path) {
                 char *k = value_to_cstr_rec(&e->key, path);
                 char *val = value_to_cstr_rec(&e->val, path);
                 s = append(s, k); s = append(s, ": "); s = append(s, val);
-                free(k); free(val);
+                myon_free(k); myon_free(val);
             }
             s = append(s, "}");
             path->depth--;
@@ -534,7 +534,7 @@ static char *value_to_cstr_rec(const Value *v, ToStrPath *path) {
                 s = append(s, "=");
                 char *fv = value_to_cstr_rec(&st->field_vals[i], path);
                 s = append(s, fv);
-                free(fv);
+                myon_free(fv);
             }
             s = append(s, ")");
             path->depth--;
@@ -557,7 +557,7 @@ char *value_to_cstr(const Value *v) {
     path.cap   = 0;
     path.depth = 0;
     char *s = value_to_cstr_rec(v, &path);
-    free((void *)path.items);
+    myon_free((void *)path.items);
     return s;
 }
 
@@ -674,7 +674,7 @@ static void map_grow(MapData *m) {
         e->hash_next = buckets[bucket];
         buckets[bucket] = e;
     }
-    free(m->buckets);
+    myon_free(m->buckets);
     m->buckets = buckets;
     m->bucket_count = count;
 }
@@ -731,7 +731,7 @@ int map_delete(Value *mv, const Value *key) {
             m->count--;
             value_free(&e->key);
             value_free(&e->val);
-            free(e);
+            myon_free(e);
             return 1;
         }
         link = &e->hash_next;

@@ -152,7 +152,7 @@ endif
 
 asan: $(ASAN_BIN)
 
-$(ASAN_BIN): $(SOURCES) src/unicode_case_data.inc src/unicode.h src/value.h src/builtin_modules.h src/mvm_bytecode.h
+$(ASAN_BIN): $(SOURCES) src/unicode_case_data.inc src/unicode.h src/value.h src/common.h src/builtin_modules.h src/mvm_bytecode.h
 	$(ASAN_CC) $(ASAN_CFLAGS) -I$(SRC_DIR) $(SOURCES) -o $@ $(ASAN_LDLIBS)
 
 # Run the full regression suite against the sanitizer binary.
@@ -162,10 +162,11 @@ $(ASAN_BIN): $(SOURCES) src/unicode_case_data.inc src/unicode.h src/value.h src/
 # patch all of them we temporarily swap the sanitizer binary in as `./myon`,
 # run the suite, then restore the original.  The swap is done with a trap so
 # the original `myon` is always put back even if a test fails (approach B in
-# the CI TODO).  ASAN_OPTIONS/UBSAN_OPTIONS make any sanitizer finding abort
+# the CI TODO). Sanitizer failures use exit 99, distinct from language errors.
+# ASAN_OPTIONS/UBSAN_OPTIONS/LSAN_OPTIONS enable all three checks and fail
 # with a non-zero exit so the failure surfaces as a red CI step.
-test-asan: $(ASAN_BIN) $(BUILD)/unicode_case_asan | $(BUILD)
-	@echo "== Myon sanitizer (ASan/UBSan) test run =="
+test-asan: $(ASAN_BIN) $(BUILD)/unicode_case_asan $(BUILD)/runtime_memory_asan $(BUILD)/lsan_probe $(BUILD)/error_cleanup_asan | $(BUILD)
+	@echo "== Myon sanitizer (ASan/UBSan/LSan) test run =="
 	@set -e; \
 	restore() { \
 	  if [ -f myon.asan-backup ]; then mv -f myon.asan-backup myon; \
@@ -175,8 +176,14 @@ test-asan: $(ASAN_BIN) $(BUILD)/unicode_case_asan | $(BUILD)
 	trap restore EXIT INT TERM; \
 	if [ -e myon ]; then cp -f myon myon.asan-backup; fi; \
 	cp -f $(ASAN_BIN) myon; \
-	export ASAN_OPTIONS="abort_on_error=1:halt_on_error=1:detect_leaks=0"; \
-	export UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=1:abort_on_error=1"; \
+	export ASAN_OPTIONS="halt_on_error=1:detect_leaks=1:exitcode=99"; \
+	export UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=1:exitcode=99"; \
+	export LSAN_OPTIONS="exitcode=99"; \
+	bash tests/lsan_selftest.sh ./$(BUILD)/lsan_probe; \
+	$(MAKE) CC="$(ASAN_CC)" CFLAGS="$(ASAN_CFLAGS)" test-pkg; \
+	$(BUILD)/runtime_memory_asan; \
+	$(BUILD)/error_cleanup_asan tree tests/cases/*.err; \
+	$(BUILD)/error_cleanup_asan mvm tests/cases/*.err; \
 	$(BUILD)/unicode_case_asan; \
 	bash tests/module_regressions.sh ./myon; \
 	bash tests/runtime_regressions.sh ./myon; \
@@ -186,7 +193,8 @@ test-asan: $(ASAN_BIN) $(BUILD)/unicode_case_asan | $(BUILD)
 	bash tests/harness_regressions.sh; \
 	./tests/run_tests.sh; \
 	./tests/mvm_compiler_tests.sh; \
-	if [ -f ./tests/run_mvm_tests.sh ]; then ./tests/run_mvm_tests.sh; fi
+	if [ -f ./tests/run_mvm_tests.sh ]; then ./tests/run_mvm_tests.sh; fi; \
+	bash tests/leak_regressions.sh ./myon
 
 $(BUILD)/%.o: $(SRC_DIR)/%.c | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -281,9 +289,11 @@ clean:
 RUNTIME_TEST_SRCS = tests/runtime_memory_tests.c src/value.c src/types.c \
                     src/ast.c src/common.c src/event_loop.c
 .PHONY: test-runtime
-test-runtime: all test-unicode | $(BUILD)
+test-runtime: all test-unicode $(BUILD)/error_cleanup_tests | $(BUILD)
 	$(CC) $(CFLAGS) -Isrc $(RUNTIME_TEST_SRCS) $(LDLIBS) -o $(BUILD)/runtime_memory_tests
 	$(BUILD)/runtime_memory_tests
+	$(BUILD)/error_cleanup_tests tree tests/cases/*.err
+	$(BUILD)/error_cleanup_tests mvm tests/cases/*.err
 	bash tests/module_regressions.sh ./$(BIN)
 	bash tests/runtime_regressions.sh ./$(BIN)
 	bash tests/diagnostic_regressions.sh ./$(BIN)
@@ -291,14 +301,12 @@ test-runtime: all test-unicode | $(BUILD)
 	bash tests/numeric_regressions.sh ./$(BIN)
 	bash tests/harness_regressions.sh
 
-# Linux LSan gate: all success fixtures and selected task shutdown errors.
-# Keep its failure code distinct from the language's expected error exit 1.
+# LSan uses the complete sanitizer suite, including expected-error paths.
 .PHONY: test-lsan
-test-lsan: $(ASAN_BIN) $(BUILD)/unicode_case_asan | $(BUILD)
-	$(ASAN_CC) $(ASAN_CFLAGS) -Isrc $(RUNTIME_TEST_SRCS) $(ASAN_LDLIBS) -o $(BUILD)/runtime_memory_lsan
-	ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 LSAN_OPTIONS=exitcode=99 UBSAN_OPTIONS=halt_on_error=1 $(BUILD)/runtime_memory_lsan
-	ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 LSAN_OPTIONS=exitcode=99 UBSAN_OPTIONS=halt_on_error=1 $(BUILD)/unicode_case_asan
-	bash tests/leak_regressions.sh ./$(ASAN_BIN)
+test-lsan: test-asan
+
+$(BUILD)/runtime_memory_asan: $(RUNTIME_TEST_SRCS) src/value.h src/common.h src/event_loop.h | $(BUILD)
+	$(ASAN_CC) $(ASAN_CFLAGS) -Isrc $(RUNTIME_TEST_SRCS) $(ASAN_LDLIBS) -o $@
 
 $(BUILD)/unicode.o: src/unicode_case_data.inc src/unicode.h
 $(BUILD)/interpreter.o: src/unicode.h
@@ -310,6 +318,15 @@ test-unicode: | $(BUILD)
 $(BUILD)/unicode_case_asan: tests/unicode_case_tests.c src/unicode.c src/unicode.h src/unicode_case_data.inc src/common.c src/common.h | $(BUILD)
 	$(ASAN_CC) $(ASAN_CFLAGS) -Isrc tests/unicode_case_tests.c src/unicode.c src/common.c -o $@
 
-$(OBJECTS): src/value.h
+$(OBJECTS): src/value.h src/common.h
 $(BUILD)/interpreter.o $(BUILD)/mvm_compiler.o: src/builtin_modules.h
 $(BUILD)/mvm_chunk.o $(BUILD)/mvm_vm.o $(BUILD)/mvm_compiler.o: src/mvm_bytecode.h
+
+$(BUILD)/lsan_probe: tests/lsan_probe.c | $(BUILD)
+	$(ASAN_CC) $(ASAN_CFLAGS) $< -o $@
+
+ERROR_TEST_SRCS = $(filter-out src/main.c,$(SOURCES))
+$(BUILD)/error_cleanup_tests: tests/error_cleanup_tests.c $(filter-out $(BUILD)/main.o,$(OBJECTS)) | $(BUILD)
+	$(CC) $(CFLAGS) -Isrc $< $(filter-out $(BUILD)/main.o,$(OBJECTS)) $(LDLIBS) -o $@
+$(BUILD)/error_cleanup_asan: tests/error_cleanup_tests.c $(ERROR_TEST_SRCS) $(wildcard src/*.h) | $(BUILD)
+	$(ASAN_CC) $(ASAN_CFLAGS) -Isrc $< $(ERROR_TEST_SRCS) $(ASAN_LDLIBS) -o $@

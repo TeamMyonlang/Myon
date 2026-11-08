@@ -46,7 +46,7 @@ jobs:
   # Job 1: sanitizer (ASan + UBSan) run of the full suite.            #
   # ------------------------------------------------------------------ #
   sanitizer:
-    name: sanitizer (ASan/UBSan)
+    name: sanitizer (ASan/UBSan/LSan)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -57,16 +57,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libssl-dev
 
-      - name: Build + run suite under ASan/UBSan
+      - name: Build + run suite under ASan/UBSan/LSan
         # `make test-asan` builds myon_asan (-fsanitize=address,undefined),
         # temporarily swaps it in as ./myon, runs the whole suite with
-        # ASAN_OPTIONS/UBSAN_OPTIONS set to abort on any finding, then
-        # restores the original binary. A sanitizer finding aborts with a
+        # ASAN_OPTIONS/UBSAN_OPTIONS/LSAN_OPTIONS set to fail on any finding, then
+        # restores the original binary. A sanitizer finding exits with a
         # non-zero exit, turning this step red.
         run: make test-asan
-
-      - name: Leak regression checks
-        run: make test-lsan
 
   # ------------------------------------------------------------------ #
   # Job 2: MinGW-w64 cross build (produces myon.exe).                 #

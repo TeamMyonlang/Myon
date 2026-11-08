@@ -152,11 +152,11 @@ Module *module_new(void) {
 
 static void chunk_free(Chunk *c) {
     if (!c) return;
-    free(c->name);
-    free(c->code);
-    free(c->lines);
-    free(c->captured);
-    free(c);
+    myon_free(c->name);
+    myon_free(c->code);
+    myon_free(c->lines);
+    myon_free(c->captured);
+    myon_free(c);
 }
 
 void module_free(Module *m) {
@@ -165,13 +165,13 @@ void module_free(Module *m) {
         value_free(&m->consts[i].value);
         if (m->consts[i].typespec) typespec_free(m->consts[i].typespec);
     }
-    free(m->consts);
-    for (int i = 0; i < m->native_count; i++) free(m->natives[i]);
-    free(m->natives);
+    myon_free(m->consts);
+    for (int i = 0; i < m->native_count; i++) myon_free(m->natives[i]);
+    myon_free(m->natives);
     for (int i = 0; i < m->chunk_count; i++) chunk_free(m->chunks[i]);
-    free(m->chunks);
-    free(m->src_path);
-    free(m);
+    myon_free(m->chunks);
+    myon_free(m->src_path);
+    myon_free(m);
 }
 
 int module_add_chunk(Module *m, const char *name) {
@@ -371,7 +371,7 @@ static const char *const_render(const Module *m, int idx, char *buf, size_t n) {
         case MVM_CONST_TYPESPEC: {
             char *ts = e->typespec ? typespec_to_cstr(e->typespec) : NULL;
             snprintf(buf, n, "type %s", ts ? ts : "?");
-            free(ts);
+            myon_free(ts);
             break;
         }
         default: snprintf(buf, n, "<const %d>", idx); break;
@@ -659,10 +659,10 @@ int mvm_module_write_file(const Module *m, const char *path) {
     #undef PATCH_U32
 
     FILE *f = fopen(path, "wb");
-    if (!f) { free(b.data); return 1; }
+    if (!f) { myon_free(b.data); return 1; }
     size_t wrote = fwrite(b.data, 1, b.len, f);
     fclose(f);
-    free(b.data);
+    myon_free(b.data);
     return wrote == b.len ? 0 : 2;
 }
 
@@ -713,16 +713,16 @@ Module *mvm_module_read_file(const char *path) {
     uint8_t *data = (uint8_t *)myon_xmalloc((size_t)sz);
     size_t got = fread(data, 1, (size_t)sz, f);
     fclose(f);
-    if (got != (size_t)sz) { free(data); return NULL; }
+    if (got != (size_t)sz) { myon_free(data); return NULL; }
 
     Rd r = { data, (size_t)sz, 0, 0 };
     if (rd8(&r) != MVM_MAGIC0 || rd8(&r) != MVM_MAGIC1 ||
-        rd8(&r) != MVM_MAGIC2 || rd8(&r) != MVM_MAGIC3) { free(data); return NULL; }
+        rd8(&r) != MVM_MAGIC2 || rd8(&r) != MVM_MAGIC3) { myon_free(data); return NULL; }
     uint8_t major = rd8(&r);
     uint8_t minor = rd8(&r);
     uint8_t endian = rd8(&r);
     (void)rd8(&r);            /* flags */
-    if (major != MVM_VERSION_MAJOR || minor != MVM_VERSION_MINOR || endian != MVM_ENDIAN_LITTLE) { free(data); return NULL; }
+    if (major != MVM_VERSION_MAJOR || minor != MVM_VERSION_MINOR || endian != MVM_ENDIAN_LITTLE) { myon_free(data); return NULL; }
 
     uint32_t const_off = rd32(&r);
     (void)rd32(&r);           /* const size */
@@ -752,7 +752,7 @@ Module *mvm_module_read_file(const char *path) {
                 uint64_t bits = rd64(&r); double d; memcpy(&d, &bits, 8);
                 module_add_const_float(m, d); break;
             }
-            case MVM_CONST_STR:   { char *s = rdstr(&r); module_add_const_str(m, s ? s : ""); free(s); break; }
+            case MVM_CONST_STR:   { char *s = rdstr(&r); module_add_const_str(m, s ? s : ""); myon_free(s); break; }
             case MVM_CONST_BOOL:  module_add_const_bool(m, rd8(&r)); break;
             case MVM_CONST_NIL:   module_add_const_nil(m); break;
             case MVM_CONST_TYPESPEC: {
@@ -770,7 +770,7 @@ Module *mvm_module_read_file(const char *path) {
     for (uint16_t i = 0; i < nc && !r.err; i++) {
         char *s = rdstr(&r);
         module_add_native(m, s ? s : "");
-        free(s);
+        myon_free(s);
     }
 
     /* chunk table */
@@ -780,7 +780,7 @@ Module *mvm_module_read_file(const char *path) {
     for (uint32_t i = 0; i < ct && !r.err; i++) {
         char *name = rdstr(&r);
         int idx = module_add_chunk(m, name ? name : "<anon>");
-        free(name);
+        myon_free(name);
         Chunk *c = m->chunks[idx];
         c->num_params = rd16(&r);
         c->num_locals = rd16(&r);
@@ -810,7 +810,7 @@ Module *mvm_module_read_file(const char *path) {
         }
     }
 
-    free(data);
+    myon_free(data);
     if (r.err) { module_free(m); return NULL; }
     return m;
 }

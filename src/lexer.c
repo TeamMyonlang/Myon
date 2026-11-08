@@ -52,9 +52,9 @@ static void tl_push(TokenList *list, Token tok) {
 void token_list_free(TokenList *list) {
     if (!list) return;
     for (int i = 0; i < list->count; i++) {
-        free(list->items[i].lexeme);
+        myon_free(list->items[i].lexeme);
     }
-    free(list->items);
+    myon_free(list->items);
     list->items = NULL;
     list->count = list->capacity = 0;
 }
@@ -428,7 +428,7 @@ int lexer_tokenize(const char *source, TokenList *out) {
 
     /* strip a trailing newline token, then append EOF */
     if (out->count > 0 && out->items[out->count - 1].type == TOK_NEWLINE) {
-        free(out->items[out->count - 1].lexeme);
+        myon_free(out->items[out->count - 1].lexeme);
         out->count--;
     }
     emit(&lx, TOK_EOF, NULL, lx.line, lx.col);

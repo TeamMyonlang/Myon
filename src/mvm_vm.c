@@ -880,7 +880,6 @@ static int run(VM *vm) {
                 Value recv_copy = value_copy(recv);
                 Value out = value_nil();
                 myon_bridge_call_method(VM_BRIDGE(vm), recv_copy, method, args, argc, line, &out);
-                value_free(&recv_copy);
                 for (int i = 0; i < argc; i++) value_free(&vm->stack[vm->sp - 1 - i]);
                 vm->sp -= argc;
                 Value r = vm_pop(vm);   /* pop the receiver */

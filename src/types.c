@@ -90,13 +90,13 @@ TypeSpec *typespec_clone(const TypeSpec *t) {
 
 void typespec_free(TypeSpec *t) {
     if (!t) return;
-    free(t->name);
+    myon_free(t->name);
     typespec_free(t->elem);
     typespec_free(t->key);
     for (int i = 0; i < t->arg_count; i++)
         typespec_free(t->args[i]);
-    free(t->args);
-    free(t);
+    myon_free(t->args);
+    myon_free(t);
 }
 
 char *typespec_to_cstr(const TypeSpec *t) {
@@ -106,14 +106,14 @@ char *typespec_to_cstr(const TypeSpec *t) {
         case TYPE_ARRAY: {
             char *e = typespec_to_cstr(t->elem);
             snprintf(buf, sizeof(buf), "myon.array(%s)", e);
-            free(e);
+            myon_free(e);
             return myon_strdup(buf);
         }
         case TYPE_MAP: {
             char *k = typespec_to_cstr(t->key);
             char *v = typespec_to_cstr(t->elem);
             snprintf(buf, sizeof(buf), "myon.map(%s, %s)", k, v);
-            free(k); free(v);
+            myon_free(k); myon_free(v);
             return myon_strdup(buf);
         }
         case TYPE_STRUCT:
@@ -126,7 +126,7 @@ char *typespec_to_cstr(const TypeSpec *t) {
                     char *a = typespec_to_cstr(t->args[i]);
                     len += (size_t)snprintf(tmp + len, sizeof(tmp) - len, "%s%s",
                                             i ? ", " : "", a);
-                    free(a);
+                    myon_free(a);
                 }
                 if (len < sizeof(tmp)) snprintf(tmp + len, sizeof(tmp) - len, ">");
                 return myon_strdup(tmp);

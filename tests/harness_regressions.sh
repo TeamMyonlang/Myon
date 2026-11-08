@@ -19,8 +19,10 @@ printf '%s %s\n' "$mode" "$name" >> calls
 case "$name" in
     output_ok) echo A ;;
     output_error) echo A; exit 1 ;;
+    output_leak) echo A; exit 99 ;;
     output_crash) echo A; kill -SEGV $$ ;;
     runtime_error) exit 1 ;;
+    error_leak) exit 99 ;;
     stage_mismatch|stage_expected|stage_bad_metadata)
         [ "$mode" = vm ] && exit 65
         exit 1 ;;
@@ -40,6 +42,14 @@ case "$name" in
             exit 1
         fi
         echo A ;;
+    unsupported_leak)
+        if [ "$mode" = tree ]; then echo A; exit 0; fi
+        echo 'MVM does not support fixture feature' >&2
+        exit 99 ;;
+    unsupported_tree_leak)
+        if [ "$mode" = tree ]; then exit 99; fi
+        echo 'MVM does not support fixture feature' >&2
+        exit 65 ;;
     unsupported_tree_crash)
         if [ "$mode" = tree ]; then kill -SEGV $$; fi
         echo 'MVM does not support fixture feature' >&2
@@ -51,11 +61,11 @@ case "$name" in
 esac
 FAKE
 chmod +x "$scratch/myon"
-for name in output_ok output_error output_crash unsupported_compile unsupported_runtime; do
+for name in output_ok output_error output_leak output_crash unsupported_compile unsupported_runtime unsupported_leak; do
     : > "$scratch/tests/cases/$name.myon"
     printf 'A\n' > "$scratch/tests/cases/$name.out"
 done
-for name in runtime_error source_error error_crash error_abort error_timeout error_missing unsupported_crash unsupported_tree_crash stage_mismatch stage_expected stage_reversed stage_drift stage_bad_metadata; do
+for name in runtime_error source_error error_leak error_crash error_abort error_timeout error_missing unsupported_crash unsupported_tree_crash unsupported_tree_leak stage_mismatch stage_expected stage_reversed stage_drift stage_bad_metadata; do
     : > "$scratch/tests/cases/$name.myon"
     : > "$scratch/tests/cases/$name.err"
 done
@@ -70,7 +80,7 @@ for harness in run_tests run_mvm_tests; do
     rc=0
     bash "$scratch/tests/$harness.sh" >"$scratch/log" 2>&1 || rc=$?
     [ "$rc" -ne 0 ]
-    for name in output_error output_crash error_crash error_abort error_timeout error_missing unsupported_crash unsupported_tree_crash missing_fixture; do
+    for name in output_error output_leak output_crash error_leak error_crash error_abort error_timeout error_missing unsupported_crash unsupported_tree_crash unsupported_tree_leak missing_fixture; do
         if ! grep -Eq "  FAIL $name( |$)" "$scratch/log"; then
             cat "$scratch/log"
             echo "FAIL $harness accepted $name" >&2
@@ -81,7 +91,7 @@ for harness in run_tests run_mvm_tests; do
         grep -Eq "  ok   $name( |$)" "$scratch/log"
     done
     if [ "$harness" = run_mvm_tests ]; then
-        for name in stage_mismatch stage_reversed stage_drift stage_bad_metadata; do
+        for name in stage_mismatch stage_reversed stage_drift stage_bad_metadata unsupported_leak; do
             grep -Eq "  FAIL $name( |$)" "$scratch/log"
         done
         grep -Eq '  ok   stage_expected( |$)' "$scratch/log"
