@@ -1,0 +1,40 @@
+module myon.array
+module myon.stdio
+xs = myon.array(int)
+xs.push(1)
+xs.push(2)
+xs.push(3)
+myon.func check_counter() ret void {
+    total = 10
+    f = myon.lambda(x: int) ret int { total = total + x
+        ret total }
+    myon.print(xs.map(f))
+    myon.print(f(4))
+    myon.print(xs.map(f))
+}
+check_counter()
+# A callback may itself invoke another native higher-order method.
+myon.func nested(x: int) ret int {
+    ys = myon.array(int)
+    ys.push(x)
+    ys.push(x + 1)
+    ret ys.reduce(myon.lambda(a: int, b: int) ret int { ret a + b }, 0)
+}
+myon.print(xs.map(nested))
+# Callback globals and normal VM calls share the same storage.
+total = 0
+myon.func accumulate(x: int) ret int { total = total + x
+    ret total }
+myon.print(xs.map(accumulate))
+myon.print(total)
+empty = myon.array(int)
+myon.print(empty.map(nested))
+myon.print(empty.filter(nested))
+myon.print(empty.reduce(nested, 42))
+# Native callbacks can also execute inside a coroutine.
+myon.async myon.func task() ret int {
+    myon.print(xs.map(nested))
+    ret total
+}
+myon.print(myon.await task())
+myon.print(xs.map(myon.lambda(x: int) ret int, int { ret x, x + 1 }))

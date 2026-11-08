@@ -47,7 +47,7 @@ static void allocation_scopes(void) {
     program_free(valid);
 }
 
-static void check_source(const char *source, const char *path, int mvm) {
+static void check_source(const char *source, const char *path, int mvm, int expect_error) {
     size_t before = value_live_allocations();
     interpret_set_script_path(path);
     diag_set_source(source);
@@ -66,8 +66,8 @@ static void check_source(const char *source, const char *path, int mvm) {
         token_list_free(&tl);
     }
     diag_clear_source();
-    if (rc != 1 && rc != 65) {
-        fprintf(stderr, "FAIL expected error in %s (%s), got %d\n", path, mvm ? "MVM" : "tree", rc);
+    if (expect_error ? (rc != 1 && rc != 65) : rc != 0) {
+        fprintf(stderr, "FAIL unexpected exit in %s (%s), got %d\n", path, mvm ? "MVM" : "tree", rc);
         exit(1);
     }
     value_collect_cycles();
@@ -107,11 +107,23 @@ int main(int argc, char **argv) {
         char *source = myon_xmalloc((size_t)size + 1);
         assert(fread(source, 1, (size_t)size, file) == (size_t)size);
         fclose(file); source[size] = 0;
-        check_source(source, path, mvm);
+        check_source(source, path, mvm, 1);
         myon_free(source); myon_free(path);
     }
     for (size_t i = 0; i < sizeof(probes)/sizeof(probes[0]); i++)
-        for (int repeat = 0; repeat < 3; repeat++) check_source(probes[i], "ownership-probe", mvm);
+        for (int repeat = 0; repeat < 3; repeat++) check_source(probes[i], "ownership-probe", mvm, 1);
+    const char *success = "module myon.array\n"
+        "myon.func scoped() ret int { xs = myon.array(int)\nxs.push(1)\n"
+        "total = 2\nf = myon.lambda(x: int) ret int { total = total + x\nret total }\n"
+        "ys = xs.map(f)\nret ys[0] }\nscoped()";
+    for (int repeat = 0; repeat < 3; repeat++) check_source(success, "callback-success", mvm, 0);
+    if (mvm) { /* VM cells also outlive a returned closure's defining frame. */
+        const char *escape = "module myon.array\n"
+            "myon.func make() ret func { n = 1\n"
+            "ret myon.lambda(x: int) ret int { n = n + x\nret n } }\n"
+            "f = make()\nxs = myon.array(int)\nxs.push(2)\nxs.map(f)";
+        for (int repeat = 0; repeat < 3; repeat++) check_source(escape, "callback-escape", mvm, 0);
+    }
     interpret_set_script_path(NULL);
     puts("error cleanup ownership tests passed");
     return 0;

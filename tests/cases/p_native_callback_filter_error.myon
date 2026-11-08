@@ -1,0 +1,4 @@
+module myon.array
+xs = myon.array(str)
+xs.push("bad")
+xs.filter(myon.lambda(x: str) ret bool { ret int(x) > 0 })

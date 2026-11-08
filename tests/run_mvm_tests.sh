@@ -42,7 +42,7 @@ fi
 run_to() { "$TIMEOUT_BIN" "$TIMEOUT" "$@"; }
 
 # Current limitations; actual exclusions still come from VM diagnostics.
-EXCLUDED_KNOWN=(p41_ffi_callback p4_array_higher_order p_module_alias)
+EXCLUDED_KNOWN=(p_module_alias)
 
 scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT

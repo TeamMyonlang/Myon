@@ -121,7 +121,7 @@ typedef struct {
      * async_vm_body.  This flag tells RET to leave the return value(s) on the
      * operand stack instead of discarding them (spec §14.9).
      */
-    int      keep_top_return;
+    int      keep_top_return; /* 1: async single result; 2: native tuple result */
 } VM;
 
 /* Convenience accessors so most code keeps reading VM_MODULE(vm) etc. */
@@ -276,19 +276,6 @@ static int vm_closure_chunk(const Value *v) {
 
 static void do_call_native(VM *vm, int line, const char *name, int argc) {
     Value *args = &vm->stack[vm->sp - argc];
-    /* An MVM closure encodes a chunk index in as.fn.mvm_chunk, not a real
-     * FuncDecl*, so a tree-walk native that would call it back (only
-     * myon.ffi.make_callback does) cannot execute it and would misbehave.
-     * Refuse cleanly and halt here rather than letting the program proceed
-     * with a bogus callback pointer (which crashes the foreign call). Passing
-     * a VM function/lambda into a native is an MVM cross-engine limitation
-     * (spec §7); run the .myon source instead. */
-    for (int i = 0; i < argc; i++) {
-        if (vm_is_mvm_fn(&args[i]))
-            vm_error(vm, line,
-                "MVM does not support passing a function/lambda to the native "
-                "'%s' (cross-engine callback; run the .myon source instead)", name);
-    }
     Value out = value_nil();
     int handled = myon_bridge_call_native(VM_BRIDGE(vm), name, args, argc, line, &out);
     if (!handled) {
@@ -474,6 +461,41 @@ static void do_spawn_async(VM *vm, int line, int argc) {
 
     Value task = myon_bridge_spawn_task(vm->sh->bridge, async_vm_body, ctx, async_vm_cleanup);
     vm_push(vm, task);
+}
+
+/* Native callbacks use independent stacks, sharing globals and captured cells.
+ * Register the stack with the bridge before any operation that can throw: a
+ * native error or abandoned coroutine can bypass this C invocation entirely. */
+static void callback_vm_cleanup(void *resource) {
+    VM *vm = resource;
+    for (int i = vm->frame_count - 1; i >= 0; i--) frame_close_cells(&vm->frames[i]);
+    while (vm->sp > 0) { Value v = vm_pop(vm); value_free(&v); }
+    free(vm->stack);
+    free(vm);
+}
+static Value call_vm_callback(void *context, Value fn, Value *args, int argc, int line) {
+    VM *vm = myon_xmalloc(sizeof(*vm));
+    memset(vm, 0, sizeof(*vm));
+    vm->sh = context;
+    vm->keep_top_return = 2; /* pack multiple returns as a native Value tuple */
+    Interp *bridge = VM_BRIDGE(vm);
+    myon_bridge_own_resource(bridge, vm, callback_vm_cleanup);
+    if (setjmp(vm->on_error)) {
+        myon_bridge_release_resource(bridge, vm);
+        callback_vm_cleanup(vm);
+        myon_bridge_propagate_error(bridge);
+    }
+    vm_push(vm, value_copy(&fn));
+    for (int i = 0; i < argc; i++) vm_push(vm, value_copy(&args[i]));
+    if (fn.as.obj->as.fn.mvm_is_async) do_spawn_async(vm, line, argc);
+    else {
+        push_frame(vm, &fn, vm_closure_chunk(&fn), argc, 0, line);
+        run(vm);
+    }
+    Value result = vm_pop(vm);
+    myon_bridge_release_resource(bridge, vm);
+    callback_vm_cleanup(vm);
+    return result;
 }
 
 static int run(VM *vm) {
@@ -683,7 +705,12 @@ static int run(VM *vm) {
                  * left on the stack so async_vm_body can hand it to the awaiter
                  * (spec §14.9).  RET normalized n>=1 above, so the task result
                  * is the single top value; drop any extra straggler returns. */
-                if (vm->keep_top_return) {
+                if (vm->keep_top_return == 2 && n > 1) {
+                    Value tuple = value_array(NULL);
+                    for (int i = 0; i < n; i++) array_push(&tuple, rets[i]);
+                    vm->sp -= n; /* ownership moved into the tuple */
+                    vm_push(vm, tuple);
+                } else if (vm->keep_top_return) {
                     for (int i = 0; i < n - 1; i++) { Value d = vm_pop(vm); value_free(&d); }
                 } else {
                     for (int i = 0; i < n; i++) { Value d = vm_pop(vm); value_free(&d); }
@@ -862,21 +889,6 @@ static int run(VM *vm) {
             } else {
                 /* built-in method (array/map/str): reuse the tree-walker */
                 Value *args = &vm->stack[vm->sp - argc];
-                /* An MVM closure encodes its chunk index in as.fn.decl (see
-                 * vm_make_closure), NOT a real FuncDecl*.  The tree-walk
-                 * built-ins (.map/.filter/.reduce, ...) would dereference that
-                 * as a pointer and crash.  Passing a VM function value into a
-                 * native higher-order method is therefore unsupported for now;
-                 * detect it and raise a clean error instead of segfaulting.
-                 * (Documented Step 7-b limitation.) */
-                for (int i = 0; i < argc; i++) {
-                    if (args[i].type == TYPE_FUNC) {
-                        vm_error(vm, line,
-                            "MVM does not support passing a function/lambda to the "
-                            "built-in method '%s' (higher-order native methods; "
-                            "run the .myon source instead)", method);
-                    }
-                }
                 Value recv_copy = value_copy(recv);
                 Value out = value_nil();
                 myon_bridge_call_method(VM_BRIDGE(vm), recv_copy, method, args, argc, line, &out);
@@ -981,6 +993,7 @@ int mvm_run_module(Module *m, Program *program, const char *source) {
     sh.module  = m;
     sh.program = program;
     sh.bridge  = myon_bridge_interp_new();
+    myon_bridge_set_vm_caller(sh.bridge, call_vm_callback, &sh);
 
     int entry = m->entry_chunk;
     Chunk *ec = module_chunk(m, entry);

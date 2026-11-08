@@ -65,7 +65,7 @@ esac
 # normalized output and run everywhere.
 LINUX_ONLY_SO_CASES=" \
 p_ffi_basic p_ffi_close p31_ffi_bytes_crc32 p31_ffi_read_cstr \
-p41_ffi_callback "
+p41_ffi_callback p_ffi_callback_reentry "
 
 # is_linux_only_so_case <name> -> 0 (true) if it must be skipped off Linux.
 is_linux_only_so_case() {

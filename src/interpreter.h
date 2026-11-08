@@ -114,6 +114,17 @@ void    myon_bridge_interp_free(Interp *it);
  */
 void *myon_bridge_error_buf(Interp *it);
 
+/* Bytecode callbacks borrow fn/args and return an owned Value. The runner and
+ * its context remain valid until bridge teardown (including task shutdown). */
+typedef Value (*MyonVMCaller)(void *context, Value fn, Value *args, int argc, int line);
+void myon_bridge_set_vm_caller(Interp *it, MyonVMCaller caller, void *context);
+/* Protect nested VM stacks across native longjmp and coroutine cancellation. */
+void myon_bridge_own_resource(Interp *it, void *resource, void (*dispose)(void *));
+void myon_bridge_release_resource(Interp *it, void *resource);
+/* Propagate an already-reported VM error through the active native barrier. */
+_Noreturn void myon_bridge_propagate_error(Interp *it);
+
+
 /*
  * Binary / unary operators with the strict-typing semantics of spec §2.2.
  * myon_bridge_binary consumes (frees) both l and r and returns a fresh Value;
