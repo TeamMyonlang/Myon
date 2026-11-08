@@ -152,7 +152,7 @@ endif
 
 asan: $(ASAN_BIN)
 
-$(ASAN_BIN): $(SOURCES)
+$(ASAN_BIN): $(SOURCES) src/unicode_case_data.inc src/unicode.h
 	$(ASAN_CC) $(ASAN_CFLAGS) -I$(SRC_DIR) $(SOURCES) -o $@ $(ASAN_LDLIBS)
 
 # Run the full regression suite against the sanitizer binary.
@@ -164,7 +164,7 @@ $(ASAN_BIN): $(SOURCES)
 # the original `myon` is always put back even if a test fails (approach B in
 # the CI TODO).  ASAN_OPTIONS/UBSAN_OPTIONS make any sanitizer finding abort
 # with a non-zero exit so the failure surfaces as a red CI step.
-test-asan: $(ASAN_BIN)
+test-asan: $(ASAN_BIN) $(BUILD)/unicode_case_asan | $(BUILD)
 	@echo "== Myon sanitizer (ASan/UBSan) test run =="
 	@set -e; \
 	restore() { \
@@ -177,6 +177,7 @@ test-asan: $(ASAN_BIN)
 	cp -f $(ASAN_BIN) myon; \
 	export ASAN_OPTIONS="abort_on_error=1:halt_on_error=1:detect_leaks=0"; \
 	export UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=1:abort_on_error=1"; \
+	$(BUILD)/unicode_case_asan; \
 	bash tests/runtime_regressions.sh ./myon; \
 	bash tests/diagnostic_regressions.sh ./myon; \
 	bash tests/string_regressions.sh ./myon; \
@@ -279,7 +280,7 @@ clean:
 RUNTIME_TEST_SRCS = tests/runtime_memory_tests.c src/value.c src/types.c \
                     src/ast.c src/common.c src/event_loop.c
 .PHONY: test-runtime
-test-runtime: all | $(BUILD)
+test-runtime: all test-unicode | $(BUILD)
 	$(CC) $(CFLAGS) -Isrc $(RUNTIME_TEST_SRCS) $(LDLIBS) -o $(BUILD)/runtime_memory_tests
 	$(BUILD)/runtime_memory_tests
 	bash tests/runtime_regressions.sh ./$(BIN)
@@ -291,7 +292,18 @@ test-runtime: all | $(BUILD)
 # Linux LSan gate: all success fixtures and selected task shutdown errors.
 # Keep its failure code distinct from the language's expected error exit 1.
 .PHONY: test-lsan
-test-lsan: $(ASAN_BIN) | $(BUILD)
+test-lsan: $(ASAN_BIN) $(BUILD)/unicode_case_asan | $(BUILD)
 	$(ASAN_CC) $(ASAN_CFLAGS) -Isrc $(RUNTIME_TEST_SRCS) $(ASAN_LDLIBS) -o $(BUILD)/runtime_memory_lsan
 	ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 LSAN_OPTIONS=exitcode=99 UBSAN_OPTIONS=halt_on_error=1 $(BUILD)/runtime_memory_lsan
+	ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 LSAN_OPTIONS=exitcode=99 UBSAN_OPTIONS=halt_on_error=1 $(BUILD)/unicode_case_asan
 	bash tests/leak_regressions.sh ./$(ASAN_BIN)
+
+$(BUILD)/unicode.o: src/unicode_case_data.inc src/unicode.h
+$(BUILD)/interpreter.o: src/unicode.h
+.PHONY: test-unicode
+test-unicode: | $(BUILD)
+	$(CC) $(CFLAGS) -Isrc tests/unicode_case_tests.c src/unicode.c src/common.c -o $(BUILD)/unicode_case_tests
+	$(BUILD)/unicode_case_tests
+
+$(BUILD)/unicode_case_asan: tests/unicode_case_tests.c src/unicode.c src/unicode.h src/unicode_case_data.inc src/common.c src/common.h | $(BUILD)
+	$(ASAN_CC) $(ASAN_CFLAGS) -Isrc tests/unicode_case_tests.c src/unicode.c src/common.c -o $@

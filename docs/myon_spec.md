@@ -8,8 +8,7 @@ MVM の命令とファイル形式は [MVM リファレンス](mvm_spec.md)、�
 [機能一覧](features.md) を参照してください。
 
 言語の規則と実装の不一致は [既知の問題](../known-issues.md) に記録しています。
-特に module 宣言による機能制限、Unicode の大小文字変換、
-実行エンジン間のエラー段階には制約があります。
+特に module 宣言による機能制限と、実行エンジン間のエラー段階には制約があります。
 
 ### 0.1 表記
 
@@ -621,7 +620,10 @@ lcm/pow_int は範囲外を error 戻り値で報告します。
 length はバイト数、length_chars は Unicode コードポイント数です。
 substring/index_of と空区切り split はコードポイント単位で動きます。
 結合文字や絵文字列の書記素クラスタ単位ではありません。
-upper/lower は Unicode ケースマッピングを実装していません。
+upper/lower はUnicode 17.0.0のDefault Case Conversion（full mapping）を使います。
+`ß → SS` のような展開とΣの文脈依存変換に対応し、OSのロケールには依存しません。
+不正UTF-8は元のバイトを保持し、文脈の区切りにします。言語別tailoringや正規化は行いません。
+データと再生成手順は [Unicode大小文字変換](unicode.md) を参照してください。
 
 | 関数 | シグネチャ | 説明 |
 |------|-----------|------|
@@ -629,7 +631,7 @@ upper/lower は Unicode ケースマッピングを実装していません。
 | `length_chars` | `(s: str) ret int` | 文字数（Unicodeコードポイント数） |
 | `concat` | `(a: str, b: str) ret str` | 連結 |
 | `contains` | `(s: str, sub: str) ret bool` | 部分文字列を含むか |
-| `upper` / `lower` | `(s: str) ret str` | 大文字化 / 小文字化（ASCII） |
+| `upper` / `lower` | `(s: str) ret str` | 大文字化 / 小文字化（Unicode 17.0.0、言語別tailoringなし） |
 | `substring` | `(s: str, start: int, len: int) ret str, error` | start文字目からlen文字分（文字数ベース）。範囲外は`error` |
 | `split` | `(s: str, sep: str) ret myon.array(str)` | sep区切りで分割。空sepは1文字ずつ、空sは空配列 |
 | `join` | `(parts: myon.array(str), sep: str) ret str` | sepで連結。空配列は`""` |
@@ -987,7 +989,7 @@ WindowsのFiberエントリはreturnせず、完了を記録してmain_fiberへ�
 
 未対応なのは IPv6、TLSサーバー、HTTP Keep-Alive、MVMのmoduleリンクとREPL、
 VM関数値をネイティブ側で実行するコールバックなどです。
-Unicodeケース変換や異常終了時のリークなど、実装上の問題は既知一覧で状態を管理します。
+module宣言の利用制限や異常終了時のリークなど、実装上の問題は既知一覧で状態を管理します。
 マルチスレッド化や追加の型制約は、現実装の仕様ではありません。
 
 HTTPハンドラのステータス/Content-Type指定、HTTPSクライアント、クロージャ、
