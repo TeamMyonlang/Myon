@@ -289,7 +289,7 @@ clean:
 # Ownership/collection checks assert counts directly; they do not depend on RSS
 # or on the main harness's permissive expected-error checks.
 RUNTIME_TEST_SRCS = tests/runtime_memory_tests.c src/value.c src/types.c \
-                    src/ast.c src/common.c src/event_loop.c
+                    src/ast.c src/common.c src/event_loop.c src/env.c
 .PHONY: test-runtime
 test-runtime: all test-unicode $(BUILD)/error_cleanup_tests | $(BUILD)
 	$(CC) $(CFLAGS) -Isrc $(RUNTIME_TEST_SRCS) $(LDLIBS) -o $(BUILD)/runtime_memory_tests
@@ -320,7 +320,7 @@ test-unicode: | $(BUILD)
 $(BUILD)/unicode_case_asan: tests/unicode_case_tests.c src/unicode.c src/unicode.h src/unicode_case_data.inc src/common.c src/common.h | $(BUILD)
 	$(ASAN_CC) $(ASAN_CFLAGS) -Isrc tests/unicode_case_tests.c src/unicode.c src/common.c -o $@
 
-$(OBJECTS): src/value.h src/common.h
+$(OBJECTS): src/value.h src/common.h src/env.h
 $(BUILD)/interpreter.o $(BUILD)/mvm_compiler.o: src/builtin_modules.h
 $(BUILD)/mvm_chunk.o $(BUILD)/mvm_vm.o $(BUILD)/mvm_compiler.o: src/mvm_bytecode.h
 

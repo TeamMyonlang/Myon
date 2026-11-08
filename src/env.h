@@ -30,6 +30,8 @@ typedef struct Binding {
 } Binding;
 
 typedef struct Env {
+    ValueGC     gc;
+    int         refcount;
     Binding    *head;
     struct Env *parent;
     int         is_block;       /* explicit { } block scope (spec 9.2 shadowing) */
@@ -41,7 +43,10 @@ typedef struct Env {
 } Env;
 
 Env  *env_new(Env *parent);
-void  env_free(Env *env);   /* frees this scope's own bindings only */
+Env  *env_ref(Env *env);
+/* Drop an owning reference. Bindings and the owned parent reference are freed
+ * when the last owner goes away; closure cycles are handled by Value GC. */
+void  env_free(Env *env);
 
 /* Define a new binding in the *current* scope. Returns 0 if the name is
  * already defined in this exact scope (shadowing check groundwork). */

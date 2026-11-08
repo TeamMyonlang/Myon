@@ -2,9 +2,12 @@ module myon.ffi
 module myon.array
 module myon.stdio
 h, e = myon.ffi.load(str("tests/fixtures/libffi_callback_test.so"))
-total = 5
-f = myon.lambda() ret int { total = total + 1
-    ret total }
+myon.func make_counter() ret func {
+    total = 5
+    ret myon.lambda() ret int { total = total + 1
+        ret total }
+}
+f = make_counter()
 p, ep = myon.ffi.make_callback(f, 0)
 r, er = myon.ffi.call_i(h, "call_noarg", "p", p)
 myon.print(r)
