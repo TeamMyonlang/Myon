@@ -442,7 +442,7 @@ static void compile_string(Compiler *c, int line, const char *raw) {
             FLUSH_LIT();
             char *sub = myon_strndup(s + 1, (size_t)(end - (s + 1)));
             Program *p = parse_interp_expr(c, line, sub);
-            free(sub);
+            myon_free(sub);
             compile_expr(c, p->stmts.items[0]->as.expr);
             program_free(p);
             chunk_emit_op(ch, MOP_TO_STR, line);
@@ -459,7 +459,7 @@ static void compile_string(Compiler *c, int line, const char *raw) {
         chunk_emit_op_u16(ch, MOP_PUSH_CONST, (uint16_t)idx, line);
     }
     #undef FLUSH_LIT
-    free(lit);
+    myon_free(lit);
 }
 
 /* Map an AST OpKind (src/ast.h) to the corresponding MVM opcode. */
@@ -561,13 +561,12 @@ static void compile_struct_ctor(Compiler *c, Expr *e, StructDecl *sd) {
             if (!an && a == f) found = a; /* positional fallback */
         }
         if (found < 0) {
-            free(fields);
             compile_error(c, e->line, "struct %s: missing field '%s'",
                           sd->name, fields[f]->name);
         }
         compile_expr(c, e->as.call.args[found]);
     }
-    free(fields);
+    myon_free(fields);
     int tidx = module_add_const_str(c->module, sd->name);
     chunk_emit_op_u16(ch, MOP_NEW_STRUCT, (uint16_t)tidx, e->line);
 }
@@ -1252,7 +1251,7 @@ static void compile_stmt(Compiler *c, Stmt *s) {
                 /* Methods are compiled as top-level chunks (no enclosing
                  * function), so they never capture upvalues. */
                 compile_function(c, md, dbg, sd, NULL, NULL);  /* sd => bind `self` at slot 0 */
-                free(dbg);
+                myon_free(dbg);
             }
             break;
         }
@@ -1381,23 +1380,25 @@ static void fill_source_info(Module *m, const char *path) {
 /* ================================================================== */
 
 Module *mvm_compile_program(Program *program, const char *source_path) {
-    Compiler c;
-    memset(&c, 0, sizeof(c));
-    c.module = module_new();
+    MyonAllocScope *scope = myon_alloc_scope_begin();
+    Compiler *c = myon_xmalloc(sizeof(*c));
+    memset(c, 0, sizeof(*c));
+    c->module = module_new();
 
     /* top-level main chunk */
-    int main_idx = module_add_chunk(c.module, "<main>");
-    c.module->entry_chunk = main_idx;
+    int main_idx = module_add_chunk(c->module, "<main>");
+    c->module->entry_chunk = main_idx;
 
     FnComp mainfn;
     memset(&mainfn, 0, sizeof(mainfn));
     mainfn.chunk_idx = main_idx;
-    c.fn = &mainfn;
+    c->fn = &mainfn;
 
-    if (setjmp(c.on_error)) {
+    if (setjmp(c->on_error)) {
         /* compile error already reported */
-        if (c.structs) free(c.structs);
-        module_free(c.module);
+        if (c->structs) myon_free(c->structs);
+        module_free(c->module);
+        myon_alloc_scope_end(scope, true);
         return NULL;
     }
 
@@ -1405,25 +1406,25 @@ Module *mvm_compile_program(Program *program, const char *source_path) {
      * references (e.g. a method returning another struct) resolve. */
     for (int i = 0; i < program->stmts.count; i++)
         if (program->stmts.items[i]->kind == STMT_STRUCT)
-            register_struct(&c, program->stmts.items[i]->as.struct_decl);
+            register_struct(c, program->stmts.items[i]->as.struct_decl);
 
     /* Resolve parents and validate the inheritance chain, mirroring the
      * tree-walk interpreter's prescan (spec 14.6): a subclass may not
      * re-declare a field already present in any ancestor.  Enforcing this in
      * the compiler makes the .err case fail cleanly (no .myc emitted) exactly
      * as `.myon` does, keeping the two engines in agreement (Step 7-b). */
-    for (int i = 0; i < c.struct_count; i++) {
-        StructDecl *sd = c.structs[i];
+    for (int i = 0; i < c->struct_count; i++) {
+        StructDecl *sd = c->structs[i];
         if (sd->parent_name && !sd->parent) {
-            sd->parent = find_struct(&c, sd->parent_name);
+            sd->parent = find_struct(c, sd->parent_name);
             if (!sd->parent)
-                compile_error(&c, 0, "struct '%s' extends unknown struct '%s'",
+                compile_error(c, 0, "struct '%s' extends unknown struct '%s'",
                               sd->name, sd->parent_name);
             for (int a = 0; a < sd->field_count; a++)
                 for (StructDecl *pc = sd->parent; pc; pc = pc->parent)
                     for (int b = 0; b < pc->field_count; b++)
                         if (strcmp(sd->fields[a].name, pc->fields[b].name) == 0)
-                            compile_error(&c, 0,
+                            compile_error(c, 0,
                                 "field '%s' in struct '%s' collides with parent (spec 14.6)",
                                 sd->fields[a].name, sd->name);
         }
@@ -1431,15 +1432,15 @@ Module *mvm_compile_program(Program *program, const char *source_path) {
 
     for (int i = 0; i < program->stmts.count; i++)
         if (program->stmts.items[i]->kind == STMT_MODULE)
-            compile_stmt(&c, program->stmts.items[i]);
+            compile_stmt(c, program->stmts.items[i]);
     for (int i = 0; i < program->stmts.count; i++)
         if (program->stmts.items[i]->kind != STMT_MODULE)
-            compile_stmt(&c, program->stmts.items[i]);
+            compile_stmt(c, program->stmts.items[i]);
 
     /* main returns nothing */
-    chunk_emit_op_u8(cur_chunk(&c), MOP_RET, 0, 0);
+    chunk_emit_op_u8(cur_chunk(c), MOP_RET, 0, 0);
 
-    Chunk *mc = cur_chunk(&c);
+    Chunk *mc = cur_chunk(c);
     mc->num_params = 0;
     mc->num_locals = (uint16_t)mainfn.max_slot;
     mc->ret_count  = 0;
@@ -1447,8 +1448,11 @@ Module *mvm_compile_program(Program *program, const char *source_path) {
      * not upvalues, so this is normally empty — set it for completeness. */
     fill_captured_bitmap(mc, &mainfn);
 
-    fill_source_info(c.module, source_path);
+    fill_source_info(c->module, source_path);
 
-    if (c.structs) free(c.structs);
-    return c.module;
+    if (c->structs) myon_free(c->structs);
+    Module *result = c->module;
+    myon_free(c);
+    myon_alloc_scope_end(scope, false);
+    return result;
 }

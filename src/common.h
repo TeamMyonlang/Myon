@@ -44,6 +44,16 @@ static inline bool checked_mul_size(size_t a, size_t b, size_t *out) {
     return !__builtin_mul_overflow(a, b, out);
 }
 
+/* Parser/compiler transactions track allocations without changing layout.
+ * Use myon_free inside a transaction. Destroy managed objects (e.g. a Module
+ * and its Values) before raw rollback. */
+typedef struct MyonAllocScope MyonAllocScope;
+MyonAllocScope *myon_alloc_scope_begin(void);
+void myon_alloc_scope_end(MyonAllocScope *scope, bool rollback);
+void myon_alloc_track(void *ptr);
+void *myon_tracked_realloc(void *ptr, size_t n);
+void myon_free(void *ptr);
+
 /* xmalloc / xrealloc: allocate or abort. Interpreter-grade convenience. */
 static inline void *myon_xmalloc(size_t n) {
     void *p = malloc(n);
@@ -51,16 +61,12 @@ static inline void *myon_xmalloc(size_t n) {
         fprintf(stderr, "myon: out of memory\n");
         exit(70);
     }
+    myon_alloc_track(p);
     return p;
 }
 
 static inline void *myon_xrealloc(void *ptr, size_t n) {
-    void *p = realloc(ptr, n);
-    if (!p) {
-        fprintf(stderr, "myon: out of memory\n");
-        exit(70);
-    }
-    return p;
+    return myon_tracked_realloc(ptr, n);
 }
 
 char *myon_strndup(const char *s, size_t n);

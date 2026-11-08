@@ -152,48 +152,48 @@ void stmtlist_push(StmtList *list, Stmt *s) {
 
 void funcdecl_free(FuncDecl *f) {
     if (!f) return;
-    free(f->name);
+    myon_free(f->name);
     for (int i = 0; i < f->param_count; i++) {
-        free(f->params[i].name);
+        myon_free(f->params[i].name);
         typespec_free(f->params[i].type);
     }
-    free(f->params);
+    myon_free(f->params);
     for (int i = 0; i < f->ret_count; i++)
         typespec_free(f->ret_types[i]);
-    free(f->ret_types);
+    myon_free(f->ret_types);
     for (int i = 0; i < f->tparam_count; i++)
-        free(f->tparams[i]);
-    free(f->tparams);
+        myon_free(f->tparams[i]);
+    myon_free(f->tparams);
     if (f->body) {
         stmtlist_free(f->body);
-        free(f->body);
+        myon_free(f->body);
     }
-    free(f);
+    myon_free(f);
 }
 
 void structdecl_free(StructDecl *s) {
     if (!s) return;
-    free(s->name);
-    free(s->parent_name);
+    myon_free(s->name);
+    myon_free(s->parent_name);
     for (int i = 0; i < s->field_count; i++) {
-        free(s->fields[i].name);
+        myon_free(s->fields[i].name);
         typespec_free(s->fields[i].type);
     }
-    free(s->fields);
+    myon_free(s->fields);
     for (int i = 0; i < s->method_count; i++)
         funcdecl_free(s->methods[i]);
-    free(s->methods);
+    myon_free(s->methods);
     for (int i = 0; i < s->tparam_count; i++)
-        free(s->tparams[i]);
-    free(s->tparams);
-    free(s);
+        myon_free(s->tparams[i]);
+    myon_free(s->tparams);
+    myon_free(s);
 }
 
 void expr_free(Expr *e) {
     if (!e) return;
     switch (e->kind) {
-        case EXPR_STRING:    free(e->as.str_val); break;
-        case EXPR_IDENT:     free(e->as.ident);   break;
+        case EXPR_STRING:    myon_free(e->as.str_val); break;
+        case EXPR_IDENT:     myon_free(e->as.ident);   break;
         case EXPR_STR_CTOR:
         case EXPR_CHAR_CTOR:
         case EXPR_INT_CTOR:
@@ -211,13 +211,13 @@ void expr_free(Expr *e) {
             expr_free(e->as.call.callee);
             for (int i = 0; i < e->as.call.arg_count; i++) {
                 expr_free(e->as.call.args[i]);
-                free(e->as.call.arg_names[i]);
+                myon_free(e->as.call.arg_names[i]);
             }
-            free(e->as.call.args);
-            free(e->as.call.arg_names);
+            myon_free(e->as.call.args);
+            myon_free(e->as.call.arg_names);
             for (int i = 0; i < e->as.call.type_arg_count; i++)
                 typespec_free(e->as.call.type_args[i]);
-            free(e->as.call.type_args);
+            myon_free(e->as.call.type_args);
             break;
         case EXPR_INDEX:
             expr_free(e->as.index.target);
@@ -225,7 +225,7 @@ void expr_free(Expr *e) {
             break;
         case EXPR_MEMBER:
             expr_free(e->as.member.target);
-            free(e->as.member.name);
+            myon_free(e->as.member.name);
             break;
         case EXPR_ARRAY_CTOR:
             typespec_free(e->as.array_elem);
@@ -238,31 +238,31 @@ void expr_free(Expr *e) {
             funcdecl_free(e->as.lambda);
             break;
         case EXPR_GENERIC:
-            free(e->as.generic.name);
+            myon_free(e->as.generic.name);
             for (int i = 0; i < e->as.generic.arg_count; i++)
                 typespec_free(e->as.generic.args[i]);
-            free(e->as.generic.args);
+            myon_free(e->as.generic.args);
             break;
         default: break;
     }
-    free(e);
+    myon_free(e);
 }
 
 void stmt_free(Stmt *s) {
     if (!s) return;
     switch (s->kind) {
         case STMT_MODULE:
-            free(s->as.module_decl.path);
-            free(s->as.module_decl.alias);
+            myon_free(s->as.module_decl.path);
+            myon_free(s->as.module_decl.alias);
             break;
         case STMT_ASSIGN:
-            free(s->as.assign.name);
+            myon_free(s->as.assign.name);
             typespec_free(s->as.assign.annotated);
             expr_free(s->as.assign.value);
             expr_free(s->as.assign.target);
             for (int i = 0; i < s->as.assign.extra_count; i++)
-                free(s->as.assign.extra_names[i]);
-            free(s->as.assign.extra_names);
+                myon_free(s->as.assign.extra_names[i]);
+            myon_free(s->as.assign.extra_names);
             break;
         case STMT_EXPR:
             expr_free(s->as.expr);
@@ -274,7 +274,7 @@ void stmt_free(Stmt *s) {
                 expr_free(s->as.if_stmt.elifs[i].cond);
                 stmtlist_free(&s->as.if_stmt.elifs[i].body);
             }
-            free(s->as.if_stmt.elifs);
+            myon_free(s->as.if_stmt.elifs);
             if (s->as.if_stmt.has_else)
                 stmtlist_free(&s->as.if_stmt.else_body);
             break;
@@ -283,7 +283,7 @@ void stmt_free(Stmt *s) {
             stmtlist_free(&s->as.while_stmt.body);
             break;
         case STMT_FOR:
-            free(s->as.for_stmt.var);
+            myon_free(s->as.for_stmt.var);
             expr_free(s->as.for_stmt.range_start);
             expr_free(s->as.for_stmt.range_end);
             expr_free(s->as.for_stmt.iterable);
@@ -293,7 +293,7 @@ void stmt_free(Stmt *s) {
             stmtlist_free(&s->as.block);
             break;
         case STMT_EXPOSE:
-            free(s->as.expose_name);
+            myon_free(s->as.expose_name);
             break;
         case STMT_FUNC:
             funcdecl_free(s->as.func);
@@ -304,18 +304,18 @@ void stmt_free(Stmt *s) {
         case STMT_RETURN:
             for (int i = 0; i < s->as.ret.count; i++)
                 expr_free(s->as.ret.values[i]);
-            free(s->as.ret.values);
+            myon_free(s->as.ret.values);
             break;
         default: break;
     }
-    free(s);
+    myon_free(s);
 }
 
 void stmtlist_free(StmtList *list) {
     if (!list) return;
     for (int i = 0; i < list->count; i++)
         stmt_free(list->items[i]);
-    free(list->items);
+    myon_free(list->items);
     list->items = NULL;
     list->count = list->capacity = 0;
 }
@@ -323,5 +323,5 @@ void stmtlist_free(StmtList *list) {
 void program_free(Program *p) {
     if (!p) return;
     stmtlist_free(&p->stmts);
-    free(p);
+    myon_free(p);
 }

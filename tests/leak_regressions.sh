@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -eu
 MYON=${1:-./myon_asan}
-export ASAN_OPTIONS=detect_leaks=1:halt_on_error=1
+export ASAN_OPTIONS=detect_leaks=1:halt_on_error=1:exitcode=99
 export LSAN_OPTIONS=exitcode=99
-export UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1
+export UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1:exitcode=99
 if command -v timeout >/dev/null 2>&1; then
     TIMEOUT_BIN=timeout
 elif command -v gtimeout >/dev/null 2>&1; then
@@ -27,16 +27,8 @@ run_case() {
     fi
     count=$((count + 1))
 }
-# Error fixtures have separate known unwinding leaks. Check every success
-# fixture, including HTTP daemon shutdown, without suppressing leak reports.
-for expected in tests/cases/*.out; do
-    src=${expected%.out}.myon
-    run_case "$src" tree 0
-    case "$(basename "$src" .myon)" in
-        p41_ffi_callback|p4_array_higher_order|p_module_alias) continue ;;
-    esac
-    run_case "$src" mvm 0
-done
+# The full source/compiler/equality suites cover all fixtures with LSan on.
+# Keep these additional task shutdown probes without a fixture allowlist.
 cat > "$scratch/ready.myon" <<'MYON'
 module myon.stdio
 myon.async myon.func pending(payload: str) ret str {

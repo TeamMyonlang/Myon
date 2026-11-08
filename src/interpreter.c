@@ -248,7 +248,13 @@ typedef struct ModuleEntry {
 } ModuleEntry;
 
 typedef struct {
-    Env *env;
+    int count;
+    Value values[];
+} OwnedValues;
+
+typedef struct {
+    void *resource;
+    void (*dispose)(void *);
     Task *owner;
     uint64_t sequence;
 } CleanupEntry;
@@ -261,6 +267,7 @@ struct Interp {
     jmp_buf      on_error;
     /* return-value transport */
     Value       *ret_values;
+    OwnedValues *ret_owner;
     int          ret_count;
     /* generic type-parameter bindings active in the current call */
     Env         *type_env;   /* name -> not used as value; tracked separately */
@@ -340,14 +347,14 @@ static jmp_buf *interp_error_buf(Interp *it) {
     return task ? (jmp_buf *)event_loop_task_error_buf(task) : &it->on_error;
 }
 
-static void cleanup_push(Interp *it, Env *env) {
+static void cleanup_register(Interp *it, void *resource, void (*dispose)(void *)) {
     if (it->cleanup_count == it->cleanup_cap) {
         int ncap = it->cleanup_cap ? it->cleanup_cap * 2 : 16;
         it->cleanup_stack = myon_xrealloc(it->cleanup_stack,
                                          (size_t)ncap * sizeof(CleanupEntry));
         it->cleanup_cap = ncap;
     }
-    CleanupEntry entry = {env, interp_current_task(it), ++it->cleanup_sequence};
+    CleanupEntry entry = {resource, dispose, interp_current_task(it), ++it->cleanup_sequence};
     it->cleanup_stack[it->cleanup_count++] = entry;
 }
 
@@ -357,10 +364,33 @@ static void cleanup_remove(Interp *it, int index) {
     it->cleanup_count--;
 }
 
-static void cleanup_pop(Interp *it, Env *env) {
+static void cleanup_forget(Interp *it, void *resource) {
     for (int i = it->cleanup_count - 1; i >= 0; i--) {
-        if (it->cleanup_stack[i].env == env) { cleanup_remove(it, i); return; }
+        if (it->cleanup_stack[i].resource == resource) { cleanup_remove(it, i); return; }
     }
+}
+
+static void dispose_env(void *resource) { env_free(resource); }
+static void cleanup_push(Interp *it, Env *env) { cleanup_register(it, env, dispose_env); }
+static void cleanup_pop(Interp *it, Env *env) { cleanup_forget(it, env); }
+static void dispose_values(void *resource) {
+    OwnedValues *owned = resource;
+    for (int i = 0; i < owned->count; i++) value_free(&owned->values[i]);
+    free(owned);
+}
+static OwnedValues *owned_values_new(Interp *it, int capacity) {
+    size_t bytes, total;
+    if (capacity < 0 || !checked_mul_size((size_t)capacity, sizeof(Value), &bytes) ||
+        !checked_add_size(bytes, sizeof(OwnedValues), &total)) exit(70);
+    OwnedValues *owned = myon_xmalloc(total);
+    owned->count = 0;
+    cleanup_register(it, owned, dispose_values);
+    return owned;
+}
+static void owned_values_release(Interp *it, OwnedValues *owned) {
+    if (!owned) return;
+    cleanup_forget(it, owned);
+    dispose_values(owned);
 }
 
 /* Sequence marks stay valid when other tasks remove interleaved frames. */
@@ -372,13 +402,19 @@ static void cleanup_unwind(Interp *it, uint64_t mark) {
         CleanupEntry entry = it->cleanup_stack[i];
         if (entry.owner != owner || entry.sequence <= mark) continue;
         cleanup_remove(it, i);
-        env_free(entry.env);
+        if (entry.resource == it->ret_owner) {
+            it->ret_owner = NULL; it->ret_values = NULL; it->ret_count = 0;
+        }
+        entry.dispose(entry.resource);
     }
 }
 
 /* At shutdown no task can resume; dispose frames belonging to every task. */
 static void cleanup_destroy(Interp *it) {
-    while (it->cleanup_count) env_free(it->cleanup_stack[--it->cleanup_count].env);
+    while (it->cleanup_count) {
+        CleanupEntry entry = it->cleanup_stack[--it->cleanup_count];
+        entry.dispose(entry.resource);
+    }
 }
 
 static void runtime_error(Interp *it, int line, const char *fmt, ...) {
@@ -399,6 +435,18 @@ static void runtime_error(Interp *it, int line, const char *fmt, ...) {
 static void runtime_error_owned(Interp *it, int line, char *message) {
     fprintf(stderr, "myon: runtime error at line %d: %s\n", line, message);
     free(message);
+    diag_print_snippet(line, 1);
+    longjmp(*interp_error_buf(it), 1);
+}
+
+static void runtime_error_free(Interp *it, int line, void *owned, const char *format, ...) {
+    va_list ap;
+    fprintf(stderr, "myon: runtime error at line %d: ", line);
+    va_start(ap, format);
+    vfprintf(stderr, format, ap);
+    va_end(ap);
+    free(owned);
+    fputc('\n', stderr);
     diag_print_snippet(line, 1);
     longjmp(*interp_error_buf(it), 1);
 }
@@ -686,8 +734,11 @@ static Value eval_binary(Interp *it, int line, OpKind op, Value l, Value r) {
             runtime_error(it, line, "unsupported operator on error");
             break;
         }
-        default:
-            runtime_error(it, line, "unsupported operand type %s", type_name(l.type));
+        default: {
+            Type type = l.type;
+            value_free(&l); value_free(&r);
+            runtime_error(it, line, "unsupported operand type %s", type_name(type));
+        }
     }
     return value_nil();
 }
@@ -696,70 +747,80 @@ static Value eval_binary(Interp *it, int line, OpKind op, Value l, Value r) {
 /* String interpolation (spec section 4, Step 10)                      */
 /* ------------------------------------------------------------------ */
 
-/* Evaluate a raw string body, expanding `{expr}` fragments.
- * `{{` and `}}` are literal braces. */
+typedef struct {
+    char *out, *source, *piece;
+    Program *program;
+    TokenList tokens;
+} StringEval;
+
+static void dispose_string_eval(void *resource) {
+    StringEval *ctx = resource;
+    free(ctx->out); free(ctx->source); free(ctx->piece);
+    program_free(ctx->program);
+    token_list_free(&ctx->tokens);
+    free(ctx);
+}
+static void string_reserve(Interp *it, int line, StringEval *ctx, size_t *cap,
+                           size_t length, size_t extra) {
+    size_t needed;
+    if (!checked_add_size(length, extra, &needed) || !checked_add_size(needed, 1, &needed))
+        runtime_error(it, line, "interpolated string is too large");
+    if (needed <= *cap) return;
+    size_t grown;
+    if (!checked_mul_size(*cap, 2, &grown) || grown < needed) grown = needed;
+    ctx->out = myon_xrealloc(ctx->out, grown);
+    *cap = grown;
+}
+
+/* The context owns partial lexing/parsing/output across nested runtime errors. */
 static Value interpolate_string(Interp *it, Env *env, int line, const char *raw) {
     size_t cap = strlen(raw) + 1, len = 0;
-    char *out = (char *)myon_xmalloc(cap);
-    out[0] = '\0';
-
+    StringEval *ctx = myon_xmalloc(sizeof(*ctx));
+    memset(ctx, 0, sizeof(*ctx));
+    cleanup_register(it, ctx, dispose_string_eval);
+    ctx->out = myon_xmalloc(cap);
+    ctx->out[0] = '\0';
     const char *s = raw;
     while (*s) {
         char escaped;
         if (myon_string_escape(&s, &escaped)) {
-            if (len + 1 >= cap) { cap *= 2; out = myon_xrealloc(out, cap); }
-            out[len++] = escaped; out[len] = '\0'; continue;
+            string_reserve(it, line, ctx, &cap, len, 1);
+            ctx->out[len++] = escaped; ctx->out[len] = '\0'; continue;
         }
-        if (s[0] == '{' && s[1] == '{') { /* literal { */
-            if (len + 1 >= cap) { cap *= 2; out = myon_xrealloc(out, cap); }
-            out[len++] = '{'; out[len] = '\0'; s += 2; continue;
-        }
-        if (s[0] == '}' && s[1] == '}') {
-            if (len + 1 >= cap) { cap *= 2; out = myon_xrealloc(out, cap); }
-            out[len++] = '}'; out[len] = '\0'; s += 2; continue;
+        if ((s[0] == '{' && s[1] == '{') || (s[0] == '}' && s[1] == '}')) {
+            string_reserve(it, line, ctx, &cap, len, 1);
+            ctx->out[len++] = s[0]; ctx->out[len] = '\0'; s += 2; continue;
         }
         if (s[0] == '{') {
-            /* find matching '}' */
             const char *end = strchr(s + 1, '}');
-            if (!end) {
-                free(out);
-                runtime_error(it, line, "unterminated '{' in string interpolation");
-            }
-            size_t exprlen = (size_t)(end - (s + 1));
-            char *exprsrc = myon_strndup(s + 1, exprlen);
-
-            /* lex + parse the sub-expression */
-            TokenList tl;
-            if (!lexer_tokenize(exprsrc, &tl)) {
-                free(exprsrc); free(out);
-                runtime_error(it, line, "lexical error in interpolation '{%s}'", "");
-            }
-            Program *sub = parser_parse(&tl);
-            free(exprsrc);
-            if (!sub || sub->stmts.count != 1 || sub->stmts.items[0]->kind != STMT_EXPR) {
-                if (sub) program_free(sub);
-                token_list_free(&tl);
-                free(out);
+            if (!end) runtime_error(it, line, "unterminated '{' in string interpolation");
+            ctx->source = myon_strndup(s + 1, (size_t)(end - s - 1));
+            if (!lexer_tokenize(ctx->source, &ctx->tokens))
+                runtime_error(it, line, "lexical error in interpolation");
+            ctx->program = parser_parse(&ctx->tokens);
+            if (!ctx->program || ctx->program->stmts.count != 1 ||
+                ctx->program->stmts.items[0]->kind != STMT_EXPR)
                 runtime_error(it, line, "invalid expression in string interpolation");
-            }
-            Value v = eval_expr(it, env, sub->stmts.items[0]->as.expr);
-            char *piece = value_to_cstr(&v);
+            Value v = eval_expr(it, env, ctx->program->stmts.items[0]->as.expr);
+            ctx->piece = value_to_cstr(&v);
             value_free(&v);
-            program_free(sub);
-            token_list_free(&tl);
-
-            size_t pl = strlen(piece);
-            while (len + pl + 1 >= cap) { cap *= 2; out = myon_xrealloc(out, cap); }
-            memcpy(out + len, piece, pl + 1);
-            len += pl;
-            free(piece);
+            size_t n = strlen(ctx->piece);
+            string_reserve(it, line, ctx, &cap, len, n);
+            memcpy(ctx->out + len, ctx->piece, n + 1); len += n;
+            free(ctx->piece); ctx->piece = NULL;
+            free(ctx->source); ctx->source = NULL;
+            program_free(ctx->program); ctx->program = NULL;
+            token_list_free(&ctx->tokens);
             s = end + 1;
             continue;
         }
-        if (len + 1 >= cap) { cap *= 2; out = myon_xrealloc(out, cap); }
-        out[len++] = *s++;
-        out[len] = '\0';
+        string_reserve(it, line, ctx, &cap, len, 1);
+        ctx->out[len++] = *s++; ctx->out[len] = '\0';
     }
+    char *out = ctx->out;
+    ctx->out = NULL;
+    cleanup_forget(it, ctx);
+    dispose_string_eval(ctx);
     return value_str(out);
 }
 
@@ -3175,8 +3236,9 @@ static Value call_method(Interp *it, Env *env, Expr *call, Value recv,
             if (a->elem_type && !typespec_matches_value(it, a->elem_type, &v)) {
                 char *want = typespec_to_cstr(a->elem_type);
                 const char *got = value_type_name(&v);
-                value_free(&v);
-                runtime_error(it, line,
+                OwnedValues *bad = owned_values_new(it, 1);
+                bad->values[bad->count++] = v;
+                runtime_error_free(it, line, want,
                     "type mismatch: cannot push %s into myon.array(%s)", got, want);
             }
             array_push(&recv, v);
@@ -3384,21 +3446,19 @@ static Value call_method(Interp *it, Env *env, Expr *call, Value recv,
             runtime_error(it, line, "struct '%s' has no method '%s'",
                           recv.as.obj->as.st.type_name, method);
 
-        /* evaluate arguments */
-        Value *args = argc ? (Value *)myon_xmalloc(sizeof(Value) * argc) : NULL;
-        for (int i = 0; i < argc; i++)
-            args[i] = eval_expr(it, env, call->as.call.args[i]);
-
-        /* bind a function value with self = recv */
+        OwnedValues *owned = owned_values_new(it, argc + 1);
+        owned->values[owned->count++] = value_nil();
+        for (int i = 0; i < argc; i++) {
+            owned->values[owned->count] = eval_expr(it, env, call->as.call.args[i]);
+            owned->count++;
+        }
         Value fnv = value_func(m, it->global);
+        owned->values[0] = fnv;
         fnv.as.obj->as.fn.is_bound = 1;
-        fnv.as.obj->as.fn.bound_self = (Value *)myon_xmalloc(sizeof(Value));
+        fnv.as.obj->as.fn.bound_self = myon_xmalloc(sizeof(Value));
         *fnv.as.obj->as.fn.bound_self = value_copy(&recv);
-
-        Value r = call_function(it, line, fnv, args, argc, NULL);
-        value_free(&fnv);
-        for (int i = 0; i < argc; i++) value_free(&args[i]);
-        free(args);
+        Value r = call_function(it, line, fnv, owned->values + 1, argc, NULL);
+        owned_values_release(it, owned);
         return r;
     }
 
@@ -3424,6 +3484,8 @@ static Value construct_struct(Interp *it, Env *env, Expr *call, StructDecl *sd,
                               TypeSpec **type_args, int type_arg_count) {
     int line = call->line;
     Value sv = value_struct(sd->name, sd);
+    OwnedValues *owned = owned_values_new(it, 1);
+    owned->values[owned->count++] = sv;
 
     /* record generic bindings on the instance (Step 15) */
     if (type_arg_count > 0) {
@@ -3445,6 +3507,7 @@ static Value construct_struct(Interp *it, Env *env, Expr *call, StructDecl *sd,
     StructField *fields = NULL;
     int fcount = 0;
     collect_fields(sd, &fields, &fcount);
+    if (fields) cleanup_register(it, fields, free);
 
     /* initialise every field, matching named arguments */
     for (int i = 0; i < fcount; i++) {
@@ -3459,14 +3522,14 @@ static Value construct_struct(Interp *it, Env *env, Expr *call, StructDecl *sd,
             }
         }
         if (!found) {
-            free(fields);
-            value_free(&sv);
             runtime_error(it, line, "missing field '%s' in %s(...) construction",
                           fields[i].name, sd->name);
         }
         struct_add_field(&sv, fields[i].name, fv);
     }
-    free(fields);
+    if (fields) { cleanup_forget(it, fields); free(fields); }
+    owned->count = 0;
+    owned_values_release(it, owned);
     return sv;
 }
 
@@ -3563,7 +3626,7 @@ static Value call_function(Interp *it, int line, Value fn, Value *args, int argc
             const char *got = value_type_name(&args[i]);
             cleanup_pop(it, call_env);   /* remove before freeing, avoids double-free at unwind */
             env_free(call_env);
-            runtime_error(it, line,
+            runtime_error_free(it, line, want,
                 "argument %d of '%s' expects %s, got %s",
                 i + 1, fd->name ? fd->name : "<lambda>", want, got);
         }
@@ -3572,8 +3635,10 @@ static Value call_function(Interp *it, int line, Value fn, Value *args, int argc
 
     /* run body */
     Value *saved_ret = it->ret_values;
+    OwnedValues *saved_owner = it->ret_owner;
     int    saved_cnt = it->ret_count;
     it->ret_values = NULL;
+    it->ret_owner = NULL;
     it->ret_count = 0;
 
     Flow f = exec_block(it, call_env, fd->body);
@@ -3584,21 +3649,25 @@ static Value call_function(Interp *it, int line, Value fn, Value *args, int argc
             result = value_void();
         } else if (it->ret_count == 1) {
             result = it->ret_values[0];
+            it->ret_values[0] = value_nil();
         } else {
             /* multiple returns -> pack into an array-like tuple.
              * We represent the tuple with a special array so multi-assignment
              * can unpack it. */
             Value tup = value_array(NULL);
-            for (int i = 0; i < it->ret_count; i++)
+            for (int i = 0; i < it->ret_count; i++) {
                 array_push(&tup, it->ret_values[i]);
+                it->ret_values[i] = value_nil();
+            }
             result = tup;
         }
-        free(it->ret_values);
+        owned_values_release(it, it->ret_owner);
     } else {
         result = value_void();
     }
 
     it->ret_values = saved_ret;
+    it->ret_owner = saved_owner;
     it->ret_count = saved_cnt;
 
     cleanup_pop(it, call_env);   /* normal exit: unregister before freeing */
@@ -4554,6 +4623,23 @@ long long myon_ffi_callback_dispatch(int slot, int argc, const long long *args) 
 /* Expression evaluation                                               */
 /* ------------------------------------------------------------------ */
 
+static Value invoke_owned_function(Interp *it, Env *env, Expr *call, Value fn) {
+    int argc = call->as.call.arg_count;
+    OwnedValues *owned = owned_values_new(it, argc + 1);
+    owned->values[owned->count++] = fn;
+    for (int i = 0; i < argc; i++) {
+        owned->values[owned->count] = eval_expr(it, env, call->as.call.args[i]);
+        owned->count++;
+    }
+    Value out;
+    if (fn.as.obj->as.fn.decl && fn.as.obj->as.fn.decl->is_async)
+        out = spawn_async_task(it, fn, owned->values + 1, argc);
+    else
+        out = call_function(it, call->line, fn, owned->values + 1, argc, call->as.call.arg_names);
+    owned_values_release(it, owned);
+    return out;
+}
+
 static Value eval_call(Interp *it, Env *env, Expr *e) {
     Expr *callee = e->as.call.callee;
     int line = e->line;
@@ -4613,19 +4699,7 @@ static Value eval_call(Interp *it, Env *env, Expr *e) {
                         "module member '%s.%s' is not callable",
                         base, callee->as.member.name);
                 }
-                int argc = e->as.call.arg_count;
-                Value *args = argc ? (Value *)myon_xmalloc(sizeof(Value) * argc) : NULL;
-                for (int i = 0; i < argc; i++)
-                    args[i] = eval_expr(it, env, e->as.call.args[i]);
-                Value r;
-                if (fn.as.obj->as.fn.decl && fn.as.obj->as.fn.decl->is_async)
-                    r = spawn_async_task(it, fn, args, argc);
-                else
-                    r = call_function(it, line, fn, args, argc, e->as.call.arg_names);
-                for (int i = 0; i < argc; i++) value_free(&args[i]);
-                free(args);
-                value_free(&fn);
-                return r;
+                return invoke_owned_function(it, env, e, fn);
             }
         } else {
             value_free(&dummy);
@@ -4634,32 +4708,18 @@ static Value eval_call(Interp *it, Env *env, Expr *e) {
 
     /* method call: obj.method(args) */
     if (callee->kind == EXPR_MEMBER) {
-        Value recv = eval_expr(it, env, callee->as.member.target);
-        Value r = call_method(it, env, e, recv, callee->as.member.name);
-        value_free(&recv);
+        OwnedValues *owned = owned_values_new(it, 1);
+        owned->values[0] = eval_expr(it, env, callee->as.member.target);
+        owned->count = 1;
+        Value r = call_method(it, env, e, owned->values[0], callee->as.member.name);
+        owned_values_release(it, owned);
         return r;
     }
 
     /* first-class function value (variable holding a func / lambda) */
     Value fn = eval_expr(it, env, callee);
-    if (fn.type == TYPE_FUNC) {
-        int argc = e->as.call.arg_count;
-        Value *args = argc ? (Value *)myon_xmalloc(sizeof(Value) * argc) : NULL;
-        for (int i = 0; i < argc; i++)
-            args[i] = eval_expr(it, env, e->as.call.args[i]);
-        /* Phase5: `myon.async myon.func` values do not run inline — spawn a
-         * coroutine task and hand back a TYPE_TASK handle immediately. */
-        Value r;
-        if (fn.as.obj->as.fn.decl && fn.as.obj->as.fn.decl->is_async) {
-            r = spawn_async_task(it, fn, args, argc);
-        } else {
-            r = call_function(it, line, fn, args, argc, e->as.call.arg_names);
-        }
-        for (int i = 0; i < argc; i++) value_free(&args[i]);
-        free(args);
-        value_free(&fn);
-        return r;
-    }
+    if (fn.type == TYPE_FUNC) return invoke_owned_function(it, env, e, fn);
+
     value_free(&fn);
     runtime_error(it, line, "call of unsupported callee");
     return value_nil();
@@ -4761,8 +4821,14 @@ static Value eval_expr(Interp *it, Env *env, Expr *e) {
         }
 
         case EXPR_BINARY: {
-            Value l = eval_expr(it, env, e->as.binary.left);
-            Value r = eval_expr(it, env, e->as.binary.right);
+            OwnedValues *owned = owned_values_new(it, 2);
+            owned->values[0] = eval_expr(it, env, e->as.binary.left);
+            owned->count = 1;
+            owned->values[1] = eval_expr(it, env, e->as.binary.right);
+            owned->count = 2;
+            Value l = owned->values[0], r = owned->values[1];
+            owned->count = 0; /* eval_binary consumes both values */
+            owned_values_release(it, owned);
             return eval_binary(it, e->line, e->as.binary.op, l, r);
         }
 
@@ -4961,15 +5027,15 @@ static void assign_or_define(Interp *it, Env *env, int line,
 
 static Flow do_multi_assign(Interp *it, Env *env, Stmt *s, Value v) {
     /* v must be a tuple (array with NULL elem_type) from a multi-return */
+    OwnedValues *owned = owned_values_new(it, 1);
+    owned->values[owned->count++] = v;
     int total = 1 + s->as.assign.extra_count;
     if (v.type != TYPE_ARRAY || v.as.obj->as.arr.elem_type != NULL) {
-        value_free(&v);
         runtime_error(it, s->line,
             "multiple-target assignment requires a multi-value return (spec 6.2)");
     }
     ArrayData *a = &v.as.obj->as.arr;
     if (a->count != total) {
-        value_free(&v);
         runtime_error(it, s->line,
             "assignment target count (%d) does not match return count (%d)",
             total, a->count);
@@ -4983,7 +5049,7 @@ static Flow do_multi_assign(Interp *it, Env *env, Stmt *s, Value v) {
          * rejecting illegal shadowing inside `{ }` blocks. */
         assign_or_define(it, env, s->line, nm, elem);
     }
-    value_free(&v);
+    owned_values_release(it, owned);
     return FLOW_NORMAL;
 }
 
@@ -5021,10 +5087,14 @@ static Flow exec_stmt(Interp *it, Env *env, Stmt *s) {
 
         case STMT_RETURN: {
             int n = s->as.ret.count;
-            it->ret_values = n ? (Value *)myon_xmalloc(sizeof(Value) * n) : NULL;
+            OwnedValues *owned = owned_values_new(it, n);
+            for (int i = 0; i < n; i++) {
+                owned->values[i] = eval_expr(it, env, s->as.ret.values[i]);
+                owned->count++;
+            }
+            it->ret_values = owned->values;
+            it->ret_owner = owned;
             it->ret_count = n;
-            for (int i = 0; i < n; i++)
-                it->ret_values[i] = eval_expr(it, env, s->as.ret.values[i]);
             return FLOW_RETURN;
         }
 
@@ -5072,8 +5142,9 @@ static Flow exec_stmt(Interp *it, Env *env, Stmt *s) {
                 !typespec_matches_value(it, s->as.assign.annotated, &v)) {
                 char *want = typespec_to_cstr(s->as.assign.annotated);
                 const char *got = value_type_name(&v);
-                value_free(&v);
-                runtime_error(it, s->line,
+                OwnedValues *bad = owned_values_new(it, 1);
+                bad->values[bad->count++] = v;
+                runtime_error_free(it, s->line, want,
                     "type annotation mismatch: '%s' declared %s but value is %s",
                     s->as.assign.name, want, got);
             }
@@ -5104,7 +5175,9 @@ static Flow exec_stmt(Interp *it, Env *env, Stmt *s) {
             int taken = c.as.b;
             if (taken) {
                 Env *sc = env_new(env);
+                cleanup_push(it, sc);
                 Flow f = exec_block(it, sc, &s->as.if_stmt.then_body);
+                cleanup_pop(it, sc);
                 env_free(sc);
                 return f;
             }
@@ -5116,14 +5189,18 @@ static Flow exec_stmt(Interp *it, Env *env, Stmt *s) {
                 }
                 if (ec.as.b) {
                     Env *sc = env_new(env);
+                    cleanup_push(it, sc);
                     Flow f = exec_block(it, sc, &s->as.if_stmt.elifs[i].body);
+                    cleanup_pop(it, sc);
                     env_free(sc);
                     return f;
                 }
             }
             if (s->as.if_stmt.has_else) {
                 Env *sc = env_new(env);
+                cleanup_push(it, sc);
                 Flow f = exec_block(it, sc, &s->as.if_stmt.else_body);
+                cleanup_pop(it, sc);
                 env_free(sc);
                 return f;
             }
@@ -5139,7 +5216,9 @@ static Flow exec_stmt(Interp *it, Env *env, Stmt *s) {
                 }
                 if (!c.as.b) break;
                 Env *sc = env_new(env);
+                cleanup_push(it, sc);
                 Flow f = exec_block(it, sc, &s->as.while_stmt.body);
+                cleanup_pop(it, sc);
                 env_free(sc);
                 if (f == FLOW_BREAK) break;
                 if (f == FLOW_RETURN) return f;
@@ -5160,8 +5239,10 @@ static Flow exec_stmt(Interp *it, Env *env, Stmt *s) {
                 long long lo = start.as.i, hi = end.as.i;
                 for (long long i = lo; i < hi; i++) {
                     Env *loop = env_new(env);
+                    cleanup_push(it, loop);
                     env_define(loop, s->as.for_stmt.var, value_int(i));
                     Flow f = exec_block(it, loop, &s->as.for_stmt.body);
+                    cleanup_pop(it, loop);
                     env_free(loop);
                     if (f == FLOW_BREAK) break;
                     if (f == FLOW_RETURN) return f;
@@ -5169,21 +5250,25 @@ static Flow exec_stmt(Interp *it, Env *env, Stmt *s) {
                 return FLOW_NORMAL;
             }
             /* for-in over an array (spec 5.2 / 7) */
+            OwnedValues *owned = owned_values_new(it, 1);
             Value iter = eval_expr(it, env, s->as.for_stmt.iterable);
+            owned->values[owned->count++] = iter;
             if (iter.type != TYPE_ARRAY) {
-                Type t = iter.type; value_free(&iter);
+                Type t = iter.type;
                 runtime_error(it, s->line, "myon.for ... myon.in requires an array, got %s", type_name(t));
             }
             ArrayData *a = &iter.as.obj->as.arr;
             for (int i = 0; i < a->count; i++) {
                 Env *loop = env_new(env);
+                cleanup_push(it, loop);
                 env_define(loop, s->as.for_stmt.var, value_copy(&a->items[i]));
                 Flow f = exec_block(it, loop, &s->as.for_stmt.body);
+                cleanup_pop(it, loop);
                 env_free(loop);
                 if (f == FLOW_BREAK) break;
-                if (f == FLOW_RETURN) { value_free(&iter); return f; }
+                if (f == FLOW_RETURN) { owned_values_release(it, owned); return f; }
             }
-            value_free(&iter);
+            owned_values_release(it, owned);
             return FLOW_NORMAL;
         }
 
@@ -5192,8 +5277,10 @@ static Flow exec_stmt(Interp *it, Env *env, Stmt *s) {
 
         case STMT_BLOCK: {
             Env *scope = env_new(env);
+            cleanup_push(it, scope);
             scope->is_block = 1;
             Flow f = exec_block(it, scope, &s->as.block);
+            cleanup_pop(it, scope);
             env_free(scope);
             return f;
         }
@@ -5341,6 +5428,11 @@ static void exec_module_file(Interp *it, Stmt *decl, ModuleEntry *m,
     Program *mp = parser_parse(&tl);
     if (!mp) { token_list_free(&tl); free(src); runtime_error(it, decl->line, "parse error in module '%s'", path); }
 
+    /* Retain before executing: recursive imports and module bodies can fail. */
+    interp_retain_program(it, mp);
+    token_list_free(&tl);
+    free(src);
+
     /* Execute module top-level into the target scope.  Aliased modules use
      * their own namespace env (`m.<name>` access); unaliased ones flatten into
      * global (historical simple namespace model). */
@@ -5349,13 +5441,6 @@ static void exec_module_file(Interp *it, Stmt *decl, ModuleEntry *m,
     for (int i = 0; i < mp->stmts.count; i++)
         if (mp->stmts.items[i]->kind != STMT_MODULE)
             exec_stmt(it, target, mp->stmts.items[i]);
-
-    /* Retain the module AST for the interpreter's lifetime: function/struct
-     * values captured above reference its nodes, so it must outlive the run and
-     * be freed exactly once at interp_free() rather than leaked. */
-    interp_retain_program(it, mp);
-    token_list_free(&tl);
-    free(src);
 
     m->loading = 0;
 }
@@ -5435,7 +5520,9 @@ static int load_external_module(Interp *it, Stmt *decl) {
     if (!file)
         runtime_error(it, decl->line, "out of memory resolving module path: '%s'", path);
 
+    cleanup_register(it, file, free);
     exec_module_file(it, decl, m, file);
+    cleanup_forget(it, file);
     free(file);
     return 1;
 }
@@ -5498,7 +5585,7 @@ static int load_package_module(Interp *it, Stmt *decl) {
     char *root = pkg_fs_find_project_root_from(it->script_dir, &root_err);
     if (!root) {
         char *msg = root_err ? root_err : myon_strdup("no project root");
-        runtime_error(it, decl->line,
+        runtime_error_free(it, decl->line, msg,
                       "cannot import package module '%s': %s "
                       "(run `myon pkg install` in your project first)", path, msg);
     }
@@ -5605,7 +5692,9 @@ static int load_package_module(Interp *it, Stmt *decl) {
     m->next = it->modules;
     it->modules = m;
 
+    cleanup_register(it, file, free);
     exec_module_file(it, decl, m, file);
+    cleanup_forget(it, file);
     free(file);
     return 1;
 }
@@ -5767,8 +5856,8 @@ static int run_toplevel(Interp *it, Program *program) {
         }
         if (f == FLOW_RETURN) {
             /* top-level ret: ignore returned values */
-            for (int k = 0; k < it->ret_count; k++) value_free(&it->ret_values[k]);
-            free(it->ret_values);
+            owned_values_release(it, it->ret_owner);
+            it->ret_owner = NULL;
             it->ret_values = NULL; it->ret_count = 0;
         }
     }
@@ -5947,7 +6036,10 @@ void myon_bridge_call_method(Interp *it, Value recv, const char *method,
     it->bridge_argc = argc;
 
     /* call_method borrows recv (does not free it); it reads args via eval_arg. */
+    OwnedValues *owned = owned_values_new(it, 1);
+    owned->values[owned->count++] = recv;
     *out = call_method(it, NULL, &call, recv, method);
+    owned_values_release(it, owned);
 
     it->bridge_args = saved_args;
     it->bridge_argc = saved_argc;

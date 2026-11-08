@@ -143,7 +143,7 @@ int myon_bridge_call_native(Interp *it, const char *name,
 
 /*
  * Call a container method (array/map/str builtin methods such as push, len,
- * keys, ...) on receiver `recv` (borrowed; not freed here) with argc already-
+ * keys, ...) on receiver `recv` (consumed on success or error) with argc already-
  * evaluated Values in `args` (borrowed).  Stores the result in *out.  A
  * runtime error longjmps to the error buffer.
  */
