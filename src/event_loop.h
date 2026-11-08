@@ -66,8 +66,12 @@ Task *event_loop_spawn(EventLoop *loop, void (*entry)(void *ud), void *ud);
 /* Handles own only metadata/results, independently of coroutine stacks. */
 /* Per-coroutine runtime nesting counter; survives suspension. */
 int *event_loop_task_call_depth(Task *task);
+/* Opaque jmp_buf storage for a task-local interpreter error barrier. */
+void *event_loop_task_error_buf(Task *task);
 void event_loop_task_ref(Task *task);
 void event_loop_task_unref(Task *task);
+/* Dispose spawn userdata once, on completion or loop destruction, on the core stack. */
+void event_loop_task_set_cleanup(Task *task, void (*cleanup)(void *));
 void event_loop_set_result_cleanup(EventLoop *loop, void (*cleanup)(void *));
 
 /* From the running task: suspend until `fd` is readable/writable.  Returns

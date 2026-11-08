@@ -245,6 +245,12 @@ typedef struct ModuleEntry {
     struct ModuleEntry *next;
 } ModuleEntry;
 
+typedef struct {
+    Env *env;
+    Task *owner;
+    uint64_t sequence;
+} CleanupEntry;
+
 struct Interp {
     Env         *global;
     StructReg    structs;
@@ -275,22 +281,10 @@ struct Interp {
      * the deep frames never run their decrement, so interp_run/interpret reset
      * this to 0 after catching an error (see those functions). */
     int          call_depth;
-    /*
-     * Known-issue #1 fix: registration-based cleanup for call frames.
-     *
-     * A runtime_error() longjmps straight back to the nearest setjmp barrier,
-     * skipping the env_free(call_env) at the bottom of every intermediate
-     * call_function() frame.  Those per-frame `call_env` scopes (and the Values
-     * bound into them) used to leak until process exit.
-     *
-     * cleanup_stack is a LIFO of the still-live `call_env` scopes, pushed on
-     * entry to call_function() and popped on its normal exit.  Each setjmp
-     * barrier records the stack depth it was entered at (like it->call_depth)
-     * and, on catching an error, unwinds the stack back down to that mark,
-     * env_free()-ing every frame the longjmp jumped over.  This is a localised
-     * fix that does not touch the interpreter's wider ownership model.
-     */
-    Env        **cleanup_stack;
+    /* Live call scopes carry task ownership and monotonic error-barrier marks.
+     * Errors unwind only their own coroutine; shutdown disposes all scopes. */
+    CleanupEntry *cleanup_stack;
+    uint64_t     cleanup_sequence;
     int          cleanup_count;
     int          cleanup_cap;
     /*
@@ -332,57 +326,56 @@ typedef struct Interp Interp;
 static ModuleEntry *find_module_by_alias(Interp *it, const char *alias);
 
 /* ------------------------------------------------------------------ */
-/* Known-issue #1: longjmp-safe cleanup stack for call frames.         */
-/* ------------------------------------------------------------------ */
-/*
- * call_function() registers its per-call `call_env` here on entry and
- * unregisters it on its normal (return/void) exit.  A runtime_error()
- * longjmps past those normal exits, so each setjmp barrier records the
- * stack depth it was entered at with cleanup_mark() and, on catching an
- * error, calls cleanup_unwind() to env_free() every frame the jump skipped.
- * Without this, those intermediate `call_env` scopes leaked until the
- * process exited (valgrind "definitely/indirectly lost").
- */
+/* Error barriers and call-scope cleanup must follow the currently running
+ * coroutine, because independent tasks interleave on the same interpreter. */
+static Task *interp_current_task(Interp *it) {
+    return it->loop ? event_loop_current(it->loop) : NULL;
+}
+
+static jmp_buf *interp_error_buf(Interp *it) {
+    Task *task = interp_current_task(it);
+    return task ? (jmp_buf *)event_loop_task_error_buf(task) : &it->on_error;
+}
+
 static void cleanup_push(Interp *it, Env *env) {
     if (it->cleanup_count == it->cleanup_cap) {
         int ncap = it->cleanup_cap ? it->cleanup_cap * 2 : 16;
-        it->cleanup_stack =
-            (Env **)myon_xrealloc(it->cleanup_stack, (size_t)ncap * sizeof(Env *));
+        it->cleanup_stack = myon_xrealloc(it->cleanup_stack,
+                                         (size_t)ncap * sizeof(CleanupEntry));
         it->cleanup_cap = ncap;
     }
-    it->cleanup_stack[it->cleanup_count++] = env;
+    CleanupEntry entry = {env, interp_current_task(it), ++it->cleanup_sequence};
+    it->cleanup_stack[it->cleanup_count++] = entry;
 }
 
-/* Pop the most recently pushed frame after a *successful* env_free by the
- * caller.  `env` is the value the caller expects on top, asserted for safety
- * (the stack is strictly LIFO because calls nest). */
+static void cleanup_remove(Interp *it, int index) {
+    memmove(&it->cleanup_stack[index], &it->cleanup_stack[index + 1],
+            (size_t)(it->cleanup_count - index - 1) * sizeof(CleanupEntry));
+    it->cleanup_count--;
+}
+
 static void cleanup_pop(Interp *it, Env *env) {
-    if (it->cleanup_count > 0 && it->cleanup_stack[it->cleanup_count - 1] == env)
-        it->cleanup_count--;
-    else {
-        /* Defensive: locate and remove `env` even if something unexpected sits
-         * on top.  Should not happen given strict nesting, but never underflow. */
-        for (int i = it->cleanup_count - 1; i >= 0; i--) {
-            if (it->cleanup_stack[i] == env) {
-                for (int j = i; j < it->cleanup_count - 1; j++)
-                    it->cleanup_stack[j] = it->cleanup_stack[j + 1];
-                it->cleanup_count--;
-                break;
-            }
-        }
+    for (int i = it->cleanup_count - 1; i >= 0; i--) {
+        if (it->cleanup_stack[i].env == env) { cleanup_remove(it, i); return; }
     }
 }
 
-/* Snapshot the current stack depth before installing a setjmp barrier. */
-static int cleanup_mark(Interp *it) { return it->cleanup_count; }
+/* Sequence marks stay valid when other tasks remove interleaved frames. */
+static uint64_t cleanup_mark(Interp *it) { return it->cleanup_sequence; }
 
-/* After a longjmp is caught, free every call_env registered above `mark`
- * (the frames the jump unwound past without running their own env_free). */
-static void cleanup_unwind(Interp *it, int mark) {
-    while (it->cleanup_count > mark) {
-        Env *e = it->cleanup_stack[--it->cleanup_count];
-        if (e) env_free(e);
+static void cleanup_unwind(Interp *it, uint64_t mark) {
+    Task *owner = interp_current_task(it);
+    for (int i = it->cleanup_count - 1; i >= 0; i--) {
+        CleanupEntry entry = it->cleanup_stack[i];
+        if (entry.owner != owner || entry.sequence <= mark) continue;
+        cleanup_remove(it, i);
+        env_free(entry.env);
     }
+}
+
+/* At shutdown no task can resume; dispose frames belonging to every task. */
+static void cleanup_destroy(Interp *it) {
+    while (it->cleanup_count) env_free(it->cleanup_stack[--it->cleanup_count].env);
 }
 
 static void runtime_error(Interp *it, int line, const char *fmt, ...) {
@@ -396,7 +389,15 @@ static void runtime_error(Interp *it, int line, const char *fmt, ...) {
      * line (not the column) for a running expression, so the caret points at
      * the start of the line as a best-effort locator. */
     diag_print_snippet(line, 1);
-    longjmp(it->on_error, 1);
+    longjmp(*interp_error_buf(it), 1);
+}
+
+/* Error messages copied from values must be freed before the nonlocal jump. */
+static void runtime_error_owned(Interp *it, int line, char *message) {
+    fprintf(stderr, "myon: runtime error at line %d: %s\n", line, message);
+    free(message);
+    diag_print_snippet(line, 1);
+    longjmp(*interp_error_buf(it), 1);
 }
 
 static Value eval_expr(Interp *it, Env *env, Expr *e);
@@ -3619,6 +3620,15 @@ typedef struct {
     Task   *task;    /* set after spawn so the entry can record result */
 } AsyncCtx;
 
+static void async_task_cleanup(void *ud) {
+    AsyncCtx *ctx = ud;
+    value_free(&ctx->fn);
+    for (int i = 0; i < ctx->argc; i++) value_free(&ctx->args[i]);
+    free(ctx->args);
+    if (ctx->result) { value_free(ctx->result); free(ctx->result); }
+    free(ctx);
+}
+
 /* Entry point run on the task's own C stack. */
 static void async_task_entry(void *ud) {
     AsyncCtx *ctx = (AsyncCtx *)ud;
@@ -3628,9 +3638,11 @@ static void async_task_entry(void *ud) {
      * longjmp across the coroutine boundary.  On error we finish the task with
      * has_error=1 and store the error value so await can re-raise it. */
     jmp_buf saved;
-    memcpy(&saved, &it->on_error, sizeof(jmp_buf));
+    memcpy(&saved, interp_error_buf(it), sizeof(jmp_buf));
 
     Value *res = (Value *)myon_xmalloc(sizeof(Value));
+    *res = value_nil();
+    ctx->result = res;
     int has_error = 0;
 
     /* Phase5.2: the coroutine runs on its own fresh C stack, so its recursion
@@ -3641,9 +3653,9 @@ static void async_task_entry(void *ud) {
     it->call_depth = 0;
     /* Known-issue #1: mark the cleanup stack so an error inside the body frees
      * the call frames it longjmps over (see cleanup_unwind). */
-    int cleanup_at = cleanup_mark(it);
+    uint64_t cleanup_at = cleanup_mark(it);
 
-    if (setjmp(it->on_error) == 0) {
+    if (setjmp(*interp_error_buf(it)) == 0) {
         *res = call_function(it, 0, ctx->fn, ctx->args, ctx->argc, NULL);
     } else {
         /* body raised: free the frames the longjmp skipped, then represent the
@@ -3654,16 +3666,10 @@ static void async_task_entry(void *ud) {
     }
 
     it->call_depth = saved_depth;
-    memcpy(&it->on_error, &saved, sizeof(jmp_buf));
+    memcpy(interp_error_buf(it), &saved, sizeof(jmp_buf));
 
-    /* release the captured fn/args now that the body has finished */
-    value_free(&ctx->fn);
-    for (int i = 0; i < ctx->argc; i++) value_free(&ctx->args[i]);
-    free(ctx->args);
-
-    ctx->result = res;
     event_loop_task_set_result(ctx->task, res, has_error);
-    free(ctx);
+    ctx->result = NULL; /* the task now owns the result */
 }
 
 /* Spawn an async task for `fn(args...)` and return a TYPE_TASK value. */
@@ -3680,6 +3686,7 @@ static Value spawn_async_task(Interp *it, Value fn, Value *args, int argc) {
     ctx->task = NULL;
 
     Task *task = event_loop_spawn(loop, async_task_entry, ctx);
+    event_loop_task_set_cleanup(task, async_task_cleanup);
     ctx->task = task;
     return value_task(task);
 }
@@ -3717,11 +3724,12 @@ static Value await_task(Interp *it, int line, Value taskv) {
         out = value_void();
     }
 
+    value_free(&taskv); /* await consumes its evaluated task handle */
     if (has_error) {
         char *msg = out.type == TYPE_ERROR ? myon_strdup(out.as.obj->as.str)
                                            : myon_strdup("async task failed");
         value_free(&out);
-        runtime_error(it, line, "%s", msg);
+        runtime_error_owned(it, line, msg);
     }
     return out;
 }
@@ -3895,12 +3903,19 @@ typedef struct {
     Task    *task;
 } HttpConnCtx;
 
+static void http_conn_cleanup(void *ud) {
+    HttpConnCtx *c = ud;
+    net_close(c->st, c->conn_id);
+    value_free(&c->handler);
+    free(c);
+}
+
 static void http_conn_task_entry(void *ud) {
     HttpConnCtx *c = (HttpConnCtx *)ud;
     Interp *it = c->it;
 
     jmp_buf saved;
-    memcpy(&saved, &it->on_error, sizeof(jmp_buf));
+    memcpy(&saved, interp_error_buf(it), sizeof(jmp_buf));
 
     HttpRequest req;
     if (http_read_request(it, c->st, c->conn_id, &req) == 0) {
@@ -3921,8 +3936,8 @@ static void http_conn_task_entry(void *ud) {
         int saved_depth = it->call_depth;
         it->call_depth = 0;
         /* Known-issue #1: free any call frames a handler error longjmps over. */
-        int cleanup_at = cleanup_mark(it);
-        if (setjmp(it->on_error) == 0) {
+        uint64_t cleanup_at = cleanup_mark(it);
+        if (setjmp(*interp_error_buf(it)) == 0) {
             Value args[3];
             args[0] = value_str(myon_strdup(req.method));
             args[1] = value_str(myon_strdup(req.path));
@@ -3978,14 +3993,9 @@ static void http_conn_task_entry(void *ud) {
         http_request_free(&req);
     }
 
-    memcpy(&it->on_error, &saved, sizeof(jmp_buf));
+    memcpy(interp_error_buf(it), &saved, sizeof(jmp_buf));
 
-    net_close(c->st, c->conn_id);
-    value_free(&c->handler);
-
-    /* mark this task done (no meaningful result) */
     event_loop_task_set_result(c->task, NULL, 0);
-    free(c);
 }
 
 /* --- context/entry for the accept loop, run as its own coroutine --- */
@@ -3998,6 +4008,14 @@ typedef struct {
     char    *root_dir;   /* owned copy (for serve_static)               */
     Task    *task;
 } HttpServerCtx;
+
+static void http_server_cleanup(void *ud) {
+    HttpServerCtx *sc = ud;
+    net_close(sc->st, sc->lsock);
+    value_free(&sc->handler);
+    free(sc->root_dir);
+    free(sc);
+}
 
 /* The accept loop itself.  Runs as a coroutine so it cooperatively yields to
  * the event loop (and to per-connection handler tasks) between accepts. */
@@ -4020,6 +4038,7 @@ static void http_accept_loop_entry(void *ud) {
             c->handler = value_copy(&sc->handler);
             c->task = NULL;
             Task *t = event_loop_spawn(ensure_loop(it), http_conn_task_entry, c);
+            event_loop_task_set_cleanup(t, http_conn_cleanup);
             c->task = t;
         } else {
             /* static file serving is quick; handle inline on this coroutine */
@@ -4027,11 +4046,7 @@ static void http_accept_loop_entry(void *ud) {
         }
     }
 
-    net_close(st, sc->lsock);
-    value_free(&sc->handler);
-    free(sc->root_dir);
     event_loop_task_set_result(sc->task, NULL, 0);
-    free(sc);
 }
 
 /* Set up the listening socket then run the accept loop as a coroutine.
@@ -4071,6 +4086,7 @@ static Value http_run_server(Interp *it, int line, int port,
     sc->task = NULL;
     Task *server_task = event_loop_spawn(ensure_loop(it),
                                          http_accept_loop_entry, sc);
+    event_loop_task_set_cleanup(server_task, http_server_cleanup);
     sc->task = server_task;
 
     if (event_loop_current(it->loop)) {
@@ -4490,7 +4506,7 @@ long long myon_ffi_callback_dispatch(int slot, int argc, const long long *args) 
     /* Install a temporary error barrier so a runtime_error in the callback
      * body does not longjmp across the foreign C frame. */
     jmp_buf saved;
-    memcpy(&saved, &it->on_error, sizeof(jmp_buf));
+    memcpy(&saved, interp_error_buf(it), sizeof(jmp_buf));
 
     /* Phase5.2: the callback fires synchronously from within a foreign C frame
      * that is itself nested under our own call stack, so depth keeps
@@ -4499,10 +4515,10 @@ long long myon_ffi_callback_dispatch(int slot, int argc, const long long *args) 
      * restore it on the way out to keep the counter balanced. */
     int saved_depth = it->call_depth;
     /* Known-issue #1: free the call frames a callback-body error longjmps over. */
-    int cleanup_at = cleanup_mark(it);
+    uint64_t cleanup_at = cleanup_mark(it);
 
     long long ret = 0;
-    if (setjmp(it->on_error) == 0) {
+    if (setjmp(*interp_error_buf(it)) == 0) {
         Value r = call_function(it, 0, cb->fn, argv, argc, NULL);
         if (r.type == TYPE_INT)       ret = r.as.i;
         else if (r.type == TYPE_BOOL) ret = r.as.b;
@@ -4518,7 +4534,7 @@ long long myon_ffi_callback_dispatch(int slot, int argc, const long long *args) 
 
     it->call_depth = saved_depth;
     /* restore the outer barrier */
-    memcpy(&it->on_error, &saved, sizeof(jmp_buf));
+    memcpy(interp_error_buf(it), &saved, sizeof(jmp_buf));
 
     for (int i = 0; i < argc; i++) value_free(&argv[i]);
     return ret;
@@ -4688,9 +4704,7 @@ static Value eval_expr(Interp *it, Env *env, Expr *e) {
              * pre-Phase5 code still works. */
             Value v = eval_expr(it, env, e->as.operand);
             if (v.type == TYPE_TASK) {
-                Value r = await_task(it, e->line, v);
-                value_free(&v);
-                return r;
+                return await_task(it, e->line, v);
             }
             return v;
         }
@@ -5691,8 +5705,9 @@ Interp *interp_create(void) {
 void interp_free(Interp *it) {
     if (!it) return;
     ffi_callback_reset_all(); /* drop any live FFI callback slots (Phase4.1) */
-    if (it->net) net_state_destroy(it->net);
     if (it->loop) event_loop_destroy(it->loop);
+    cleanup_destroy(it);
+    if (it->net) net_state_destroy(it->net);
     env_free(it->global);
     free(it->structs.items);
     if (it->ffi) ffi_state_free(it->ffi);
@@ -5708,9 +5723,7 @@ void interp_free(Interp *it) {
     for (int i = 0; i < it->program_count; i++)
         program_free(it->programs[i]);
     free(it->programs);
-    /* Known-issue #1: the cleanup registry is empty on a clean run (each frame
-     * pops itself) and fully unwound on an error, so only the backing array is
-     * left to free here. */
+    /* All completed and suspended call scopes have now been disposed. */
     free(it->cleanup_stack);
     free(it->script_dir);
     free(it);
@@ -5719,7 +5732,7 @@ void interp_free(Interp *it) {
 
 /*
  * Execute a program's top-level statements on `it`'s global scope.  Assumes a
- * setjmp barrier for it->on_error has already been installed by the caller.
+ * error barrier for the current execution context is installed by the caller.
  * Returns 0 normally, 1 on the break/continue-outside-loop error.
  */
 static int run_toplevel(Interp *it, Program *program) {
@@ -5762,7 +5775,7 @@ int interp_run(Interp *it, Program *program) {
     /* retain the AST for the interpreter's lifetime */
     interp_retain_program(it, program);
 
-    if (setjmp(it->on_error)) {
+    if (setjmp(*interp_error_buf(it))) {
         /* a runtime error aborted this program; interpreter stays alive.
          * Phase5.2: the erroring frame longjmped straight here without running
          * the per-frame call_depth decrements, so reset the counter for the
@@ -5788,7 +5801,7 @@ int interp_run(Interp *it, Program *program) {
 
 Interp *myon_bridge_interp_new(void)  { return interp_create(); }
 void    myon_bridge_interp_free(Interp *it) { interp_free(it); }
-void   *myon_bridge_error_buf(Interp *it) { return (void *)&it->on_error; }
+void   *myon_bridge_error_buf(Interp *it) { return (void *)interp_error_buf(it); }
 
 Value myon_bridge_binary(Interp *it, int line, int op, Value l, Value r) {
     /* eval_binary consumes l and r (spec §2.2 strict typing). */
@@ -5925,8 +5938,17 @@ typedef struct {
     Interp       *it;
     MyonTaskBody  body;
     void         *ud;
+    void        (*cleanup)(void *);
+    Value        *result;
     Task         *task;      /* set after spawn */
 } BridgeTaskCtx;
+
+static void bridge_task_cleanup(void *ud) {
+    BridgeTaskCtx *ctx = ud;
+    if (ctx->cleanup) ctx->cleanup(ctx->ud);
+    if (ctx->result) { value_free(ctx->result); free(ctx->result); }
+    free(ctx);
+}
 
 /*
  * Coroutine entry for an MVM async task.  This whole function runs on the
@@ -5943,17 +5965,18 @@ static void bridge_task_entry(void *ud) {
 
     Value *res = (Value *)myon_xmalloc(sizeof(Value));
     *res = value_nil();
+    ctx->result = res;
     int has_error = 0;
 
     /* Local error barrier: a runtime_error inside the body must not longjmp
      * across the coroutine boundary (mirrors async_task_entry). */
     jmp_buf saved;
-    memcpy(&saved, &it->on_error, sizeof(jmp_buf));
+    memcpy(&saved, interp_error_buf(it), sizeof(jmp_buf));
     int saved_depth = it->call_depth;
     it->call_depth = 0;
-    int cleanup_at = cleanup_mark(it);
+    uint64_t cleanup_at = cleanup_mark(it);
 
-    if (setjmp(it->on_error) == 0) {
+    if (setjmp(*interp_error_buf(it)) == 0) {
         ctx->body(ctx->ud, res, &has_error);   /* runs the nested VM loop */
     } else {
         /* body raised: free skipped frames, finish with an error result */
@@ -5964,17 +5987,20 @@ static void bridge_task_entry(void *ud) {
     }
 
     it->call_depth = saved_depth;
-    memcpy(&it->on_error, &saved, sizeof(jmp_buf));
+    memcpy(interp_error_buf(it), &saved, sizeof(jmp_buf));
 
     event_loop_task_set_result(ctx->task, res, has_error);
-    free(ctx);
+    ctx->result = NULL;
 }
 
-Value myon_bridge_spawn_task(Interp *it, MyonTaskBody body, void *ud) {
+Value myon_bridge_spawn_task(Interp *it, MyonTaskBody body, void *ud,
+                             void (*cleanup)(void *)) {
     EventLoop *loop = ensure_loop(it);
     BridgeTaskCtx *ctx = (BridgeTaskCtx *)myon_xmalloc(sizeof(BridgeTaskCtx));
     ctx->it = it; ctx->body = body; ctx->ud = ud; ctx->task = NULL;
+    ctx->cleanup = cleanup; ctx->result = NULL;
     Task *task = event_loop_spawn(loop, bridge_task_entry, ctx);
+    event_loop_task_set_cleanup(task, bridge_task_cleanup);
     ctx->task = task;
     return value_task(task);
 }
@@ -5983,9 +6009,7 @@ Value myon_bridge_await(Interp *it, int line, Value task_value) {
     /* `myon.await <plain value>` is a no-op that yields the value (spec §14.9
      * allows awaiting a non-task; matches the tree-walker). */
     if (task_value.type != TYPE_TASK) return task_value;
-    Value out = await_task(it, line, task_value);
-    value_free(&task_value);
-    return out;
+    return await_task(it, line, task_value);
 }
 
 void myon_bridge_drain_tasks(Interp *it) {
@@ -6014,8 +6038,9 @@ int interpret(Program *program) {
     }
 
     ffi_callback_reset_all(); /* drop any live FFI callback slots (Phase4.1) */
-    if (it.net) net_state_destroy(it.net);
     if (it.loop) event_loop_destroy(it.loop);
+    cleanup_destroy(&it);
+    if (it.net) net_state_destroy(it.net);
     env_free(it.global);
     free(it.structs.items);
     if (it.ffi) ffi_state_free(it.ffi);

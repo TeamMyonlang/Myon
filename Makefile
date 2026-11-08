@@ -287,3 +287,11 @@ test-runtime: all | $(BUILD)
 	bash tests/string_regressions.sh ./$(BIN)
 	bash tests/numeric_regressions.sh ./$(BIN)
 	bash tests/harness_regressions.sh
+
+# Linux LSan gate: all success fixtures and selected task shutdown errors.
+# Keep its failure code distinct from the language's expected error exit 1.
+.PHONY: test-lsan
+test-lsan: $(ASAN_BIN) | $(BUILD)
+	$(ASAN_CC) $(ASAN_CFLAGS) -Isrc $(RUNTIME_TEST_SRCS) $(ASAN_LDLIBS) -o $(BUILD)/runtime_memory_lsan
+	ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 LSAN_OPTIONS=exitcode=99 UBSAN_OPTIONS=halt_on_error=1 $(BUILD)/runtime_memory_lsan
+	bash tests/leak_regressions.sh ./$(ASAN_BIN)

@@ -171,7 +171,9 @@ void myon_bridge_call_method(Interp *it, Value recv, const char *method,
  *   or re-raises its error via the bridge error barrier.
  */
 typedef void (*MyonTaskBody)(void *ud, Value *out_result, int *out_has_error);
-Value myon_bridge_spawn_task(Interp *it, MyonTaskBody body, void *ud);
+/* cleanup owns ud and runs after completion or cancellation at shutdown. */
+Value myon_bridge_spawn_task(Interp *it, MyonTaskBody body, void *ud,
+                             void (*cleanup)(void *));
 Value myon_bridge_await(Interp *it, int line, Value task_value);
 /* Run all not-yet-awaited foreground async tasks to completion (program end). */
 void  myon_bridge_drain_tasks(Interp *it);

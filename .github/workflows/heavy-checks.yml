@@ -65,6 +65,9 @@ jobs:
         # non-zero exit, turning this step red.
         run: make test-asan
 
+      - name: Leak regression checks
+        run: make test-lsan
+
   # ------------------------------------------------------------------ #
   # Job 2: MinGW-w64 cross build (produces myon.exe).                 #
   # ------------------------------------------------------------------ #

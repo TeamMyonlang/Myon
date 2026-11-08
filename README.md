@@ -172,6 +172,7 @@ make test-runtime
 make test-mvm
 make test-mvm-equality
 make test-asan
+make test-lsan
 ```
 
 テストには Bash、GNU coreutils、diffutils を使います。macOS では
@@ -185,7 +186,11 @@ Linux 以外でスキップされます。MVM の未対応機能は等価性ス�
 合格・失敗・スキップ・除外の件数は実行ログを確認してください。
 
 `make test-asan` は ASan/UBSan で全スイートを実行します。全体のリーク検出は
-`detect_leaks=0` です。個別のリーク検査では、例えば次のように LSan を有効にします。
+`detect_leaks=0` です。Linux の `make test-lsan` は、所有権テスト、正常終了する全フィクスチャ、
+選択したタスク異常終了をリーク検査します。MVM の未対応3件は除外します。
+構文エラーなど他の異常終了経路は、まだ検査対象に含めていません。
+LSan の失敗は終了コード99で、言語エラー1/65とは区別します。
+個別のリーク検査では、例えば次のように LSan を有効にします。
 
 ```sh
 make asan
@@ -196,7 +201,7 @@ ASAN_OPTIONS=detect_leaks=1 bash tests/numeric_regressions.sh ./myon_asan
 
 | ワークフロー | 実行条件・内容 |
 |---|---|
-| [ci.yml](.github/workflows/ci.yml) | main への push と PR。Linux の gcc/clang でビルドとテスト |
+| [ci.yml](.github/workflows/ci.yml) | main への push と PR。Linux の gcc/clang でビルドとテスト。gcc で LSan 検査 |
 | [heavy-checks.yml](.github/workflows/heavy-checks.yml) | main への push と手動実行。sanitizer、Windows クロスビルド、Windows/macOS 実機テスト、benchmark |
 | [release.yml](.github/workflows/release.yml) | 手動実行による Linux・Windows・macOS バイナリの配布 |
 
