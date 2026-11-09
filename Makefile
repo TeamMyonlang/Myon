@@ -194,6 +194,7 @@ test-asan: $(ASAN_BIN) $(BUILD)/unicode_case_asan $(BUILD)/runtime_memory_asan $
 	./tests/run_tests.sh; \
 	./tests/mvm_compiler_tests.sh; \
 	if [ -f ./tests/run_mvm_tests.sh ]; then ./tests/run_mvm_tests.sh; fi; \
+	bash tests/package_mvm_regressions.sh ./myon; \
 	bash tests/callback_regressions.sh ./myon; \
 	bash tests/leak_regressions.sh ./myon
 
@@ -210,6 +211,7 @@ test: all test-pkg test-runtime
 	./tests/run_tests.sh
 	./tests/mvm_compiler_tests.sh
 	bash tests/callback_regressions.sh ./$(BIN)
+	bash tests/package_mvm_regressions.sh ./$(BIN)
 	@if [ -f ./tests/run_mvm_tests.sh ]; then ./tests/run_mvm_tests.sh; fi
 
 # ------------------------------------------------------------------------- #

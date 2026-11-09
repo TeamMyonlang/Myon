@@ -100,6 +100,7 @@ typedef struct {
 
     Value   *globals;     /* top-level (<main>) variable slots (spec §4.6) */
     int      global_count;
+    UpvalueCell **global_cells; /* owning mirrors for boxed entry-frame slots */
 } VMShared;
 
 typedef struct {
@@ -303,8 +304,9 @@ static void frame_open_cells(VM *vm, Frame *f) {
     for (int i = 0; i < (int)c->num_locals; i++) {
         if (i < (int)c->captured_len && c->captured[i]) {
             /* move the slot's value into a fresh cell */
-            f->cells[i] = upvalue_cell_new(vm->stack[f->base + i]);
-            vm->stack[f->base + i] = value_nil();
+            Value *slot = f->globals_frame ? &vm->sh->globals[i] : &vm->stack[f->base + i];
+            f->cells[i] = upvalue_cell_new(*slot);
+            *slot = value_nil();
         } else {
             f->cells[i] = NULL;
         }
@@ -544,6 +546,21 @@ static int run(VM *vm) {
 
         /* local variables (frame-relative).  A captured slot lives in a boxed
          * cell (spec §7.3) so closures share it; read/write through the cell. */
+        case MOP_RESET_LOCAL: {
+            uint16_t slot = read_u16(f);
+            if (f->cells && f->cells[slot]) {
+                upvalue_cell_unref(f->cells[slot]);
+                f->cells[slot] = upvalue_cell_new(value_nil());
+                if (f->globals_frame) {
+                    upvalue_cell_unref(vm->sh->global_cells[slot]);
+                    vm->sh->global_cells[slot] = upvalue_cell_ref(f->cells[slot]);
+                }
+            } else {
+                Value *v = f->globals_frame ? &vm->sh->globals[slot] : &vm->stack[f->base + slot];
+                value_free(v); *v = value_nil();
+            }
+            break;
+        }
         case MOP_LOAD_LOCAL: {
             uint16_t slot = read_u16(f);
             if (f->cells && f->cells[slot])
@@ -593,7 +610,8 @@ static int run(VM *vm) {
             uint16_t slot = read_u16(f);
             if (slot >= (uint16_t)vm->sh->global_count)
                 vm_error(vm, line, "internal: global slot %u out of range", slot);
-            vm_push(vm, value_copy(&vm->sh->globals[slot]));
+            Value *v = vm->sh->global_cells[slot] ? &vm->sh->global_cells[slot]->value : &vm->sh->globals[slot];
+            vm_push(vm, value_copy(v));
             break;
         }
         case MOP_STORE_GLOBAL: {
@@ -601,8 +619,8 @@ static int run(VM *vm) {
             if (slot >= (uint16_t)vm->sh->global_count)
                 vm_error(vm, line, "internal: global slot %u out of range", slot);
             Value v = vm_pop(vm);
-            value_free(&vm->sh->globals[slot]);
-            vm->sh->globals[slot] = v;
+            Value *target = vm->sh->global_cells[slot] ? &vm->sh->global_cells[slot]->value : &vm->sh->globals[slot];
+            value_free(target); *target = v;
             break;
         }
 
@@ -654,8 +672,13 @@ static int run(VM *vm) {
         case MOP_CALL: {
             uint8_t argc = read_u8(f);
             Value *callee = vm_peek(vm, argc);   /* fn sits below the args */
-            if (!vm_is_mvm_fn(callee))
-                vm_error(vm, line, "cannot call a %s value", value_type_name(callee));
+            if (!vm_is_mvm_fn(callee)) {
+                Value out = myon_bridge_call_function(VM_BRIDGE(vm), *callee,
+                    &vm->stack[vm->sp - argc], argc, line);
+                for (int i = 0; i <= argc; i++) { Value v = vm_pop(vm); value_free(&v); }
+                vm_push(vm, out);
+                break;
+            }
             int cidx = vm_closure_chunk(callee);
             /*
              * Calling an `myon.async` function does not run it: it spawns a
@@ -861,7 +884,8 @@ static int run(VM *vm) {
             uint8_t argc = read_u8(f);
             const char *method = VM_MODULE(vm)->consts[nidx].value.as.obj->as.str;
             Value *recv = vm_peek(vm, argc);   /* receiver below the args */
-            if (recv->type == TYPE_STRUCT) {
+            if (recv->type == TYPE_STRUCT &&
+                recv->as.obj->as.st.decl == find_struct_decl(vm, recv->as.obj->as.st.type_name)) {
                 /* static dispatch to the Struct.method chunk (self at slot 0) */
                 StructDecl *sd = recv->as.obj->as.st.decl;
                 if (!sd) sd = find_struct_decl(vm, recv->as.obj->as.st.type_name);
@@ -1005,6 +1029,8 @@ int mvm_run_module(Module *m, Program *program, const char *source) {
     sh.global_count = ec->num_locals;
     sh.globals = sh.global_count
         ? (Value *)myon_xmalloc(sizeof(Value) * (size_t)sh.global_count) : NULL;
+    sh.global_cells = calloc((size_t)(sh.global_count ? sh.global_count : 1), sizeof(*sh.global_cells));
+    if (!sh.global_cells) exit(70);
     for (int i = 0; i < sh.global_count; i++) sh.globals[i] = value_nil();
 
     VM vm;
@@ -1023,6 +1049,9 @@ int mvm_run_module(Module *m, Program *program, const char *source) {
             f->chunk = ec; f->ip = ec->code; f->base = 0; f->fn_slot = -1;
             f->upvalues = NULL; f->upvalue_count = 0;
             f->cells = NULL; f->globals_frame = 1;
+            frame_open_cells(&vm, f);
+            for (int i = 0; i < sh.global_count; i++)
+                if (f->cells) sh.global_cells[i] = upvalue_cell_ref(f->cells[i]);
             rc = run(&vm);
             /*
              * Drain any tasks still pending after <main> returns so background
@@ -1043,6 +1072,8 @@ int mvm_run_module(Module *m, Program *program, const char *source) {
     free(vm.stack);
     for (int i = 0; i < sh.global_count; i++) value_free(&sh.globals[i]);
     free(sh.globals);
+    for (int i = 0; i < sh.global_count; i++) upvalue_cell_unref(sh.global_cells[i]);
+    free(sh.global_cells);
     myon_bridge_interp_free(sh.bridge);
     if (source) diag_clear_source();
     return rc;

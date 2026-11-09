@@ -270,6 +270,7 @@ static int looks_like_myc(const char *path) {
 static int check_myc_stale(const Module *m, const char *myc_path, int strict);
 
 static int cmd_run_myc(const char *path, int strict_stale) {
+    interpret_set_script_path(path);
     Module *m = mvm_module_read_file(path);
     if (!m) {
         fprintf(stderr, "myon: cannot load bytecode '%s'\n", path);
@@ -304,6 +305,7 @@ static int cmd_run_myc(const char *path, int strict_stale) {
  * behaviour are untouched.
  */
 static int cmd_run_mvm(const char *src) {
+    interpret_set_script_path(src);
     char *source = NULL;
     TokenList tokens;
     Program *program = load_program(src, &source, &tokens);

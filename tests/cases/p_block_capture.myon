@@ -1,0 +1,29 @@
+module myon.array
+module myon.stdio
+callbacks = myon.array(func)
+{
+    n = 30
+    callbacks.push(myon.lambda(x: int) ret int { n = n + x; ret n })
+}
+f = callbacks[0]
+myon.print(f(2))
+myon.print(f(3))
+# Reusing storage in a later block cannot change a captured binding.
+{ other = "unrelated" }
+myon.print(f(1))
+myon.for i myon.in range(0, 3) {
+    n = i * 10
+    callbacks.push(myon.lambda(x: int) ret int { n = n + x; ret n })
+}
+myon.print(callbacks[1](1))
+myon.print(callbacks[2](1))
+myon.print(callbacks[3](1))
+myon.print(callbacks[1](2))
+{
+    shared = 50
+    callbacks.push(myon.lambda(x: int) ret int { shared = shared + x; ret shared })
+    myon.expose shared
+}
+myon.func read_shared() ret int { ret shared }
+myon.print(callbacks[4](2))
+myon.print(read_shared())

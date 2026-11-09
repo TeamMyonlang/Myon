@@ -85,6 +85,7 @@ typedef struct FnComp {
     int    chunk_idx;
     Local  locals[MAX_LOCALS];
     int    local_count;
+    int    binding_params;
     int    scope_depth;
     Upvalue upvalues[MAX_UPVALUES];
     int     upvalue_count;
@@ -111,6 +112,7 @@ typedef struct FnComp {
 
 typedef struct {
     Module   *module;
+    Program  *program;
     FnComp   *fn;              /* current function being compiled */
     /* struct declarations seen at top level (for static dispatch, spec §4.11) */
     StructDecl **structs;
@@ -208,15 +210,20 @@ static int add_upvalue(Compiler *c, FnComp *fn, int index, int from_local, char 
  * the upvalue index in `fn`, or -1 if `name` is not a capturable enclosing
  * local.  A hit in the immediately-enclosing function's frame is captured
  * `from_local`; a deeper hit is threaded through each intermediate function as
- * a re-captured upvalue.  <main>'s locals are globals, not upvalues, so the
- * walk stops before <main>.
+ * a re-captured upvalue. Only depth-zero <main> bindings are globals;
+ * block bindings in <main> are captured like other enclosing locals.
  */
+static int main_block_slot(FnComp *fn, int slot) {
+    for (int i = 0; i < fn->local_count; i++)
+        if (fn->locals[i].slot == slot) return fn->locals[i].depth > 0;
+    return 0;
+}
 static int resolve_upvalue(Compiler *c, FnComp *fn, const char *name) {
     FnComp *up = fn->enclosing;
     if (!up || is_main_fn(fn)) return -1;  /* fn is <main>: no upvalues */
 
     int local = resolve_local(up, name);
-    if (local >= 0 && !is_main_fn(up)) {
+    if (local >= 0 && (!is_main_fn(up) || main_block_slot(up, local))) {
         mark_captured(up, local);
         return add_upvalue(c, fn, local, 1, (char *)name);
     }
@@ -273,7 +280,7 @@ static int find_in_outer_scope(FnComp *fn, const char *name) {
 /* Declare a new local at the current scope depth; returns its slot. */
 static int declare_local(Compiler *c, const char *name) {
     FnComp *fn = c->fn;
-    if (fn->local_count >= MAX_LOCALS)
+    if (fn->local_count >= MAX_LOCALS || fn->next_slot >= MAX_LOCALS)
         compile_error(c, 0, "too many local variables in one function");
     int slot = fn->next_slot++;
     if (fn->next_slot > fn->max_slot) fn->max_slot = fn->next_slot;
@@ -281,6 +288,7 @@ static int declare_local(Compiler *c, const char *name) {
     fn->locals[fn->local_count].depth = fn->scope_depth;
     fn->locals[fn->local_count].slot = slot;
     fn->local_count++;
+    if (!fn->binding_params) chunk_emit_op_u16(cur_chunk(c), MOP_RESET_LOCAL, (uint16_t)slot, 0);
     return slot;
 }
 
@@ -332,7 +340,7 @@ static void end_scope(Compiler *c) {
     int depth = fn->scope_depth;
     while (fn->local_count > 0 && fn->locals[fn->local_count - 1].depth == depth) {
         fn->local_count--;
-        fn->next_slot--;
+        if (!is_main_fn(fn)) fn->next_slot--;
     }
     fn->scope_depth--;
 }
@@ -571,6 +579,30 @@ static void compile_struct_ctor(Compiler *c, Expr *e, StructDecl *sd) {
     chunk_emit_op_u16(ch, MOP_NEW_STRUCT, (uint16_t)tidx, e->line);
 }
 
+static int package_member(Compiler *c, Expr *e) {
+    if (e->kind != EXPR_MEMBER || e->as.member.target->kind != EXPR_IDENT) return 0;
+    const char *alias = e->as.member.target->as.ident;
+    int slot;
+    if (resolve_name(c, c->fn, alias, &slot) != NAME_NONE) return 0;
+    for (int i = 0; i < c->program->stmts.count; i++) {
+        Stmt *s = c->program->stmts.items[i];
+        if (s->kind != STMT_MODULE || !s->as.module_decl.alias) continue;
+        const char *path = s->as.module_decl.path;
+        if (strcmp(s->as.module_decl.alias, alias) || !strncmp(path, "myon.", 5) ||
+            !strncmp(path, "external.", 9)) continue;
+        Chunk *ch = cur_chunk(c);
+        int a = module_add_const_str(c->module, alias);
+        int b = module_add_const_str(c->module, e->as.member.name);
+        chunk_emit_op_u16(ch, MOP_PUSH_CONST, a, e->line);
+        chunk_emit_op_u16(ch, MOP_PUSH_CONST, b, e->line);
+        int nid = module_add_native(c->module, "myon.__package_member");
+        chunk_emit_op_u16(ch, MOP_CALL_NATIVE, nid, e->line);
+        chunk_emit_byte(ch, 2, e->line);
+        return 1;
+    }
+    return 0;
+}
+
 static void compile_call(Compiler *c, Expr *e) {
     Chunk *ch = cur_chunk(c);
     Expr *callee = e->as.call.callee;
@@ -612,6 +644,11 @@ static void compile_call(Compiler *c, Expr *e) {
                       callee->as.generic.name);
     }
 
+    if (package_member(c, callee)) {
+        for (int i = 0; i < e->as.call.arg_count; i++) compile_expr(c, e->as.call.args[i]);
+        chunk_emit_op_u8(ch, MOP_CALL, e->as.call.arg_count, e->line);
+        return;
+    }
     /* method call: obj.method(args) -> INVOKE (spec §4.11) */
     if (callee->kind == EXPR_MEMBER) {
         compile_expr(c, callee->as.member.target);          /* receiver */
@@ -746,6 +783,7 @@ static void compile_expr(Compiler *c, Expr *e) {
             chunk_emit_op(ch, MOP_INDEX_GET, e->line);
             break;
         case EXPR_MEMBER: {
+            if (package_member(c, e)) break;
             compile_expr(c, e->as.member.target);
             int nidx = module_add_const_str(c->module, e->as.member.name);
             chunk_emit_op_u16(ch, MOP_GET_FIELD, (uint16_t)nidx, e->line);
@@ -1182,8 +1220,15 @@ static void compile_stmt(Compiler *c, Stmt *s) {
             } else if (strcmp(path, "myon") == 0 || strncmp(path, "myon.", 5) == 0) {
                 compile_error(c, s->line, "unknown builtin module '%s'", path);
             } else {
-                unsupported(c, s->line, "installed package module imports",
-                    "The MVM backend cannot yet load installed package modules; run the source instead.");
+                if (!s->as.module_decl.alias) compile_error(c, s->line, "package module requires an alias");
+                int p = module_add_const_str(c->module, path);
+                int a = module_add_const_str(c->module, s->as.module_decl.alias);
+                chunk_emit_op_u16(ch, MOP_PUSH_CONST, p, s->line);
+                chunk_emit_op_u16(ch, MOP_PUSH_CONST, a, s->line);
+                int nid = module_add_native(c->module, "myon.__package_import");
+                chunk_emit_op_u16(ch, MOP_CALL_NATIVE, nid, s->line);
+                chunk_emit_byte(ch, 2, s->line);
+                chunk_emit_op(ch, MOP_POP, s->line);
             }
             break;
         }
@@ -1302,6 +1347,7 @@ static int compile_function(Compiler *c, FuncDecl *decl, const char *dbg_name,
      * remember the owning struct so `self.field` / `self.method()` inside the
      * body can be checked and dispatched statically.
      */
+    fn.binding_params = 1;
     int self_param = self_struct ? 1 : 0;
     if (self_struct) declare_local(c, "self");
 
@@ -1309,6 +1355,7 @@ static int compile_function(Compiler *c, FuncDecl *decl, const char *dbg_name,
     for (int i = 0; i < decl->param_count; i++)
         declare_local(c, decl->params[i].name);
 
+    fn.binding_params = 0;
     compile_block(c, decl->body, 0);   /* function body is its own scope root */
 
     /* implicit return (spec §4.8): RET 0 */
@@ -1384,6 +1431,7 @@ Module *mvm_compile_program(Program *program, const char *source_path) {
     Compiler *c = myon_xmalloc(sizeof(*c));
     memset(c, 0, sizeof(*c));
     c->module = module_new();
+    c->program = program;
 
     /* top-level main chunk */
     int main_idx = module_add_chunk(c->module, "<main>");
@@ -1430,9 +1478,12 @@ Module *mvm_compile_program(Program *program, const char *source_path) {
         }
     }
 
-    for (int i = 0; i < program->stmts.count; i++)
-        if (program->stmts.items[i]->kind == STMT_MODULE)
-            compile_stmt(c, program->stmts.items[i]);
+    for (int builtin = 1; builtin >= 0; builtin--)
+        for (int i = 0; i < program->stmts.count; i++) {
+            Stmt *s = program->stmts.items[i];
+            if (s->kind == STMT_MODULE && !!myon_builtin_module_bit(s->as.module_decl.path) == builtin)
+                compile_stmt(c, s);
+        }
     for (int i = 0; i < program->stmts.count; i++)
         if (program->stmts.items[i]->kind != STMT_MODULE)
             compile_stmt(c, program->stmts.items[i]);
@@ -1444,10 +1495,8 @@ Module *mvm_compile_program(Program *program, const char *source_path) {
     mc->num_params = 0;
     mc->num_locals = (uint16_t)mainfn.max_slot;
     mc->ret_count  = 0;
-    /* <main>'s locals are globals; nested functions capture them as GLOBAL,
-     * not upvalues, so this is normally empty — set it for completeness. */
+    /* Box main-frame block bindings; depth-zero bindings remain globals. */
     fill_captured_bitmap(mc, &mainfn);
-
     fill_source_info(c->module, source_path);
 
     if (c->structs) myon_free(c->structs);

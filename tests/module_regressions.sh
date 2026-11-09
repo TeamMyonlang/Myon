@@ -128,10 +128,10 @@ MYON
 run tree 0
 printf 'loaded\n9\n5\n' > "$scratch/expected"
 cmp "$scratch/expected" "$scratch/out"
-# Module activation is part of MYC1 1.2 semantics: reject older and future minors.
+# Module activation is part of MYC1 1.3 semantics: reject older and future minors.
 printf 'module myon.stdio\nmyon.print(7)\n' > "$scratch/input.myon"
 "$MYON" --compile "$scratch/input.myon" -o "$scratch/current.myc"
-for minor in '\001' '\003'; do
+for minor in '\002' '\004'; do
     cp "$scratch/current.myc" "$scratch/old.myc"
     printf '%b' "$minor" | dd of="$scratch/old.myc" bs=1 seek=5 conv=notrunc 2>/dev/null
     rc=0
