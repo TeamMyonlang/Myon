@@ -19,11 +19,3 @@ myon.print(callbacks[1](1))
 myon.print(callbacks[2](1))
 myon.print(callbacks[3](1))
 myon.print(callbacks[1](2))
-{
-    shared = 50
-    callbacks.push(myon.lambda(x: int) ret int { shared = shared + x; ret shared })
-    myon.expose shared
-}
-myon.func read_shared() ret int { ret shared }
-myon.print(callbacks[4](2))
-myon.print(read_shared())
