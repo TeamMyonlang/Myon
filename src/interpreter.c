@@ -5398,7 +5398,7 @@ static void exec_module_file(Interp *it, Stmt *decl, ModuleEntry *m,
     FILE *f = fopen(file, "rb");
     if (!f) {
         char *fcopy = myon_strdup(file);
-        runtime_error(it, decl->line,
+        runtime_error_free(it, decl->line, fcopy,
                       "cannot open module file '%s' for '%s'", fcopy, path);
     }
     fseek(f, 0, SEEK_END);
@@ -5958,8 +5958,41 @@ static Expr bridge_make_call_expr(int line, int argc) {
     return e;
 }
 
+Value myon_bridge_call_function(Interp *it, Value fn, Value *args, int argc, int line) {
+    Value *saved = it->bridge_args;
+    int saved_argc = it->bridge_argc;
+    it->bridge_args = NULL; it->bridge_argc = 0;
+    Value result;
+    if (fn.type == TYPE_FUNC && fn.as.obj->as.fn.decl && fn.as.obj->as.fn.decl->is_async)
+        result = spawn_async_task(it, fn, args, argc);
+    else result = call_function(it, line, fn, args, argc, NULL);
+    it->bridge_args = saved; it->bridge_argc = saved_argc;
+    return result;
+}
+
 int myon_bridge_call_native(Interp *it, const char *name,
                             Value *args, int argc, int line, Value *out) {
+    if (strcmp(name, "myon.__package_import") == 0 || strcmp(name, "myon.__package_member") == 0) {
+        if (argc != 2 || args[0].type != TYPE_STR || args[1].type != TYPE_STR)
+            runtime_error(it, line, "invalid package instruction");
+        if (!strcmp(name, "myon.__package_import")) {
+            Stmt decl; memset(&decl, 0, sizeof(decl));
+            decl.kind = STMT_MODULE; decl.line = line;
+            decl.as.module_decl.path = args[0].as.obj->as.str;
+            decl.as.module_decl.alias = args[1].as.obj->as.str;
+            Value *saved = it->bridge_args; int count = it->bridge_argc;
+            it->bridge_args = NULL; it->bridge_argc = 0;
+            load_package_module(it, &decl);
+            it->bridge_args = saved; it->bridge_argc = count;
+            *out = value_void();
+        } else {
+            ModuleEntry *m = find_module_by_alias(it, args[0].as.obj->as.str);
+            if (!m || !env_get(m->ns, args[1].as.obj->as.str, out))
+                runtime_error(it, line, "package member '%s.%s' not found",
+                    args[0].as.obj->as.str, args[1].as.obj->as.str);
+        }
+        return 1;
+    }
     if (strcmp(name, "myon.__module_nested") == 0)
         runtime_error(it, line, "module declarations are only allowed at top level");
     if (strcmp(name, "myon.__module_enable") == 0 || strcmp(name, "myon.__module_require") == 0) {

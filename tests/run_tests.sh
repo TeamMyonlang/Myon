@@ -247,21 +247,19 @@ check_pkg_cwd_independent() {
 }
 check_pkg_cwd_independent pkg_module_cwd_independent
 
-# The MVM backend must reject installed-package imports explicitly rather than
-# silently diverging from the tree-walker (spec §6.3).
-check_pkg_mvm_unsupported() {
-    local name="$1" src="$2"
-    local msg rc
-    msg="$("$MYON" --compile "$src" -o /dev/null 2>&1)"; rc=$?
-    if [ "$rc" -ne 0 ] && printf '%s' "$msg" | grep -q "MVM does not support installed package module"; then
-        echo "  ok   $name (MVM rejects package import as unsupported)"
+# MVM package imports also resolve relative to their owning project.
+check_pkg_mvm() {
+    local rc=0 result
+    result=$(mktemp)
+    "$MYON" --run-mvm tests/cases/pkgproj/main.myon > "$result" || rc=$?
+    if [ "$rc" -eq 0 ] && diff -u tests/cases/pkgproj/main.out "$result"; then
         pass=$((pass + 1))
     else
-        echo "  FAIL $name (expected explicit MVM-unsupported error; exit $rc)"
-        fail=$((fail + 1))
+        echo 'FAIL MVM package import'; fail=$((fail + 1))
     fi
+    rm -f "$result"
 }
-check_pkg_mvm_unsupported pkg_module_mvm_unsupported tests/cases/pkgproj/main.myon
+check_pkg_mvm
 
 if [ "$skip" -gt 0 ]; then
     echo "== results: $pass passed, $fail failed, $skip skipped =="
