@@ -86,6 +86,7 @@ typedef struct FnComp {
     Local  locals[MAX_LOCALS];
     int    local_count;
     int    binding_params;
+    int    is_method;
     int    scope_depth;
     Upvalue upvalues[MAX_UPVALUES];
     int     upvalue_count;
@@ -294,8 +295,35 @@ static int declare_local(Compiler *c, const char *name) {
 
 /* Open a new lexical scope.  `is_block` marks an explicit `{ }` block so the
  * §9.2 shadowing rule applies (see FnComp.depth_is_block). */
+static int flat_external(Compiler *c) {
+    for (int i = 0; i < c->program->stmts.count; i++) {
+        Stmt *s = c->program->stmts.items[i];
+        if (s->kind == STMT_MODULE && !s->as.module_decl.alias &&
+            (!strcmp(s->as.module_decl.path, "external") || !strncmp(s->as.module_decl.path, "external.", 9))) return 1;
+    }
+    return 0;
+}
+static void emit_external_name(Compiler *c, int line, const char *name, int store) {
+    Chunk *ch = cur_chunk(c);
+    int n = module_add_const_str(c->module, name);
+    chunk_emit_op_u16(ch, MOP_PUSH_CONST, n, line);
+    int id = module_add_native(c->module, store ? "myon.__external_set" : "myon.__external_get");
+    chunk_emit_op_u16(ch, MOP_CALL_NATIVE, id, line);
+    chunk_emit_byte(ch, store ? 2 : 1, line);
+    if (store) chunk_emit_op(ch, MOP_POP, line);
+}
+static const char *external_global(Compiler *c, NameKind k, int slot) {
+    if (!flat_external(c) || k == NAME_UPVALUE || (k == NAME_LOCAL && !is_main_fn(c->fn))) return NULL;
+    FnComp *root = c->fn;
+    while (root->enclosing) root = root->enclosing;
+    for (int i = 0; i < root->local_count; i++)
+        if (root->locals[i].slot == slot && root->locals[i].depth == 0) return root->locals[i].name;
+    return NULL;
+}
 /* Emit a load for a resolved variable (LOAD_LOCAL / LOAD_GLOBAL / LOAD_UPVALUE). */
 static void emit_var_load(Compiler *c, int line, NameKind k, int slot) {
+    const char *name = external_global(c, k, slot);
+    if (name) { emit_external_name(c, line, name, 0); return; }
     OpCode op = (k == NAME_GLOBAL)  ? MOP_LOAD_GLOBAL
               : (k == NAME_UPVALUE) ? MOP_LOAD_UPVALUE
                                     : MOP_LOAD_LOCAL;
@@ -304,6 +332,8 @@ static void emit_var_load(Compiler *c, int line, NameKind k, int slot) {
 
 /* Emit a store for a resolved variable (STORE_LOCAL / STORE_GLOBAL / STORE_UPVALUE). */
 static void emit_var_store(Compiler *c, int line, NameKind k, int slot) {
+    const char *name = external_global(c, k, slot);
+    if (name) { emit_external_name(c, line, name, 1); return; }
     OpCode op = (k == NAME_GLOBAL)  ? MOP_STORE_GLOBAL
               : (k == NAME_UPVALUE) ? MOP_STORE_UPVALUE
                                     : MOP_STORE_LOCAL;
@@ -340,27 +370,36 @@ static void end_scope(Compiler *c) {
     int depth = fn->scope_depth;
     while (fn->local_count > 0 && fn->locals[fn->local_count - 1].depth == depth) {
         fn->local_count--;
-        if (!is_main_fn(fn)) fn->next_slot--;
+        /* Slots have distinct lexical lifetimes, including published copies. */
     }
     fn->scope_depth--;
 }
 
-/*
- * myon.expose name (spec §5.4 / language §9.1): promote the named local's
- * lifetime to the enclosing scope so end_scope() does not discard it.  We
- * lower its recorded depth by one; this both keeps it alive across the closing
- * brace and prevents a spurious POP.
- */
+/* Publish a Value copy into the immediate parent scope. Keep the source
+ * binding in place so captured variables and later writes still see it. */
 static void expose_local(Compiler *c, int line, const char *name) {
     FnComp *fn = c->fn;
-    for (int i = fn->local_count - 1; i >= 0; i--) {
-        if (fn->locals[i].depth == fn->scope_depth &&
-            strcmp(fn->locals[i].name, name) == 0) {
-            if (fn->locals[i].depth > 0) fn->locals[i].depth--;
-            return;
+    int source;
+    NameKind kind = resolve_name(c, fn, name, &source);
+    if (kind == NAME_NONE) compile_error(c, line, "myon.expose: '%s' is not defined here", name);
+    if (fn->scope_depth == 0) return;
+    int depth = fn->scope_depth - 1, target = -1;
+    for (int i = fn->local_count - 1; i >= 0; i--)
+        if (fn->locals[i].depth == depth && !strcmp(fn->locals[i].name, name)) {
+            target = fn->locals[i].slot; break;
         }
+    emit_var_load(c, line, kind, source);
+    if (target < 0) {
+        target = declare_local(c, name);
+        Local published = fn->locals[--fn->local_count];
+        published.depth = depth;
+        int pos = fn->local_count;
+        while (pos > 0 && fn->locals[pos - 1].depth > depth) {
+            fn->locals[pos] = fn->locals[pos - 1]; pos--;
+        }
+        fn->locals[pos] = published; fn->local_count++;
     }
-    compile_error(c, line, "myon.expose: '%s' is not declared in this block", name);
+    emit_var_store(c, line, NAME_LOCAL, target);
 }
 
 /* ================================================================== */
@@ -579,7 +618,7 @@ static void compile_struct_ctor(Compiler *c, Expr *e, StructDecl *sd) {
     chunk_emit_op_u16(ch, MOP_NEW_STRUCT, (uint16_t)tidx, e->line);
 }
 
-static int package_member(Compiler *c, Expr *e) {
+static int import_member(Compiler *c, Expr *e) {
     if (e->kind != EXPR_MEMBER || e->as.member.target->kind != EXPR_IDENT) return 0;
     const char *alias = e->as.member.target->as.ident;
     int slot;
@@ -588,8 +627,7 @@ static int package_member(Compiler *c, Expr *e) {
         Stmt *s = c->program->stmts.items[i];
         if (s->kind != STMT_MODULE || !s->as.module_decl.alias) continue;
         const char *path = s->as.module_decl.path;
-        if (strcmp(s->as.module_decl.alias, alias) || !strncmp(path, "myon.", 5) ||
-            !strncmp(path, "external.", 9)) continue;
+        if (strcmp(s->as.module_decl.alias, alias) || !strncmp(path, "myon.", 5)) continue;
         Chunk *ch = cur_chunk(c);
         int a = module_add_const_str(c->module, alias);
         int b = module_add_const_str(c->module, e->as.member.name);
@@ -619,9 +657,11 @@ static void compile_call(Compiler *c, Expr *e) {
          * recursive top-level functions work (spec §4.6 note / M4). */
         int slot = -1;
         NameKind k = resolve_name(c, c->fn, name, &slot);
-        if (k == NAME_NONE)
-            compile_error(c, e->line, "undefined function or variable '%s'", name);
-        emit_var_load(c, e->line, k, slot);
+        if (k == NAME_NONE && flat_external(c)) emit_external_name(c, e->line, name, 0);
+        else {
+            if (k == NAME_NONE) compile_error(c, e->line, "undefined function or variable '%s'", name);
+            emit_var_load(c, e->line, k, slot);
+        }
         for (int i = 0; i < e->as.call.arg_count; i++)
             compile_expr(c, e->as.call.args[i]);
         chunk_emit_op_u8(ch, MOP_CALL, (uint8_t)e->as.call.arg_count, e->line);
@@ -644,7 +684,7 @@ static void compile_call(Compiler *c, Expr *e) {
                       callee->as.generic.name);
     }
 
-    if (package_member(c, callee)) {
+    if (import_member(c, callee)) {
         for (int i = 0; i < e->as.call.arg_count; i++) compile_expr(c, e->as.call.args[i]);
         chunk_emit_op_u8(ch, MOP_CALL, e->as.call.arg_count, e->line);
         return;
@@ -737,9 +777,11 @@ static void compile_expr(Compiler *c, Expr *e) {
         case EXPR_IDENT: {
             int slot = -1;
             NameKind k = resolve_name(c, c->fn, e->as.ident, &slot);
-            if (k == NAME_NONE)
-                compile_error(c, e->line, "undefined variable '%s'", e->as.ident);
-            emit_var_load(c, e->line, k, slot);
+            if (k == NAME_NONE && flat_external(c)) emit_external_name(c, e->line, e->as.ident, 0);
+            else {
+                if (k == NAME_NONE) compile_error(c, e->line, "undefined variable '%s'", e->as.ident);
+                emit_var_load(c, e->line, k, slot);
+            }
             break;
         }
         case EXPR_BINARY: {
@@ -783,7 +825,7 @@ static void compile_expr(Compiler *c, Expr *e) {
             chunk_emit_op(ch, MOP_INDEX_GET, e->line);
             break;
         case EXPR_MEMBER: {
-            if (package_member(c, e)) break;
+            if (import_member(c, e)) break;
             compile_expr(c, e->as.member.target);
             int nidx = module_add_const_str(c->module, e->as.member.name);
             chunk_emit_op_u16(ch, MOP_GET_FIELD, (uint16_t)nidx, e->line);
@@ -860,12 +902,24 @@ static void compile_expr(Compiler *c, Expr *e) {
 /* assignment (spec §5.3 resolve_assign, §4.6/§4.10/§4.11)             */
 /* ================================================================== */
 
+static void bind_external_local(Compiler *c, int slot, const char *name, int line) {
+    FnComp *fn = c->fn;
+    if ((fn->enclosing || fn->scope_depth > 0) && !fn->is_method && flat_external(c)) {
+        mark_captured(fn, slot);
+        int n = module_add_const_str(c->module, name);
+        int encoded = slot | (cur_scope_is_block(c) ? 0x8000 : 0);
+        chunk_emit_op_u16(cur_chunk(c), MOP_BIND_EXTERNAL, encoded, line);
+        chunk_emit_byte(cur_chunk(c), n & 255, line);
+        chunk_emit_byte(cur_chunk(c), (n >> 8) & 255, line);
+    }
+}
+
 static void compile_assign_target_name(Compiler *c, int line, const char *name) {
     /* value to store is already on the stack top. */
     FnComp *fn = c->fn;
     int i = find_in_current_scope(fn, name);
     if (i >= 0) {                          /* (1) update current scope */
-        chunk_emit_op_u16(cur_chunk(c), MOP_STORE_LOCAL, (uint16_t)i, line);
+        emit_var_store(c, line, NAME_LOCAL, i);
         return;
     }
     int j = find_in_outer_scope(fn, name);
@@ -874,7 +928,7 @@ static void compile_assign_target_name(Compiler *c, int line, const char *name) 
             compile_error(c, line,
                 "redefinition of '%s' shadows an outer variable (forbidden, spec 9.2)", name);
         }
-        chunk_emit_op_u16(cur_chunk(c), MOP_STORE_LOCAL, (uint16_t)j, line); /* (2b) */
+        emit_var_store(c, line, NAME_LOCAL, j); /* (2b) */
         return;
     }
     /*
@@ -888,7 +942,7 @@ static void compile_assign_target_name(Compiler *c, int line, const char *name) 
         int rslot = -1;
         NameKind rk = resolve_name(c, fn, name, &rslot);
         if (rk == NAME_GLOBAL) {
-            chunk_emit_op_u16(cur_chunk(c), MOP_STORE_GLOBAL, (uint16_t)rslot, line);
+            emit_var_store(c, line, NAME_GLOBAL, rslot);
             return;
         }
         if (rk == NAME_UPVALUE) {
@@ -897,7 +951,8 @@ static void compile_assign_target_name(Compiler *c, int line, const char *name) 
         }
     }
     int slot = declare_local(c, name);     /* (3) new local */
-    chunk_emit_op_u16(cur_chunk(c), MOP_STORE_LOCAL, (uint16_t)slot, line);
+    bind_external_local(c, slot, name, line);
+    emit_var_store(c, line, NAME_LOCAL, slot);
 }
 
 static void compile_assign(Compiler *c, Stmt *s) {
@@ -933,35 +988,8 @@ static void compile_assign(Compiler *c, Stmt *s) {
         /* Evaluate the RHS which must leave N values on the stack (a call). */
         compile_expr(c, s->as.assign.value);
         int total = s->as.assign.extra_count + 1;
-        /* A native stdlib call returns its multi-value result as a single
-         * tuple array (spec §6.2), not as N stack values like a user
-         * function's multi-`ret`.  Detect that RHS shape and spread it with
-         * MOP_UNPACK so the STORE_LOCALs below receive the N values.  User
-         * function / method calls already leave N values, so they need no
-         * unpack. (Step 7-b) */
-        {
-            Expr *rhs = s->as.assign.value;
-            int rhs_is_native_call =
-                rhs && rhs->kind == EXPR_CALL &&
-                rhs->as.call.callee &&
-                rhs->as.call.callee->kind == EXPR_IDENT &&
-                strncmp(rhs->as.call.callee->as.ident, "myon.", 5) == 0;
-            /* A built-in method call (obj.method(...) where obj is an
-             * array/map/str, e.g. `mid, merr = ss.slice(1, 3)`) is executed
-             * by MOP_INVOKE, which reuses the tree-walk built-in and therefore
-             * leaves the multi-return as a single tuple array too (spec §6.2),
-             * exactly like a native call.  We cannot statically tell a built-in
-             * receiver from a user-struct receiver here, but struct methods
-             * returning multiple values into a multi-target assignment are not
-             * part of the MVM-supported surface, so emitting UNPACK for any
-             * method-call RHS is the correct, net-positive choice. (Step 7-b) */
-            int rhs_is_method_call =
-                rhs && rhs->kind == EXPR_CALL &&
-                rhs->as.call.callee &&
-                rhs->as.call.callee->kind == EXPR_MEMBER;
-            if (rhs_is_native_call || rhs_is_method_call)
-                chunk_emit_op_u8(ch, MOP_UNPACK, (uint8_t)total, line);
-        }
+        /* Every backend represents multiple returns as one tuple Value. */
+        chunk_emit_op_u8(ch, MOP_UNPACK, (uint8_t)total, line);
         /* Values are on the stack in order; store in reverse (spec §4.9). */
         /* First resolve/declare all target slots left-to-right so slot numbers
          * are stable, then emit STORE in reverse.  Each target is resolved with
@@ -998,9 +1026,11 @@ static void compile_assign(Compiler *c, Stmt *s) {
                         idx = rslot;
                     } else {
                         idx = declare_local(c, names[k]);
+                        bind_external_local(c, idx, names[k], line);
                     }
                 } else {
                     idx = declare_local(c, names[k]);
+                        bind_external_local(c, idx, names[k], line);
                 }
             }
             slots[k] = idx;
@@ -1013,14 +1043,16 @@ static void compile_assign(Compiler *c, Stmt *s) {
     /* simple / compound single-target assignment */
     if (s->as.assign.is_compound) {
         /* x op= v  ->  x = x op v */
-        int slot = resolve_local(c->fn, s->as.assign.name);
-        if (slot < 0)
-            compile_error(c, line, "compound assignment to undefined variable '%s'",
-                          s->as.assign.name);
-        chunk_emit_op_u16(ch, MOP_LOAD_LOCAL, (uint16_t)slot, line);
+        int slot;
+        NameKind kind = resolve_name(c, c->fn, s->as.assign.name, &slot);
+        if (kind == NAME_NONE && flat_external(c)) emit_external_name(c, line, s->as.assign.name, 0);
+        else {
+            if (kind == NAME_NONE) compile_error(c, line, "compound assignment to undefined variable '%s'", s->as.assign.name);
+            emit_var_load(c, line, kind, slot);
+        }
         compile_expr(c, s->as.assign.value);
         chunk_emit_op(ch, binary_opcode(s->as.assign.compound), line);
-        chunk_emit_op_u16(ch, MOP_STORE_LOCAL, (uint16_t)slot, line);
+        compile_assign_target_name(c, line, s->as.assign.name);
         return;
     }
 
@@ -1215,8 +1247,14 @@ static void compile_stmt(Compiler *c, Stmt *s) {
             } else if (myon_builtin_module_bit(path)) {
                 emit_module_instruction(c, s->line, "myon.__module_enable", path);
             } else if (strcmp(path, "external") == 0 || strncmp(path, "external.", 9) == 0) {
-                unsupported(c, s->line, "external module imports (module external.*)",
-                    "The MVM backend cannot yet load external modules; run the source instead.");
+                int p = module_add_const_str(c->module, path);
+                int a = module_add_const_str(c->module, s->as.module_decl.alias ? s->as.module_decl.alias : "");
+                chunk_emit_op_u16(ch, MOP_PUSH_CONST, p, s->line);
+                chunk_emit_op_u16(ch, MOP_PUSH_CONST, a, s->line);
+                int nid = module_add_native(c->module, "myon.__external_import");
+                chunk_emit_op_u16(ch, MOP_CALL_NATIVE, nid, s->line);
+                chunk_emit_byte(ch, 2, s->line);
+                chunk_emit_op(ch, MOP_POP, s->line);
             } else if (strcmp(path, "myon") == 0 || strncmp(path, "myon.", 5) == 0) {
                 compile_error(c, s->line, "unknown builtin module '%s'", path);
             } else {
@@ -1278,7 +1316,7 @@ static void compile_stmt(Compiler *c, Stmt *s) {
             Upvalue uv[MAX_UPVALUES]; int nuv = 0;
             int cidx = compile_function(c, s->as.func, s->as.func->name, NULL, uv, &nuv);
             emit_make_closure(c, s->line, cidx, uv, nuv);
-            chunk_emit_op_u16(cur_chunk(c), MOP_STORE_LOCAL, (uint16_t)slot, s->line);
+            emit_var_store(c, s->line, NAME_LOCAL, slot);
             break;
         }
         case STMT_STRUCT: {
@@ -1347,6 +1385,7 @@ static int compile_function(Compiler *c, FuncDecl *decl, const char *dbg_name,
      * remember the owning struct so `self.field` / `self.method()` inside the
      * body can be checked and dispatched statically.
      */
+    fn.is_method = self_struct != NULL;
     fn.binding_params = 1;
     int self_param = self_struct ? 1 : 0;
     if (self_struct) declare_local(c, "self");

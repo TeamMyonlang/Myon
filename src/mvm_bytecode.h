@@ -95,6 +95,7 @@ typedef enum {
     MOP_CALL         = 0x51,  /* u8 argc */
     MOP_RET          = 0x52,  /* u8 n */
     /* MVM closures (spec §7.3): captured outer variables live in boxed cells. */
+    MOP_BIND_EXTERNAL = 0x58, /* u16 slot, u16 name: resolve an imported binding once */
     MOP_RESET_LOCAL = 0x57, /* u16 slot: fresh binding/capture cell */
     MOP_LOAD_UPVALUE  = 0x53, /* u16 idx : push a copy of upvalues[idx] */
     MOP_STORE_UPVALUE = 0x54, /* u16 idx : pop, write into upvalues[idx] cell */
@@ -162,8 +163,9 @@ typedef enum {
  * MOP_SPAWN_ASYNC / MOP_AWAIT instructions for closures & async/await support.
  * Minor 2: builtin module activation/checks are emitted as native calls.
  * Minor 3: RESET_LOCAL separates binding lifetimes; package imports use the bridge.
+ * Minor 4: BIND_EXTERNAL connects local capture cells to imported namespaces.
  */
-#define MVM_VERSION_MINOR 3
+#define MVM_VERSION_MINOR 4
 #define MVM_ENDIAN_LITTLE 1
 
 /*

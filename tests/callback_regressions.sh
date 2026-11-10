@@ -4,7 +4,7 @@ set -eu
 MYON=${1:-./myon}
 scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT
-for name in p_native_callback_state p4_array_higher_order p_block_capture; do
+for name in p_native_callback_state p4_array_higher_order p_block_capture p_expose_capture; do
     "$MYON" --compile "tests/cases/$name.myon" -o "$scratch/$name.myc"
     "$MYON" "$scratch/$name.myc" > "$scratch/out"
     diff -u "tests/cases/$name.out" "$scratch/out"

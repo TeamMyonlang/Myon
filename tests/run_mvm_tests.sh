@@ -41,14 +41,14 @@ else
 fi
 run_to() { "$TIMEOUT_BIN" "$TIMEOUT" "$@"; }
 
-# Current limitations; actual exclusions still come from VM diagnostics.
-EXCLUDED_KNOWN=(p_module_alias)
+# All documented fixture limitations are implemented. Unexpected unsupported
+# diagnostics are still reported by the comparison below.
 
 scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT
 
 echo "== MVM .myon/.myc equality suite (Step 7-b) =="
-echo "   (documented exclusions: ${EXCLUDED_KNOWN[*]})"
+echo "   (documented exclusions: none)"
 echo
 
 pass=0

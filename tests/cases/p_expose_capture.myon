@@ -1,0 +1,32 @@
+module myon.array
+module myon.stdio
+callbacks = myon.array(func)
+{
+    n = 50
+    callbacks.push(myon.lambda(x: int) ret int { n = n + x; ret n })
+    myon.expose n
+    n = 70
+}
+f = callbacks[0]
+myon.print(f(2))
+myon.print(n)
+# Repeated publication updates the parent copy, keeping the original capture.
+{
+    x = 1
+    myon.expose x
+    x = 2
+    myon.expose x
+    x = 3
+    callbacks.push(myon.lambda() ret int { ret x })
+}
+myon.print(x)
+myon.print(callbacks[1]())
+myon.func nested() ret int {
+    {
+        local = 10
+        myon.expose local
+        local = 20
+    }
+    ret local
+}
+myon.print(nested())
