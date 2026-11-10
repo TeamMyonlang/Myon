@@ -18,6 +18,14 @@ myon.func make() ret func {
 }
 f = make()
 myon.print(f(2))
+keep = myon.array(func)
+{ n = 100; keep.push(myon.lambda(x: int) ret int { n += x; ret n }) }
+{ n = 200; keep.push(myon.lambda(x: int) ret int { n += x; ret n }) }
+myon.print(keep[0](1))
+myon.print(keep[1](1))
+n = 300
+myon.print(n)
+myon.print(keep[0](1))
 ghost = 99; Missing<int>()
 myon.print(x)
 myon.print(ghost)
@@ -46,7 +54,7 @@ quit
 MYON
 (cd tests/cases; "$MYON" --repl-mvm < "$scratch/input") > "$scratch/out" 2> "$scratch/err"
 sed -e '/^MVM backend\./d' -e '/^Myon REPL\./d' -e 's/myon> //g' -e 's/\.\.\.> //g' -e '/^$/d' "$scratch/out" > "$scratch/actual"
-printf '1\n7\n12\n5\n15\n6\n42\n42\n[17]\n25\n18\n9\ndone\n' > "$scratch/expected"
+printf '1\n7\n12\n101\n201\n300\n102\n5\n15\n6\n42\n42\n[17]\n25\n18\n9\ndone\n' > "$scratch/expected"
 diff -u "$scratch/expected" "$scratch/actual"
 grep -q 'unknown generic type' "$scratch/err"
 grep -q 'undefined external binding.*ghost' "$scratch/err"

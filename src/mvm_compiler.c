@@ -1327,7 +1327,9 @@ static void compile_stmt(Compiler *c, Stmt *s) {
             break;
         case STMT_FUNC: {
             /* declare the function name as a local, build closure, store it. */
-            int slot = declare_local(c, s->as.func->name);
+            int slot = c->repl && is_main_fn(c->fn) && c->fn->scope_depth == 0
+                ? find_in_current_scope(c->fn, s->as.func->name) : -1;
+            if (slot < 0) slot = declare_local(c, s->as.func->name);
             Upvalue uv[MAX_UPVALUES]; int nuv = 0;
             int cidx = compile_function(c, s->as.func, s->as.func->name, NULL, uv, &nuv);
             emit_make_closure(c, s->line, cidx, uv, nuv);
@@ -1566,7 +1568,15 @@ static Module *compile_program(Program *program, const char *source_path, MvmCom
 
     if (c->structs) myon_free(c->structs);
     Module *result = c->module;
-    if (session) session->root = *mainfn;
+    if (session) {
+        session->root = *mainfn;
+        /* Discarded scopes need no named slots in the next input. Old closures
+         * own their cells; RESET_LOCAL detaches reused storage from them. */
+        session->root.next_slot = 0;
+        for (int i = 0; i < mainfn->local_count; i++)
+            if (mainfn->locals[i].slot >= session->root.next_slot)
+                session->root.next_slot = mainfn->locals[i].slot + 1;
+    }
     myon_free(mainfn);
     myon_free(c);
     myon_alloc_scope_end(scope, false);

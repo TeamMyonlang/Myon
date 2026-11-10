@@ -38,6 +38,16 @@ int main(void) {
         value_collect_cycles();
         assert(value_live_allocations() == base);
     }
+    MvmRepl *long_session = mvm_repl_new();
+    input(long_session, "myon.func f() ret int { ret 1 }", 0);
+    for (int i = 0; i < 1030; i++) {
+        input(long_session, "{ temporary = 1 }", 0);
+        input(long_session, "myon.func f() ret int { ret 2 }", 0);
+    }
+    input(long_session, "f()", 0);
+    mvm_repl_free(long_session);
+    value_collect_cycles();
+    assert(value_live_allocations() == base);
     puts("MVM REPL ownership tests passed");
     return 0;
 }
