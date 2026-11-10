@@ -74,7 +74,8 @@ make win-cross WIN_OPENSSL_LDLIBS="-L/path/to/windows/openssl/lib -lcrypt32"
 ```
 
 引数なしで起動すると REPL に入ります。変数・関数・構造体はセッション中保持され、
-`exit`、`quit`、EOF で終了します。REPL はツリーウォーク実行のみです。
+`exit`、`quit`、EOF で終了します。既定はツリーウォークです。
+`myon --repl-mvm`（またはファイルなしの `myon --run-mvm`）で MVM REPL を起動します。
 
 ## 組み込みmoduleの宣言
 
@@ -113,7 +114,7 @@ MVM は標準ライブラリの一部をツリーウォーク側の実装と共�
 | パッケージの module 取り込み | 対応 | 対応（本体はツリーウォーク実行） |
 | 高階ネイティブメソッド `array.map/filter/reduce` での関数呼び出し | 対応 | 対応 |
 | FFI コールバック | 対応 | 対応 |
-| REPL | 対応 | 未対応 |
+| REPL | 対応 | 対応（`--repl-mvm`） |
 
 保存済み `.myc` は構造体宣言の AST を保持しないため、構造体を使う単体実行には制約があります。
 `--run-mvm` と保存済みバイトコードの検証範囲は [MVM 仕様7節](docs/mvm_spec.md#7-対応範囲と制約) を参照してください。

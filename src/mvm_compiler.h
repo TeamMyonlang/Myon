@@ -27,14 +27,11 @@
  * (src/mvm_chunk.h) of bytecode chunks + a shared constant pool, following the
  * instruction set fixed in the MVM spec.  It performs the static scope
  * resolution of §5 (compile-time local-slot assignment, shadowing rules,
- * myon.expose lifetime promotion) so the VM never has to search an Env at
+ * myon.expose copy publication) so the VM never has to search an Env at
  * runtime.
  *
- * Features that the MVM spec (§7) marks as out of scope — async/await,
- * myon.net / myon.http, myon.ffi, closures over outer locals, and generics —
- * are rejected here with a clear, diag-formatted compile error (the .myc is
- * not produced).  These are all funnelled through a single "unsupported"
- * reporting path so they are easy to lift later.
+ * File execution and interactive sessions use the same compiler. Interactive
+ * inputs stage new tables and slot bindings, committing only successful input.
  */
 
 /*
@@ -47,5 +44,11 @@
  * and used to fill mtime/size/hash; it does not need to be re-read.
  */
 Module *mvm_compile_program(Program *program, const char *source_path);
+typedef struct MvmCompileSession MvmCompileSession;
+MvmCompileSession *mvm_compile_session_new(void);
+void mvm_compile_session_free(MvmCompileSession *session);
+Module *mvm_compile_session_module(MvmCompileSession *session);
+/* Returns entry index or -1; all holds retained declarations, first is new input. */
+int mvm_compile_input(MvmCompileSession *session, Program *all, int first);
 
 #endif /* MYON_MVM_COMPILER_H */
