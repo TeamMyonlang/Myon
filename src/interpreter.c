@@ -5958,6 +5958,14 @@ static Expr bridge_make_call_expr(int line, int argc) {
     return e;
 }
 
+void myon_bridge_bind_external(Interp *it, UpvalueCell *cell, const char *name, int forbid_shadow) {
+    if (env_defined_local(it->global, name)) {
+        if (forbid_shadow) runtime_error(it, 0, "redefinition of '%s' shadows an outer variable (forbidden, spec 9.2)", name);
+        cell->alias_env = env_ref(it->global);
+        cell->alias_name = myon_strdup(name);
+    }
+}
+
 Value myon_bridge_call_function(Interp *it, Value fn, Value *args, int argc, int line) {
     Value *saved = it->bridge_args;
     int saved_argc = it->bridge_argc;
@@ -5972,6 +5980,30 @@ Value myon_bridge_call_function(Interp *it, Value fn, Value *args, int argc, int
 
 int myon_bridge_call_native(Interp *it, const char *name,
                             Value *args, int argc, int line, Value *out) {
+    if (!strcmp(name, "myon.__external_get") || !strcmp(name, "myon.__external_set")) {
+        int store = !strcmp(name, "myon.__external_set");
+        if (argc != (store ? 2 : 1) || args[argc-1].type != TYPE_STR)
+            runtime_error(it, line, "invalid external binding instruction");
+        const char *binding = args[argc-1].as.obj->as.str;
+        if (store) {
+            if (env_defined_local(it->global, binding)) env_set(it->global, binding, value_copy(&args[0]));
+            else env_define(it->global, binding, value_copy(&args[0]));
+            *out = value_void();
+        } else if (!env_get(it->global, binding, out)) runtime_error(it, line, "undefined external binding '%s'", binding);
+        return 1;
+    }
+    if (!strcmp(name, "myon.__external_import")) {
+        if (argc != 2 || args[0].type != TYPE_STR || args[1].type != TYPE_STR)
+            runtime_error(it, line, "invalid external import instruction");
+        Stmt decl; memset(&decl, 0, sizeof(decl)); decl.kind = STMT_MODULE; decl.line = line;
+        decl.as.module_decl.path = args[0].as.obj->as.str;
+        decl.as.module_decl.alias = args[1].as.obj->as.str[0] ? args[1].as.obj->as.str : NULL;
+        Value *saved = it->bridge_args; int count = it->bridge_argc;
+        it->bridge_args = NULL; it->bridge_argc = 0;
+        load_external_module(it, &decl);
+        it->bridge_args = saved; it->bridge_argc = count;
+        *out = value_void(); return 1;
+    }
     if (strcmp(name, "myon.__package_import") == 0 || strcmp(name, "myon.__package_member") == 0) {
         if (argc != 2 || args[0].type != TYPE_STR || args[1].type != TYPE_STR)
             runtime_error(it, line, "invalid package instruction");

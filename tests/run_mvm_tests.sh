@@ -42,7 +42,7 @@ fi
 run_to() { "$TIMEOUT_BIN" "$TIMEOUT" "$@"; }
 
 # Current limitations; actual exclusions still come from VM diagnostics.
-EXCLUDED_KNOWN=(p_module_alias)
+EXCLUDED_KNOWN=()
 
 scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT

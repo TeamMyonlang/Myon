@@ -164,6 +164,8 @@ void myon_bridge_call_method(Interp *it, Value recv, const char *method,
 /* fn and args are borrowed; result ownership transfers to the VM. */
 Value myon_bridge_call_function(Interp *it, Value fn, Value *args, int argc, int line);
 
+void myon_bridge_bind_external(Interp *it, UpvalueCell *cell, const char *name, int forbid_shadow);
+
 /* ---- async/await seam for the MVM (spec §14.9) --------------------------- */
 /*
  * The MVM realizes cooperative async by running each async function body as a

@@ -126,6 +126,8 @@ typedef struct {
 typedef struct UpvalueCell {
     ValueGC gc;
     Value value;
+    Env *alias_env; /* optional owned external namespace */
+    char *alias_name;
     int   refcount;
 } UpvalueCell;
 
@@ -210,6 +212,8 @@ int   array_pop(Value *av, Value *out);   /* returns 0 if empty */
 /* ---- MVM upvalue cells (boxed captured variables, spec §7.3) ---- */
 UpvalueCell *upvalue_cell_new(Value initial /* owned */);
 UpvalueCell *upvalue_cell_ref(UpvalueCell *c);     /* bump refcount, returns c */
+Value upvalue_cell_get(UpvalueCell *c);
+void upvalue_cell_set(UpvalueCell *c, Value v);
 void         upvalue_cell_unref(UpvalueCell *c);   /* drop one ref, free at 0 */
 
 /* map helpers */

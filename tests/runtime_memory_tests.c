@@ -312,6 +312,20 @@ static void closure_environments(void) {
     env_free(parent);
     assert(value_live_allocations() == base);
 
+    /* Imported aliases participate in the same environment/cell cycle graph. */
+    parent = env_new(NULL);
+    first = value_func(NULL, NULL);
+    UpvalueCell *alias = upvalue_cell_new(value_nil());
+    alias->alias_env = env_ref(parent);
+    alias->alias_name = myon_strdup("callback");
+    first.as.obj->as.fn.upvalues = myon_xmalloc(sizeof(alias));
+    first.as.obj->as.fn.upvalues[0] = alias;
+    first.as.obj->as.fn.upvalue_count = 1;
+    assert(env_define(parent, "callback", first));
+    env_free(parent);
+    value_collect_cycles();
+    assert(value_live_allocations() == base);
+
     for (int i = 0; i < 10000; i++) {
         parent = env_new(NULL);
         child = env_new(parent);

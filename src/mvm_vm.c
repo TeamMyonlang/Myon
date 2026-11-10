@@ -119,10 +119,10 @@ typedef struct {
      * When the outermost frame returns (frame_count 1->0), the <main> entry
      * chunk discards its return value.  An async task body, however, runs its
      * function chunk *as* the outermost frame and needs that value delivered to
-     * async_vm_body.  This flag tells RET to leave the return value(s) on the
+     * async_vm_body. This flag tells RET to leave the result on the
      * operand stack instead of discarding them (spec §14.9).
      */
-    int      keep_top_return; /* 1: async single result; 2: native tuple result */
+    int      keep_top_return; /* async/native invocation returns its owned result */
 } VM;
 
 /* Convenience accessors so most code keeps reading VM_MODULE(vm) etc. */
@@ -546,6 +546,12 @@ static int run(VM *vm) {
 
         /* local variables (frame-relative).  A captured slot lives in a boxed
          * cell (spec §7.3) so closures share it; read/write through the cell. */
+        case MOP_BIND_EXTERNAL: {
+            uint16_t slot = read_u16(f), name = read_u16(f);
+            const char *binding = VM_MODULE(vm)->consts[name].value.as.obj->as.str;
+            myon_bridge_bind_external(VM_BRIDGE(vm), f->cells[slot & 0x7fff], binding, slot & 0x8000);
+            break;
+        }
         case MOP_RESET_LOCAL: {
             uint16_t slot = read_u16(f);
             if (f->cells && f->cells[slot]) {
@@ -564,7 +570,7 @@ static int run(VM *vm) {
         case MOP_LOAD_LOCAL: {
             uint16_t slot = read_u16(f);
             if (f->cells && f->cells[slot])
-                vm_push(vm, value_copy(&f->cells[slot]->value));
+                vm_push(vm, upvalue_cell_get(f->cells[slot]));
             else if (f->globals_frame)
                 vm_push(vm, value_copy(&vm->sh->globals[slot]));
             else
@@ -575,8 +581,7 @@ static int run(VM *vm) {
             uint16_t slot = read_u16(f);
             Value v = vm_pop(vm);
             if (f->cells && f->cells[slot]) {
-                value_free(&f->cells[slot]->value);
-                f->cells[slot]->value = v;
+                upvalue_cell_set(f->cells[slot], v);
             } else if (f->globals_frame) {
                 value_free(&vm->sh->globals[slot]);
                 vm->sh->globals[slot] = v;
@@ -591,7 +596,7 @@ static int run(VM *vm) {
             uint16_t idx = read_u16(f);
             if (idx >= (uint16_t)f->upvalue_count || !f->upvalues || !f->upvalues[idx])
                 vm_error(vm, line, "internal: bad upvalue index %u", idx);
-            vm_push(vm, value_copy(&f->upvalues[idx]->value));
+            vm_push(vm, upvalue_cell_get(f->upvalues[idx]));
             break;
         }
         case MOP_STORE_UPVALUE: {
@@ -599,8 +604,7 @@ static int run(VM *vm) {
             if (idx >= (uint16_t)f->upvalue_count || !f->upvalues || !f->upvalues[idx])
                 vm_error(vm, line, "internal: bad upvalue index %u", idx);
             Value v = vm_pop(vm);
-            value_free(&f->upvalues[idx]->value);
-            f->upvalues[idx]->value = v;
+            upvalue_cell_set(f->upvalues[idx], v);
             break;
         }
         /* globals: shared top-level (<main>) slots (spec §4.6 note).  Held in a
@@ -721,25 +725,19 @@ static int run(VM *vm) {
                 value_free(&d);
             }
             vm->frame_count--;
-            for (int i = 0; i < n; i++) vm_push(vm, rets[i]);
+            /* Calls crossing the tree/VM boundary use the same tuple Value. */
+            Value result;
+            if (n == 1) result = rets[0];
+            else {
+                result = value_array(NULL);
+                for (int i = 0; i < n; i++) array_push(&result, rets[i]);
+            }
             if (vm->frame_count == 0) {
-                /* Outermost frame returned.  For the <main> entry chunk the
-                 * return value is discarded; for an async task body it must be
-                 * left on the stack so async_vm_body can hand it to the awaiter
-                 * (spec §14.9).  RET normalized n>=1 above, so the task result
-                 * is the single top value; drop any extra straggler returns. */
-                if (vm->keep_top_return == 2 && n > 1) {
-                    Value tuple = value_array(NULL);
-                    for (int i = 0; i < n; i++) array_push(&tuple, rets[i]);
-                    vm->sp -= n; /* ownership moved into the tuple */
-                    vm_push(vm, tuple);
-                } else if (vm->keep_top_return) {
-                    for (int i = 0; i < n - 1; i++) { Value d = vm_pop(vm); value_free(&d); }
-                } else {
-                    for (int i = 0; i < n; i++) { Value d = vm_pop(vm); value_free(&d); }
-                }
+                if (vm->keep_top_return) vm_push(vm, result);
+                else value_free(&result);
                 return 0;
             }
+            vm_push(vm, result);
             f = &vm->frames[vm->frame_count - 1];
             break;
         }

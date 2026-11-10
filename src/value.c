@@ -202,6 +202,7 @@ Value value_func(FuncDecl *decl, Env *closure) {
 UpvalueCell *upvalue_cell_new(Value initial) {
     gc_before_alloc();
     UpvalueCell *c = (UpvalueCell *)myon_xmalloc(sizeof(UpvalueCell));
+    c->alias_env = NULL; c->alias_name = NULL;
     c->value = initial;   /* takes ownership */
     c->refcount = 1;
     gc_register(&c->gc, c, &c->refcount, GC_UPVALUE);
@@ -218,8 +219,19 @@ void upvalue_cell_unref(UpvalueCell *c) {
     if (--c->refcount <= 0) {
         gc_unregister(&c->gc);
         value_free(&c->value);
+        env_free(c->alias_env); myon_free(c->alias_name);
         myon_free(c);
     }
+}
+
+Value upvalue_cell_get(UpvalueCell *c) {
+    Value v;
+    if (c->alias_env && env_get(c->alias_env, c->alias_name, &v)) return v;
+    return value_copy(&c->value);
+}
+void upvalue_cell_set(UpvalueCell *c, Value v) {
+    if (c->alias_env) env_set(c->alias_env, c->alias_name, v);
+    else { value_free(&c->value); c->value = v; }
 }
 
 Value value_task(void *task) {
@@ -333,7 +345,9 @@ static void gc_value_edge(Value *v, void (*visit)(ValueGC *, void *), void *ud) 
 }
 static void gc_edges(ValueGC *g, void (*visit)(ValueGC *, void *), void *ud) {
     if (g->kind == GC_UPVALUE) {
-        gc_value_edge(&((UpvalueCell *)g->owner)->value, visit, ud);
+        UpvalueCell *c = g->owner;
+        gc_value_edge(&c->value, visit, ud);
+        if (c->alias_env) visit(&c->alias_env->gc, ud);
         return;
     }
     if (g->kind == GC_ENV) {
@@ -414,7 +428,10 @@ void value_collect_cycles(void) {
     /* Suppress decrements between dead nodes during payload destruction, and
      * delay freeing node storage until every edge has been released. */
     for (ValueGC *g = dead; g; g = g->work) {
-        if (g->kind == GC_UPVALUE) value_free(&((UpvalueCell *)g->owner)->value);
+        if (g->kind == GC_UPVALUE) {
+            UpvalueCell *c = g->owner;
+            value_free(&c->value); env_free(c->alias_env); myon_free(c->alias_name);
+        }
         else if (g->kind == GC_ENV) env_destroy_payload((Env *)g->owner);
         else obj_destroy_payload((Obj *)g->owner);
     }

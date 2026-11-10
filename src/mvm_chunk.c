@@ -48,6 +48,7 @@ const char *mvm_opcode_name(uint8_t op) {
         case MOP_NOT:          return "NOT";
         case MOP_LOAD_LOCAL:   return "LOAD_LOCAL";
         case MOP_STORE_LOCAL:  return "STORE_LOCAL";
+        case MOP_BIND_EXTERNAL: return "BIND_EXTERNAL";
         case MOP_RESET_LOCAL: return "RESET_LOCAL";
         case MOP_LOAD_GLOBAL:  return "LOAD_GLOBAL";
         case MOP_STORE_GLOBAL: return "STORE_GLOBAL";
@@ -106,6 +107,7 @@ int mvm_opcode_operand_bytes(uint8_t op) {
         case MOP_NEW_ARRAY: case MOP_NEW_MAP:
         case MOP_NEW_STRUCT: case MOP_GET_FIELD: case MOP_SET_FIELD:
             return 2;
+        case MOP_BIND_EXTERNAL: return 4;
         /* one u8 */
         case MOP_CALL: case MOP_RET: case MOP_UNPACK:
         case MOP_SPAWN_ASYNC:
@@ -438,6 +440,9 @@ void mvm_chunk_disassemble(const Module *m, const Chunk *c, FILE *out) {
                 fprintf(out, "%-14s %u\t; %s\n", name, idx, const_render(m, idx, buf, sizeof buf));
                 break;
             }
+            case MOP_BIND_EXTERNAL:
+                fprintf(out, "%-14s %u %u\n", name, rd_u16(p), rd_u16(p + 2));
+                break;
             case MOP_RESET_LOCAL:
             case MOP_LOAD_LOCAL:
             case MOP_STORE_LOCAL:
