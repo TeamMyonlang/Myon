@@ -103,6 +103,8 @@ int interp_run(Interp *it, Program *program);
  */
 Interp *myon_bridge_interp_new(void);
 void    myon_bridge_interp_free(Interp *it);
+/* Recover one interactive input, preserving globals and loaded modules. */
+void myon_bridge_recover_input(Interp *it);
 
 /*
  * The interpreter's runtime-error longjmp target.  The VM installs its own

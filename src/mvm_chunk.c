@@ -155,6 +155,7 @@ Module *module_new(void) {
 
 static void chunk_free(Chunk *c) {
     if (!c) return;
+    if (!c) return;
     myon_free(c->name);
     myon_free(c->code);
     myon_free(c->lines);
@@ -175,6 +176,41 @@ void module_free(Module *m) {
     myon_free(m->chunks);
     myon_free(m->src_path);
     myon_free(m);
+}
+
+Module *module_fork(Module *old) {
+    Module *m = module_new();
+    m->const_count = m->const_cap = old->const_count;
+    if (m->const_count) m->consts = myon_xmalloc((size_t)m->const_count * sizeof(*m->consts));
+    for (int i = 0; i < m->const_count; i++) {
+        m->consts[i] = old->consts[i];
+        m->consts[i].value = value_copy(&old->consts[i].value);
+        m->consts[i].typespec = typespec_clone(old->consts[i].typespec);
+    }
+    for (int i = 0; i < old->native_count; i++) module_add_native(m, old->natives[i]);
+    for (int i = 0; i < old->chunk_count; i++) module_add_chunk(m, old->chunks[i]->name);
+    return m;
+}
+void module_adopt(Module *m, Module *candidate) {
+    for (int i = 0; i < m->const_count; i++) {
+        value_free(&candidate->consts[i].value);
+        typespec_free(candidate->consts[i].typespec);
+        candidate->consts[i] = m->consts[i];
+        m->consts[i].value = value_nil(); m->consts[i].typespec = NULL;
+    }
+    for (int i = 0; i < m->native_count; i++) {
+        myon_free(candidate->natives[i]);
+        candidate->natives[i] = m->natives[i]; m->natives[i] = NULL;
+    }
+    for (int i = 0; i < m->chunk_count; i++) {
+        chunk_free(candidate->chunks[i]);
+        candidate->chunks[i] = m->chunks[i];
+        m->chunks[i] = NULL;
+    }
+    Module old = *m;
+    *m = *candidate;
+    *candidate = old;
+    module_free(candidate);
 }
 
 int module_add_chunk(Module *m, const char *name) {

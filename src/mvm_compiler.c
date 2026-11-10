@@ -121,7 +121,21 @@ typedef struct {
     int          struct_cap;
     jmp_buf   on_error;        /* longjmp target on a compile error */
     int        had_error;
+    int        repl;
 } Compiler;
+
+struct MvmCompileSession {
+    Module *module;
+    FnComp root;
+};
+MvmCompileSession *mvm_compile_session_new(void) {
+    MvmCompileSession *s = myon_xmalloc(sizeof(*s));
+    memset(s, 0, sizeof(*s)); s->module = module_new(); return s;
+}
+void mvm_compile_session_free(MvmCompileSession *s) {
+    if (s) { module_free(s->module); myon_free(s); }
+}
+Module *mvm_compile_session_module(MvmCompileSession *s) { return s->module; }
 
 /* ================================================================== */
 /* Error reporting (diag-formatted, spec §7.2)                         */
@@ -296,6 +310,7 @@ static int declare_local(Compiler *c, const char *name) {
 /* Open a new lexical scope.  `is_block` marks an explicit `{ }` block so the
  * §9.2 shadowing rule applies (see FnComp.depth_is_block). */
 static int flat_external(Compiler *c) {
+    if (c->repl) return 1;
     for (int i = 0; i < c->program->stmts.count; i++) {
         Stmt *s = c->program->stmts.items[i];
         if (s->kind == STMT_MODULE && !s->as.module_decl.alias &&
@@ -1465,21 +1480,23 @@ static void fill_source_info(Module *m, const char *path) {
 /* entry point                                                         */
 /* ================================================================== */
 
-Module *mvm_compile_program(Program *program, const char *source_path) {
+static Module *compile_program(Program *program, const char *source_path, MvmCompileSession *session, int first) {
     MyonAllocScope *scope = myon_alloc_scope_begin();
     Compiler *c = myon_xmalloc(sizeof(*c));
     memset(c, 0, sizeof(*c));
-    c->module = module_new();
+    c->module = session ? module_fork(session->module) : module_new();
+    c->repl = session != NULL;
     c->program = program;
 
     /* top-level main chunk */
     int main_idx = module_add_chunk(c->module, "<main>");
     c->module->entry_chunk = main_idx;
 
-    FnComp mainfn;
-    memset(&mainfn, 0, sizeof(mainfn));
-    mainfn.chunk_idx = main_idx;
-    c->fn = &mainfn;
+    FnComp *mainfn = myon_xmalloc(sizeof(*mainfn));
+    if (session) *mainfn = session->root;
+    else memset(mainfn, 0, sizeof(*mainfn));
+    mainfn->chunk_idx = main_idx;
+    c->fn = mainfn;
 
     if (setjmp(c->on_error)) {
         /* compile error already reported */
@@ -1493,7 +1510,11 @@ Module *mvm_compile_program(Program *program, const char *source_path) {
      * references (e.g. a method returning another struct) resolve. */
     for (int i = 0; i < program->stmts.count; i++)
         if (program->stmts.items[i]->kind == STMT_STRUCT)
-            register_struct(c, program->stmts.items[i]->as.struct_decl);
+        {
+            StructDecl *sd = program->stmts.items[i]->as.struct_decl;
+            if (session && find_struct(c, sd->name)) compile_error(c, 0, "redefinition of struct '%s'", sd->name);
+            register_struct(c, sd);
+        }
 
     /* Resolve parents and validate the inheritance chain, mirroring the
      * tree-walk interpreter's prescan (spec 14.6): a subclass may not
@@ -1518,29 +1539,45 @@ Module *mvm_compile_program(Program *program, const char *source_path) {
     }
 
     for (int builtin = 1; builtin >= 0; builtin--)
-        for (int i = 0; i < program->stmts.count; i++) {
+        for (int i = first; i < program->stmts.count; i++) {
             Stmt *s = program->stmts.items[i];
             if (s->kind == STMT_MODULE && !!myon_builtin_module_bit(s->as.module_decl.path) == builtin)
                 compile_stmt(c, s);
         }
-    for (int i = 0; i < program->stmts.count; i++)
+    for (int i = first; i < program->stmts.count; i++)
         if (program->stmts.items[i]->kind != STMT_MODULE)
             compile_stmt(c, program->stmts.items[i]);
+
+    if (c->module->chunk_count > (int)UINT16_MAX + 1 ||
+        c->module->const_count > (int)UINT16_MAX + 1 ||
+        c->module->native_count > (int)UINT16_MAX + 1)
+        compile_error(c, 0, "bytecode table limit exceeded (65536 entries)");
 
     /* main returns nothing */
     chunk_emit_op_u8(cur_chunk(c), MOP_RET, 0, 0);
 
     Chunk *mc = cur_chunk(c);
     mc->num_params = 0;
-    mc->num_locals = (uint16_t)mainfn.max_slot;
+    mc->num_locals = (uint16_t)mainfn->max_slot;
     mc->ret_count  = 0;
     /* Box main-frame block bindings; depth-zero bindings remain globals. */
-    fill_captured_bitmap(mc, &mainfn);
+    fill_captured_bitmap(mc, mainfn);
     fill_source_info(c->module, source_path);
 
     if (c->structs) myon_free(c->structs);
     Module *result = c->module;
+    if (session) session->root = *mainfn;
+    myon_free(mainfn);
     myon_free(c);
     myon_alloc_scope_end(scope, false);
     return result;
+}
+
+Module *mvm_compile_program(Program *p, const char *path) { return compile_program(p, path, NULL, 0); }
+int mvm_compile_input(MvmCompileSession *s, Program *all, int first) {
+    Module *candidate = compile_program(all, NULL, s, first);
+    if (!candidate) return -1;
+    int entry = candidate->entry_chunk;
+    module_adopt(s->module, candidate);
+    return entry;
 }

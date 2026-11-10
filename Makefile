@@ -165,7 +165,7 @@ $(ASAN_BIN): $(SOURCES) src/unicode_case_data.inc src/unicode.h src/value.h src/
 # the CI TODO). Sanitizer failures use exit 99, distinct from language errors.
 # ASAN_OPTIONS/UBSAN_OPTIONS/LSAN_OPTIONS enable all three checks and fail
 # with a non-zero exit so the failure surfaces as a red CI step.
-test-asan: $(ASAN_BIN) $(BUILD)/unicode_case_asan $(BUILD)/runtime_memory_asan $(BUILD)/lsan_probe $(BUILD)/error_cleanup_asan | $(BUILD)
+test-asan: $(ASAN_BIN) $(BUILD)/unicode_case_asan $(BUILD)/runtime_memory_asan $(BUILD)/lsan_probe $(BUILD)/error_cleanup_asan $(BUILD)/repl_memory_asan | $(BUILD)
 	@echo "== Myon sanitizer (ASan/UBSan/LSan) test run =="
 	@set -e; \
 	restore() { \
@@ -194,6 +194,8 @@ test-asan: $(ASAN_BIN) $(BUILD)/unicode_case_asan $(BUILD)/runtime_memory_asan $
 	./tests/run_tests.sh; \
 	./tests/mvm_compiler_tests.sh; \
 	if [ -f ./tests/run_mvm_tests.sh ]; then ./tests/run_mvm_tests.sh; fi; \
+	$(BUILD)/repl_memory_asan > /dev/null; \
+	bash tests/repl_mvm_regressions.sh ./myon; \
 	bash tests/external_mvm_regressions.sh ./myon; \
 	bash tests/package_mvm_regressions.sh ./myon; \
 	bash tests/callback_regressions.sh ./myon; \
@@ -295,7 +297,7 @@ clean:
 RUNTIME_TEST_SRCS = tests/runtime_memory_tests.c src/value.c src/types.c \
                     src/ast.c src/common.c src/event_loop.c src/env.c
 .PHONY: test-runtime
-test-runtime: all test-unicode $(BUILD)/error_cleanup_tests | $(BUILD)
+test-runtime: all test-unicode $(BUILD)/error_cleanup_tests $(BUILD)/repl_memory_tests | $(BUILD)
 	$(CC) $(CFLAGS) -Isrc $(RUNTIME_TEST_SRCS) $(LDLIBS) -o $(BUILD)/runtime_memory_tests
 	$(BUILD)/runtime_memory_tests
 	$(BUILD)/error_cleanup_tests tree tests/cases/*.err
@@ -306,6 +308,8 @@ test-runtime: all test-unicode $(BUILD)/error_cleanup_tests | $(BUILD)
 	bash tests/string_regressions.sh ./$(BIN)
 	bash tests/numeric_regressions.sh ./$(BIN)
 	bash tests/harness_regressions.sh
+	$(BUILD)/repl_memory_tests > /dev/null
+	bash tests/repl_mvm_regressions.sh ./$(BIN)
 
 # LSan uses the complete sanitizer suite, including expected-error paths.
 .PHONY: test-lsan
@@ -335,4 +339,9 @@ ERROR_TEST_SRCS = $(filter-out src/main.c,$(SOURCES))
 $(BUILD)/error_cleanup_tests: tests/error_cleanup_tests.c $(filter-out $(BUILD)/main.o,$(OBJECTS)) | $(BUILD)
 	$(CC) $(CFLAGS) -Isrc $< $(filter-out $(BUILD)/main.o,$(OBJECTS)) $(LDLIBS) -o $@
 $(BUILD)/error_cleanup_asan: tests/error_cleanup_tests.c $(ERROR_TEST_SRCS) $(wildcard src/*.h) | $(BUILD)
+	$(ASAN_CC) $(ASAN_CFLAGS) -Isrc $< $(ERROR_TEST_SRCS) $(ASAN_LDLIBS) -o $@
+
+$(BUILD)/repl_memory_tests: tests/repl_memory_tests.c $(filter-out $(BUILD)/main.o,$(OBJECTS)) | $(BUILD)
+	$(CC) $(CFLAGS) -Isrc $< $(filter-out $(BUILD)/main.o,$(OBJECTS)) $(LDLIBS) -o $@
+$(BUILD)/repl_memory_asan: tests/repl_memory_tests.c $(ERROR_TEST_SRCS) $(wildcard src/*.h) | $(BUILD)
 	$(ASAN_CC) $(ASAN_CFLAGS) -Isrc $< $(ERROR_TEST_SRCS) $(ASAN_LDLIBS) -o $@

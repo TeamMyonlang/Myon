@@ -56,5 +56,10 @@
  * (message already printed in the tree-walker's format, spec §8).
  */
 int mvm_run_module(Module *m, Program *program, const char *source);
+typedef struct MvmRepl MvmRepl;
+MvmRepl *mvm_repl_new(void);
+/* Consumes program on success and failure. Text is copied for diagnostics. */
+int mvm_repl_run(MvmRepl *repl, Program *program, const char *source);
+void mvm_repl_free(MvmRepl *repl);
 
 #endif /* MYON_MVM_VM_H */

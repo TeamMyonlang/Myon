@@ -25,6 +25,7 @@
  */
 
 #include "mvm_vm.h"
+#include "mvm_compiler.h"
 
 #include "value.h"
 #include "types.h"
@@ -305,8 +306,12 @@ static void frame_open_cells(VM *vm, Frame *f) {
         if (i < (int)c->captured_len && c->captured[i]) {
             /* move the slot's value into a fresh cell */
             Value *slot = f->globals_frame ? &vm->sh->globals[i] : &vm->stack[f->base + i];
-            f->cells[i] = upvalue_cell_new(*slot);
-            *slot = value_nil();
+            if (f->globals_frame && vm->sh->global_cells[i])
+                f->cells[i] = upvalue_cell_ref(vm->sh->global_cells[i]);
+            else {
+                f->cells[i] = upvalue_cell_new(*slot);
+                *slot = value_nil();
+            }
         } else {
             f->cells[i] = NULL;
         }
@@ -507,6 +512,7 @@ static int run(VM *vm) {
         size_t off = (size_t)(f->ip - f->chunk->code);
         int line = line_for(f->chunk, off);
         vm->cur_line = line;
+        if (f->chunk->repl_source) diag_set_source(f->chunk->repl_source);
         uint8_t op = read_u8(f);
 
         switch (op) {
@@ -1075,4 +1081,98 @@ int mvm_run_module(Module *m, Program *program, const char *source) {
     myon_bridge_interp_free(sh.bridge);
     if (source) diag_clear_source();
     return rc;
+}
+
+/* Interactive sessions retain modules, namespaces and ASTs independently of
+ * the temporary dispatch stack for each input. Compiler transactions append
+ * chunks without invalidating frames belonging to suspended daemon tasks. */
+typedef struct ReplUnit {
+    Program *program;
+    char *source;
+    struct ReplUnit *next;
+} ReplUnit;
+struct MvmRepl {
+    MvmCompileSession *compiler;
+    VMShared shared;
+    Program history; /* borrowed statements; ReplUnits own their ASTs */
+    ReplUnit *units;
+};
+MvmRepl *mvm_repl_new(void) {
+    MvmRepl *r = myon_xmalloc(sizeof(*r));
+    memset(r, 0, sizeof(*r));
+    r->compiler = mvm_compile_session_new();
+    r->shared.module = mvm_compile_session_module(r->compiler);
+    r->shared.program = &r->history;
+    r->shared.bridge = myon_bridge_interp_new();
+    myon_bridge_set_vm_caller(r->shared.bridge, call_vm_callback, &r->shared);
+    /* Same local-slot limit as the compiler; no global pointers move on yield. */
+    r->shared.globals = myon_xmalloc(1024 * sizeof(Value));
+    r->shared.global_cells = calloc(1024, sizeof(UpvalueCell *));
+    if (!r->shared.global_cells) exit(70);
+    for (int i = 0; i < 1024; i++) r->shared.globals[i] = value_nil();
+    return r;
+}
+int mvm_repl_run(MvmRepl *r, Program *program, const char *source) {
+    int first = r->history.stmts.count;
+    int total = first + program->stmts.count;
+    r->history.stmts.items = myon_xrealloc(r->history.stmts.items,
+        (size_t)(total ? total : 1) * sizeof(Stmt *));
+    for (int i = 0; i < program->stmts.count; i++)
+        r->history.stmts.items[first + i] = program->stmts.items[i];
+    r->history.stmts.count = total;
+    diag_set_source(source);
+    int old_chunks = r->shared.module->chunk_count;
+    int entry = mvm_compile_input(r->compiler, &r->history, first);
+    if (entry < 0) {
+        r->history.stmts.count = first;
+        program_free(program); diag_clear_source(); return 65;
+    }
+    ReplUnit *unit = myon_xmalloc(sizeof(*unit));
+    unit->program = program; unit->source = myon_strdup(source);
+    unit->next = r->units; r->units = unit;
+    for (int i = old_chunks; i < r->shared.module->chunk_count; i++)
+        r->shared.module->chunks[i]->repl_source = unit->source;
+    Chunk *ec = module_chunk(r->shared.module, entry);
+    r->shared.global_count = ec->num_locals;
+    VM *vm = myon_xmalloc(sizeof(*vm));
+    memset(vm, 0, sizeof(*vm)); vm->sh = &r->shared;
+    volatile int rc = 0;
+    if (setjmp(vm->on_error) == 0) {
+        jmp_buf *barrier = myon_bridge_error_buf(r->shared.bridge);
+        if (setjmp(*barrier) == 0) {
+            Frame *f = &vm->frames[vm->frame_count++];
+            f->chunk = ec; f->ip = ec->code; f->fn_slot = -1;
+            f->globals_frame = 1;
+            frame_open_cells(vm, f);
+            for (int i = 0; i < r->shared.global_count; i++) {
+                if (f->cells && r->shared.global_cells[i] != f->cells[i]) {
+                    upvalue_cell_unref(r->shared.global_cells[i]);
+                    r->shared.global_cells[i] = upvalue_cell_ref(f->cells[i]);
+                }
+            }
+            run(vm);
+            myon_bridge_drain_tasks(r->shared.bridge);
+        } else rc = 1;
+    } else rc = 1;
+    callback_vm_cleanup(vm);
+    if (rc) myon_bridge_recover_input(r->shared.bridge);
+    diag_clear_source();
+    return rc;
+}
+void mvm_repl_free(MvmRepl *r) {
+    if (!r) return;
+    myon_bridge_interp_free(r->shared.bridge);
+    for (int i = 0; i < r->shared.global_count; i++) {
+        value_free(&r->shared.globals[i]);
+        upvalue_cell_unref(r->shared.global_cells[i]);
+    }
+    free(r->shared.globals); free(r->shared.global_cells);
+    mvm_compile_session_free(r->compiler);
+    while (r->units) {
+        ReplUnit *next = r->units->next;
+        program_free(r->units->program); free(r->units->source); free(r->units);
+        r->units = next;
+    }
+    free(r->history.stmts.items); free(r);
+    value_collect_cycles();
 }

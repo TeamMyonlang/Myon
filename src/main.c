@@ -117,8 +117,7 @@ static void usage(const char *prog) {
         "  * A file argument is dispatched by content/extension: a MYC1 bytecode blob\n"
         "    (or a .myc name) runs on the MVM VM; anything else runs on the tree-walking\n"
         "    interpreter.  '-' always means stdin (treated as source).\n"
-        "  * The REPL currently uses the tree-walking interpreter only; an MVM-backed\n"
-        "    REPL is a future item.\n"
+        "  * --repl-mvm (or --run-mvm without a file) starts the MVM REPL.\n"
         "  * --run-mvm <src> compiles a .myon in memory and runs it on the MVM VM.\n"
         "    It is an internal cross-check used by the .myon/.myc equality test suite\n"
         "    (tests/run_mvm_tests.sh); normal execution does not need it.\n",
@@ -374,8 +373,10 @@ static int repl_input_complete(const char *src) {
     return depth <= 0;
 }
 
-static int run_repl(void) {
-    Interp *it = interp_create();
+static int run_repl(int use_mvm) {
+    Interp *it = use_mvm ? NULL : interp_create();
+    MvmRepl *vm_repl = use_mvm ? mvm_repl_new() : NULL;
+    if (use_mvm) fputs("MVM backend.\n", stdout);
     printf("Myon REPL. Type 'exit' or 'quit' to leave (Ctrl+D also works).\n");
 
     size_t cap = 256, len = 0;
@@ -435,7 +436,8 @@ static int run_repl(void) {
             if (program) {
                 /* interp_run installs its own setjmp barrier: a runtime error
                  * aborts only this input, the REPL keeps going. */
-                interp_run(it, program);
+                if (vm_repl) mvm_repl_run(vm_repl, program, buf);
+                else interp_run(it, program);
             }
             /* tokens are referenced by retained AST lexemes? No: the parser
              * copies what it needs into the AST, so freeing tokens is safe. */
@@ -451,6 +453,7 @@ static int run_repl(void) {
 
     free(buf);
     interp_free(it);
+    mvm_repl_free(vm_repl);
     return 0;
 }
 
@@ -577,6 +580,7 @@ int main(int argc, char **argv) {
         return pkg_cli_main(argc - 2, argv + 2);
     }
 
+    int repl_mvm = 0;
     int tokens_only = 0;
     int strict_stale = 0;
     const char *path = NULL;
@@ -617,7 +621,8 @@ int main(int argc, char **argv) {
             script_argc = argc - i;
             break;
         }
-        if (strcmp(argv[i], "--tokens") == 0) tokens_only = 1;
+        if (strcmp(argv[i], "--repl-mvm") == 0) repl_mvm = 1;
+        else if (strcmp(argv[i], "--tokens") == 0) tokens_only = 1;
         else if (strcmp(argv[i], "--strict-stale") == 0) strict_stale = 1;
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage(argv[0]); return 0;
@@ -630,7 +635,7 @@ int main(int argc, char **argv) {
             if (i + 1 >= argc) { usage(argv[0]); return 64; }
             dump_src = argv[++i];
         } else if (strcmp(argv[i], "--run-mvm") == 0) {
-            if (i + 1 >= argc) { usage(argv[0]); return 64; }
+            if (i + 1 >= argc) { repl_mvm = 1; continue; }
             run_mvm_src = argv[++i];
         } else if (strcmp(argv[i], "-o") == 0) {
             if (i + 1 >= argc) { usage(argv[0]); return 64; }
@@ -649,13 +654,16 @@ int main(int argc, char **argv) {
     /* Publish the script arguments before any interpreter is created/run. */
     interpret_set_script_args(script_argv, script_argc);
 
+    if (repl_mvm && (path || tokens_only || dump_src || compile_src || run_mvm_src)) {
+        fprintf(stderr, "myon: --repl-mvm cannot be combined with file execution\n"); return 64;
+    }
     if (dump_src)    return cmd_dump_bytecode(dump_src);
     if (compile_src) return cmd_compile(compile_src, compile_out);
     if (run_mvm_src) return cmd_run_mvm(run_mvm_src);
 
     /* No file argument and not a token dump: start the interactive REPL. */
     if (!path && !tokens_only) {
-        return run_repl();
+        return run_repl(repl_mvm);
     }
 
     if (!path) { usage(argv[0]); return 64; }

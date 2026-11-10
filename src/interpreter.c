@@ -5895,6 +5895,22 @@ int interp_run(Interp *it, Program *program) {
 Interp *myon_bridge_interp_new(void)  { return interp_create(); }
 void    myon_bridge_interp_free(Interp *it) { interp_free(it); }
 void   *myon_bridge_error_buf(Interp *it) { return (void *)interp_error_buf(it); }
+void myon_bridge_recover_input(Interp *it) {
+    if (it->loop) { event_loop_destroy(it->loop); it->loop = NULL; }
+    if (it->net) { net_state_destroy(it->net); it->net = NULL; }
+    cleanup_destroy(it);
+    it->ret_owner = NULL; it->ret_values = NULL; it->ret_count = 0;
+    it->bridge_args = NULL; it->bridge_argc = 0; it->call_depth = 0;
+    ModuleEntry **link = &it->modules;
+    while (*link) {
+        ModuleEntry *m = *link;
+        if (!m->loading) { link = &m->next; continue; }
+        *link = m->next;
+        env_free(m->ns); free(m->path); free(m->alias); free(m);
+    }
+    value_collect_cycles();
+}
+
 void myon_bridge_set_vm_caller(Interp *it, MyonVMCaller caller, void *context) {
     it->vm_caller = caller; it->vm_context = context;
 }

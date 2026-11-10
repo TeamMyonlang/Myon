@@ -45,6 +45,7 @@ typedef struct {
 } LineEntry;
 
 typedef struct Chunk {
+    const char *repl_source; /* borrowed session text; not serialized */
     char     *name;        /* diagnostic name; "<main>" for top level */
     uint16_t  num_params;
     uint16_t  num_locals;  /* total local slots this chunk uses (spec §5.5) */
@@ -105,6 +106,9 @@ typedef struct Module {
 
 /* ---- Module lifecycle ---- */
 Module *module_new(void);
+/* Compilation transaction: copy tables, then adopt additions, retaining old chunks. */
+Module *module_fork(Module *m);
+void module_adopt(Module *m, Module *candidate);
 void    module_free(Module *m);
 
 /* Append a fresh, empty chunk and return its index. Chunk name is copied. */
