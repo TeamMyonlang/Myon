@@ -4,7 +4,7 @@
 構文・関数の引数と戻り値は [言語リファレンス](myon_spec.md)、MVM の形式は
 [MVM リファレンス](mvm_spec.md) を参照してください。
 実装が存在することと、すべての入力・環境で検証されていることは区別します。
-未対応事項と既知の不具合は [既知の問題](../known-issues.md) に記載しています。
+未修正の不具合と未対応機能は [既知の問題](../known-issues.md) に記載しています。
 
 ## 言語と値
 
@@ -16,13 +16,13 @@
 | 整数演算と比較 | `interpreter.c` | `step12_overflow`、`p_int_comparison_precision`。比較は double を経由しない |
 | if / elif / else、while、for、break / continue | `parser.c`、`interpreter.c` | `step5_logic`、`examples/control_flow.myon` |
 | ブロックスコープ、`myon.expose` | `env.c`、`interpreter.c` | `step8_shadow`、`step8_expose`。エラー発生段階の差は `.mvm-exit` で明示 |
-| 関数・複数戻り値・ラムダ | `interpreter.c`、`mvm_compiler.c`、`mvm_vm.c` | 関数型・捕捉・ネイティブ境界の制約は MVM 仕様7節 |
+| 関数・複数戻り値・ラムダ | `interpreter.c`、`mvm_compiler.c`、`mvm_vm.c` | `p_escaping_closure`、`p_native_callback_state`、`p41_ffi_callback` |
 | 構造体・継承・メソッド | `types.c`、`interpreter.c` | `step9_struct`。C FFI の構造体レイアウトとは別機能 |
 | ジェネリクス | `parser.c`、`interpreter.c`、`mvm_compiler.c` | `step15_generics`。型制約構文はない |
 | 文字列補間 | `interpreter.c`、`mvm_compiler.c` | `{expr}` を評価する。エスケープのバイト検査は `string_regressions.sh` |
 
 `value_copy` / `value_free` は参照カウントを操作します。到達不能な循環は、
-Obj と MVM の UpvalueCell を対象とするコレクタで回収します。
+Obj、MVM の UpvalueCell、ツリーウォークの Env を対象とするコレクタで回収します。
 この仕組みは、FFI の生アドレスや C 側で独立して確保された資源の管理を代行しません。
 出力時には循環と深さを検査し、`<cycle>` / `<...>` で再帰を打ち切ります。
 `runtime_memory_tests.c` と `p_tostr_cycle_guard` に対応する検査があります。
@@ -110,9 +110,9 @@ SDL2、SDL_mixer、SQLite の利用例は `examples/ffi_*` にあります。
 配列の高階メソッドと FFI コールバックは VM 関数値にも対応します。呼び出しごとに
 独立した VM スタックを使い、グローバル変数・捕捉セル・標準ライブラリの状態を共有します。
 MVM REPL は `--repl-mvm` で起動します。入力間の定義・捕捉セルと標準ライブラリの状態を保持します。
-外部ファイルとパッケージは共通のローダーから
-ソースを読み、ツリーウォーク実行で初期化して MVM と接続します。`.myc` 単体の構造体実行には、宣言 AST が
-保存されないことによる制約もあります。MVM 仕様7節を参照してください。
+外部ファイルとパッケージは共通のローダーからソースを読み、ツリーウォーク実行で初期化して
+MVM と接続します。保存済み `.myc` には構造体宣言の AST がなく、ソース内で宣言した構造体の
+生成は実行時エラーになります。MVM 仕様7節を参照してください。
 
 組み込みmoduleはトップレベルの宣言が必要です。標準ライブラリ呼び出しと明示的な配列/Map生成を
 両エンジンで検査します。`module_regressions.sh` は保存済みMYC1 1.4、REPL、外部取り込み、
@@ -148,14 +148,15 @@ OS 判定と機能マクロは `src/platform.h` にあります。Linux・macOS�
 範囲は [README](../README.md#テスト) を参照してください。
 
 メインスイートの `.out` は出力と終了コード0、`.err` は終了コード1/65を検査します。
-等価性スイートは両エンジンを1回ずつ実行し、未対応診断を除外として記録します。
+等価性スイートは両エンジンを1回ずつ実行します。現在、機能未対応による除外対象はありません。
+ハーネスには未対応診断を除外扱いする処理があり、終了コード99とシグナル終了は除外しません。
 エラーケースは終了コード1/65の段階一致を要求します。既知の段階差がある3件は
 `.mvm-exit` で両エンジンの期待コードを指定します。診断全文の一致は要求しません。
 
 ## 変更記録の参照
 
-過去の文書で使われた Step / Phase は実装当時の区分です。現在の対応範囲は上の一覧、
-個々の変更は Git の履歴、修正内容と再現条件は [既知の問題](../known-issues.md) で確認できます。
+対応範囲とテストはこの文書の一覧、変更履歴は Git のコミットで確認できます。
+[既知の問題](../known-issues.md) には未解決の項目だけを記載します。
 
 クロージャの寿命は `p_escaping_closure` で、定義元の関数・ブロック・async タスク終了後も
 両エンジンで検査します。ツリーウォークの Env と関数値の循環は Value の循環回収に含めます。
