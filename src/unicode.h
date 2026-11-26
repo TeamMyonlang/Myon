@@ -18,6 +18,13 @@
 #define MYON_UNICODE_H
 
 #include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+/* Decode one UTF-8 scalar, returning its width or zero on invalid input.
+ * Encode writes one valid scalar into an output buffer of at least 4 bytes. */
+size_t myon_utf8_decode(const unsigned char *s, const unsigned char *end, uint32_t *cp);
+size_t myon_utf8_encode(unsigned char *out, uint32_t cp);
 
 /* Owned NUL-terminated UTF-8 result, or NULL on size overflow. Invalid bytes
  * are preserved and break casing context. No locale tailoring/normalization. */

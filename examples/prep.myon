@@ -1,0 +1,69 @@
+system myon.useversion=1
+module myon.array
+module myon.file
+module myon.json
+module myon.math
+module myon.stdio
+module myon.string
+
+myon.func csv_field(s: str) ret str {
+    myon.if myon.string.contains(s, ",") myon.or myon.string.contains(s, "\"") myon.or myon.string.contains(s, "\n") myon.or myon.string.contains(s, "\r") then {
+        ret "\"" + myon.string.replace(s, "\"", "\"\"") + "\""
+    }
+    ret s
+}
+
+myon.func prep(path: str, requested: int) ret bool, error {
+    recipe, read_error = myon.file.read(path)
+    myon.if read_error != myon.nil then { ret false, read_error }
+    servings, servings_error = myon.json.get_int(recipe, "servings")
+    myon.if servings_error != myon.nil then { ret false, servings_error }
+    myon.if servings <= 0 then { ret false, error("recipe servings must be positive") }
+
+    ingredients, ingredients_error = myon.json.get_array(recipe, "ingredients")
+    myon.if ingredients_error != myon.nil then { ret false, ingredients_error }
+    count, count_error = myon.json.length(ingredients)
+    myon.if count_error != myon.nil then { ret false, count_error }
+    rows = myon.array(str)
+    rows.push("ingredient,amount,unit")
+    myon.for index myon.in range(0, count) {
+        item, item_error = myon.json.get_object(ingredients, index)
+        myon.if item_error != myon.nil then { ret false, item_error }
+        name, name_error = myon.json.get_str(item, "name")
+        myon.if name_error != myon.nil then { ret false, name_error }
+        unit, unit_error = myon.json.get_str(item, "unit")
+        myon.if unit_error != myon.nil then { ret false, unit_error }
+        amount, amount_error = myon.json.get_int(item, "amount")
+        myon.if amount_error != myon.nil then { ret false, amount_error }
+        myon.if amount < 0 then { ret false, error("ingredient amount cannot be negative") }
+
+        # Reduce before multiplying to preserve exact integer ratios.
+        factor = myon.math.gcd(requested, servings)
+        denominator = servings / factor
+        divisor = myon.math.gcd(amount, denominator)
+        numerator = (amount / divisor) * (requested / factor)
+        denominator = denominator / divisor
+        displayed = str(numerator)
+        myon.if denominator != 1 then { displayed = displayed + "/" + str(denominator) }
+        rows.push(csv_field(name) + "," + displayed + "," + csv_field(unit))
+    }
+    myon.for row myon.in rows { myon.print(row) }
+    ret true, myon.nil
+}
+
+args = myon.argv()
+myon.if args.length() != 2 then {
+    myon.eprint("usage: myon examples/prep.myon recipe.json servings")
+} myon.else {
+    requested, parse_error = myon.string.to_int(args[1])
+    myon.if parse_error != myon.nil then {
+        myon.eprint(parse_error)
+    } myon.else {
+        myon.if requested <= 0 then {
+            myon.eprint("servings must be positive")
+        } myon.else {
+            ok, fail = prep(args[0], requested)
+            myon.if fail != myon.nil then { myon.eprint(fail) }
+        }
+    }
+}

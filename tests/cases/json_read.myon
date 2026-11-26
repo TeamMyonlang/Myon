@@ -1,0 +1,28 @@
+module myon.json
+module myon.stdio
+
+items = "[42, false, null, 1.5, \"\\uD83C\\uDF38\", \"\\u0000\"]"
+valid, validation_error = myon.json.validate(items)
+myon.print(valid)
+size, size_error = myon.json.length(items)
+myon.print(size)
+number, number_error = myon.json.get_int(items, 0)
+myon.print(number)
+flag, flag_error = myon.json.get_bool(items, 1)
+myon.print(flag)
+empty, empty_error = myon.json.is_null(items, 2)
+myon.print(empty)
+ratio, ratio_error = myon.json.get_float(items, 3)
+myon.print(ratio)
+flower, flower_error = myon.json.get_str(items, 4)
+myon.print(flower)
+nul_value, nul_error = myon.json.get_str(items, 5)
+myon.print(nul_error != myon.nil)
+invalid, invalid_error = myon.json.get_int("[1,]", 0)
+myon.print(invalid_error != myon.nil)
+missing, missing_error = myon.json.get_int(items, 9)
+myon.print(missing_error != myon.nil)
+wrong, wrong_error = myon.json.get_int(items, 3)
+myon.print(wrong_error != myon.nil)
+overflow, overflow_error = myon.json.get_int("9223372036854775808")
+myon.print(overflow_error != myon.nil)

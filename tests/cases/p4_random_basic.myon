@@ -31,3 +31,27 @@ myon.while j < 10 {
     j += 1
 }
 myon.print(f_ok)                  # true
+
+# Full-width intervals and bounds that exceed the range of a single rand().
+lo = -9223372036854775807 - 1
+hi = 9223372036854775807
+whole, whole_error = myon.random.int(lo, hi)
+myon.print(whole_error == myon.nil)
+edge, edge_error = myon.random.int(lo, lo)
+myon.print(edge_error == myon.nil myon.and edge == lo)
+wide, wide_error = myon.random.int(hi - 100, hi)
+myon.print(wide_error == myon.nil myon.and wide >= hi - 100 myon.and wide <= hi)
+myon.random.seed(42)
+first, first_error = myon.random.int(lo, hi)
+myon.random.seed(42)
+again, again_error = myon.random.int(lo, hi)
+myon.print(first == again)
+
+secure, secure_error = myon.random.secure_int(lo, hi)
+secure_edge, secure_edge_error = myon.random.secure_int(hi, hi)
+myon.if secure_error == myon.nil then {
+    myon.print(secure_edge_error == myon.nil myon.and secure_edge == hi)
+} myon.else {
+    # Targets without the OS source should consistently report an error.
+    myon.print(secure_edge_error != myon.nil)
+}

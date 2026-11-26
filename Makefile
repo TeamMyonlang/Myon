@@ -186,6 +186,7 @@ test-asan: $(ASAN_BIN) $(BUILD)/unicode_case_asan $(BUILD)/runtime_memory_asan $
 	$(BUILD)/error_cleanup_asan mvm tests/cases/*.err; \
 	$(BUILD)/unicode_case_asan; \
 	bash tests/module_regressions.sh ./myon; \
+	bash tests/tooling_regressions.sh ./myon; \
 	bash tests/runtime_regressions.sh ./myon; \
 	bash tests/diagnostic_regressions.sh ./myon; \
 	bash tests/string_regressions.sh ./myon; \
@@ -303,6 +304,7 @@ test-runtime: all test-unicode $(BUILD)/error_cleanup_tests $(BUILD)/repl_memory
 	$(BUILD)/error_cleanup_tests tree tests/cases/*.err
 	$(BUILD)/error_cleanup_tests mvm tests/cases/*.err
 	bash tests/module_regressions.sh ./$(BIN)
+	bash tests/tooling_regressions.sh ./$(BIN)
 	bash tests/runtime_regressions.sh ./$(BIN)
 	bash tests/diagnostic_regressions.sh ./$(BIN)
 	bash tests/string_regressions.sh ./$(BIN)
@@ -319,7 +321,9 @@ $(BUILD)/runtime_memory_asan: $(RUNTIME_TEST_SRCS) src/value.h src/common.h src/
 	$(ASAN_CC) $(ASAN_CFLAGS) -Isrc $(RUNTIME_TEST_SRCS) $(ASAN_LDLIBS) -o $@
 
 $(BUILD)/unicode.o: src/unicode_case_data.inc src/unicode.h
-$(BUILD)/interpreter.o: src/unicode.h
+$(BUILD)/interpreter.o: src/unicode.h src/json.h src/receipt.h src/builtin_modules.h
+$(BUILD)/json.o: src/json.h src/unicode.h
+$(BUILD)/main.o $(BUILD)/mvm_vm.o $(BUILD)/receipt.o: src/receipt.h
 .PHONY: test-unicode
 test-unicode: | $(BUILD)
 	$(CC) $(CFLAGS) -Isrc tests/unicode_case_tests.c src/unicode.c src/common.c -o $(BUILD)/unicode_case_tests

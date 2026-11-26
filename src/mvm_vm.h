@@ -39,18 +39,13 @@
  *   - a plain `switch` dispatch loop (spec §4.1 recommendation: portable C,
  *     no GCC computed-goto extension, so MSVC etc. can build it too).
  *
- * Structs / methods (spec §4.11) need their declarations (field order, method
- * bodies) which the current `.myc` format does not serialize; therefore struct
- * support is only available when the VM is given the source Program (the
- * "run compiled-in-memory" path).  See mvm_vm.c for the reported limitation.
+ * Saved modules include the struct metadata needed by NEW_STRUCT and INVOKE.
  */
 
 /*
- * Execute `m`.  `program` (may be NULL) supplies struct/method declarations for
- * NEW_STRUCT / GET_FIELD / SET_FIELD / INVOKE when the module was compiled in
- * memory from source; pass NULL when running a reloaded `.myc` (structs then
- * raise a clear runtime error).  `source` (may be NULL) is the original source
- * text, registered with diag so runtime errors can show a source snippet.
+ * Execute `m`. A source `program` supplies declarations for in-memory
+ * execution. Pass NULL to use the declarations stored in a loaded module.
+ * The optional source text allows diagnostics to show a source snippet.
  *
  * Returns a process exit code: 0 on success, non-zero on a runtime error
  * (message already printed in the tree-walker's format, spec §8).

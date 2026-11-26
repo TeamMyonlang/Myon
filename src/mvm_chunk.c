@@ -174,6 +174,7 @@ void module_free(Module *m) {
     myon_free(m->natives);
     for (int i = 0; i < m->chunk_count; i++) chunk_free(m->chunks[i]);
     myon_free(m->chunks);
+    if (m->stored_structs) program_free(m->stored_structs);
     myon_free(m->src_path);
     myon_free(m);
 }
@@ -650,7 +651,30 @@ static void ser_chunk(Buf *b, const Chunk *c) {
     }
 }
 
-int mvm_module_write_file(const Module *m, const char *path) {
+static void ser_structs(Buf *b, const Program *program) {
+    uint32_t count = 0;
+    for (int i = 0; i < program->stmts.count; i++)
+        count += program->stmts.items[i]->kind == STMT_STRUCT;
+    buf_u32(b, count);
+    for (int i = 0; i < program->stmts.count; i++) {
+        const Stmt *stmt = program->stmts.items[i];
+        if (stmt->kind != STMT_STRUCT) continue;
+        const StructDecl *sd = stmt->as.struct_decl;
+        buf_str(b, sd->name);
+        buf_str(b, sd->parent_name);
+        buf_u32(b, (uint32_t)sd->field_count);
+        for (int j = 0; j < sd->field_count; j++) {
+            buf_str(b, sd->fields[j].name);
+            ser_typespec(b, sd->fields[j].type);
+        }
+        buf_u32(b, (uint32_t)sd->tparam_count);
+        for (int j = 0; j < sd->tparam_count; j++)
+            buf_str(b, sd->tparams[j]);
+    }
+}
+
+int mvm_module_write_file(const Module *m, const Program *program,
+                          const char *path, int reproducible) {
     Buf b = {0};
 
     /* --- header (spec §6.2), 32 bytes; offsets patched after layout --- */
@@ -669,10 +693,10 @@ int mvm_module_write_file(const Module *m, const char *path) {
 
     /* --- source info (spec §6.5) --- */
     uint32_t srcinfo_off = (uint32_t)b.len;
-    buf_u64(&b, (uint64_t)m->src_mtime);
+    buf_u64(&b, reproducible ? 0 : (uint64_t)m->src_mtime);
     buf_u64(&b, m->src_size);
     buf_bytes(&b, m->src_hash, 32);
-    buf_str(&b, m->src_path);
+    buf_str(&b, reproducible ? NULL : m->src_path);
 
     /* --- constant pool (spec §6.3) --- */
     uint32_t const_off = (uint32_t)b.len;
@@ -687,6 +711,7 @@ int mvm_module_write_file(const Module *m, const char *path) {
     buf_u32(&b, (uint32_t)m->chunk_count);
     for (int i = 0; i < m->chunk_count; i++)
         ser_chunk(&b, m->chunks[i]);
+    ser_structs(&b, program);
 
     /* --- patch header offsets --- */
     #define PATCH_U32(pos, val) do { \
@@ -704,9 +729,9 @@ int mvm_module_write_file(const Module *m, const char *path) {
     FILE *f = fopen(path, "wb");
     if (!f) { myon_free(b.data); return 1; }
     size_t wrote = fwrite(b.data, 1, b.len, f);
-    fclose(f);
+    int closed = fclose(f);
     myon_free(b.data);
-    return wrote == b.len ? 0 : 2;
+    return wrote == b.len && closed == 0 ? 0 : 2;
 }
 
 /* ---- reader ---- */
@@ -726,24 +751,102 @@ static char *rdstr(Rd *r) {
     return s;
 }
 
-static TypeSpec *deser_typespec(Rd *r) {
+static TypeSpec *deser_typespec(Rd *r, unsigned depth) {
     uint8_t base = rd8(r);
+    if (r->err || depth == 128 || base > TYPE_TASK) {
+        r->err = 1;
+        return NULL;
+    }
     TypeSpec *t = typespec_new((Type)base);
     if (base == TYPE_STRUCT || base == TYPE_TYPEPARAM) {
         char *nm = rdstr(r);
         t->name = nm;
     }
     if (base == TYPE_ARRAY || base == TYPE_MAP)
-        t->elem = deser_typespec(r);
+        t->elem = deser_typespec(r, depth + 1);
     if (base == TYPE_MAP)
-        t->key = deser_typespec(r);
+        t->key = deser_typespec(r, depth + 1);
     uint16_t argc = rd16(r);
+    if (r->err || argc > (r->len - r->pos) / 3) {
+        r->err = 1;
+        typespec_free(t);
+        return NULL;
+    }
     t->arg_count = argc;
     if (argc) {
         t->args = (TypeSpec **)myon_xmalloc(sizeof(TypeSpec *) * argc);
-        for (int i = 0; i < argc; i++) t->args[i] = deser_typespec(r);
+        for (int i = 0; i < argc; i++) t->args[i] = deser_typespec(r, depth + 1);
     }
     return t;
+}
+
+static Program *deser_structs(Rd *r) {
+    uint32_t count = rd32(r);
+    if (r->err || count > (r->len - r->pos) / 16 || count > INT32_MAX) {
+        r->err = 1;
+        return NULL;
+    }
+    Program *program = myon_xmalloc(sizeof(*program));
+    *program = (Program){0};
+    for (uint32_t i = 0; i < count && !r->err; i++) {
+        Stmt *stmt = stmt_new(STMT_STRUCT, 0);
+        StructDecl *sd = myon_xmalloc(sizeof(*sd));
+        *sd = (StructDecl){0};
+        stmt->as.struct_decl = sd;
+        stmtlist_push(&program->stmts, stmt);
+        sd->name = rdstr(r);
+        sd->parent_name = rdstr(r);
+        if (sd->parent_name && !*sd->parent_name) {
+            myon_free(sd->parent_name);
+            sd->parent_name = NULL;
+        }
+        uint32_t fields = rd32(r);
+        if (r->err || !sd->name || !*sd->name ||
+            fields > (r->len - r->pos) / 7 || fields > INT32_MAX) {
+            r->err = 1;
+            break;
+        }
+        sd->fields = fields ? myon_xmalloc(fields * sizeof(*sd->fields)) : NULL;
+        for (uint32_t j = 0; j < fields && !r->err; j++) {
+            StructField *field = &sd->fields[sd->field_count++];
+            field->name = rdstr(r);
+            field->type = deser_typespec(r, 0);
+            if (!field->name || !*field->name) r->err = 1;
+        }
+        uint32_t params = rd32(r);
+        if (r->err || params > (r->len - r->pos) / 4 || params > INT32_MAX) {
+            r->err = 1;
+            break;
+        }
+        sd->tparams = params ? myon_xmalloc(params * sizeof(*sd->tparams)) : NULL;
+        for (uint32_t j = 0; j < params && !r->err; j++) {
+            char *name = rdstr(r);
+            sd->tparams[sd->tparam_count++] = name;
+            if (!name || !*name) r->err = 1;
+        }
+    }
+    for (int i = 0; i < program->stmts.count && !r->err; i++) {
+        StructDecl *sd = program->stmts.items[i]->as.struct_decl;
+        if (!sd->parent_name) continue;
+        for (int j = 0; j < program->stmts.count; j++) {
+            StructDecl *parent = program->stmts.items[j]->as.struct_decl;
+            if (strcmp(sd->parent_name, parent->name) == 0) {
+                sd->parent = parent;
+                break;
+            }
+        }
+        if (!sd->parent) r->err = 1;
+    }
+    for (int i = 0; i < program->stmts.count && !r->err; i++) {
+        int remaining = program->stmts.count;
+        for (StructDecl *sd = program->stmts.items[i]->as.struct_decl; sd; sd = sd->parent) {
+            if (remaining-- == 0) {
+                r->err = 1;
+                break;
+            }
+        }
+    }
+    return program;
 }
 
 Module *mvm_module_read_file(const char *path) {
@@ -765,7 +868,7 @@ Module *mvm_module_read_file(const char *path) {
     uint8_t minor = rd8(&r);
     uint8_t endian = rd8(&r);
     (void)rd8(&r);            /* flags */
-    if (major != MVM_VERSION_MAJOR || minor != MVM_VERSION_MINOR || endian != MVM_ENDIAN_LITTLE) { myon_free(data); return NULL; }
+    if (major != MVM_VERSION_MAJOR || (minor != 4 && minor != MVM_VERSION_MINOR) || endian != MVM_ENDIAN_LITTLE) { myon_free(data); return NULL; }
 
     uint32_t const_off = rd32(&r);
     (void)rd32(&r);           /* const size */
@@ -799,8 +902,8 @@ Module *mvm_module_read_file(const char *path) {
             case MVM_CONST_BOOL:  module_add_const_bool(m, rd8(&r)); break;
             case MVM_CONST_NIL:   module_add_const_nil(m); break;
             case MVM_CONST_TYPESPEC: {
-                TypeSpec *t = deser_typespec(&r);
-                module_add_const_typespec(m, t);
+                TypeSpec *t = deser_typespec(&r, 0);
+                if (t) module_add_const_typespec(m, t);
                 typespec_free(t);
                 break;
             }
@@ -853,6 +956,10 @@ Module *mvm_module_read_file(const char *path) {
         }
     }
 
+    if (minor >= 5 && !r.err) {
+        m->stored_structs = deser_structs(&r);
+        if (r.pos != r.len) r.err = 1;
+    }
     myon_free(data);
     if (r.err) { module_free(m); return NULL; }
     return m;

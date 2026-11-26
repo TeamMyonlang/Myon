@@ -30,7 +30,8 @@ typedef struct { uint32_t first, last; } CodeRange;
 
 /* Strict RFC 3629 decoding. A zero result consumes no bytes; callers preserve
  * that invalid byte and advance once. Never read beyond the input's end. */
-static size_t decode(const unsigned char *s, const unsigned char *end, uint32_t *cp) {
+size_t myon_utf8_decode(const unsigned char *s, const unsigned char *end, uint32_t *cp) {
+    if (s == end) return 0;
     unsigned char c = *s;
     if (c < 0x80) { *cp = c; return 1; }
     size_t n = c >= 0xC2 && c <= 0xDF ? 2 :
@@ -67,7 +68,7 @@ static bool cased(uint32_t cp) {
 static bool next_cased(const unsigned char *s, const unsigned char *end) {
     while (s < end) {
         uint32_t cp;
-        size_t n = decode(s, end, &cp);
+        size_t n = myon_utf8_decode(s, end, &cp);
         if (!n) return false;
         if (!ignorable(cp)) return cased(cp);
         s += n;
@@ -97,6 +98,12 @@ static void encode(unsigned char *out, uint32_t cp, size_t n) {
     out[0] = (unsigned char)((n == 2 ? 0xC0 : n == 3 ? 0xE0 : 0xF0) | cp);
 }
 
+size_t myon_utf8_encode(unsigned char *out, uint32_t cp) {
+    size_t n = encoded_size(cp);
+    encode(out, cp, n);
+    return n;
+}
+
 /* Two passes keep allocation exact and check expansion before writing. Sigma
  * lookahead scans only adjacent ignorable runs, so repeated sigmas stay linear. */
 static bool convert(const unsigned char *s, const unsigned char *end, bool upper,
@@ -105,7 +112,7 @@ static bool convert(const unsigned char *s, const unsigned char *end, bool upper
     bool preceding_cased = false;
     while (s < end) {
         uint32_t cp;
-        size_t width = decode(s, end, &cp);
+        size_t width = myon_utf8_decode(s, end, &cp);
         if (!width) {
             if (!checked_add_size(used, 1, &used)) return false;
             if (out) out[used - 1] = *s;

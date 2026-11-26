@@ -1,0 +1,35 @@
+system myon.useversion=1
+module myon.array
+module myon.stdio
+module myon.time
+
+myon.async myon.func sample(reading: int) ret int {
+    myon.await myon.time.sleep_ms(1)
+    ret reading
+}
+
+myon.async myon.func follow(previous: int) ret int {
+    myon.await myon.time.sleep_ms(1)
+    ret previous
+}
+
+readings = myon.array(int)
+readings.push(20)
+readings.push(21)
+readings.push(19)
+
+myon.print("sample,current,previous")
+number = 0
+last = 0
+myon.for reading myon.in readings {
+    current_task = sample(reading)
+    number += 1
+    myon.if number == 1 then {
+        last = myon.await current_task
+        myon.print(number, ",", last, ",")
+    } myon.else {
+        previous_task = follow(last)
+        last = myon.await current_task
+        myon.print(number, ",", last, ",", myon.await previous_task)
+    }
+}

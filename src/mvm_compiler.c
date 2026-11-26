@@ -1518,25 +1518,27 @@ static Module *compile_program(Program *program, const char *source_path, MvmCom
             register_struct(c, sd);
         }
 
-    /* Resolve parents and validate the inheritance chain, mirroring the
-     * tree-walk interpreter's prescan (spec 14.6): a subclass may not
-     * re-declare a field already present in any ancestor.  Enforcing this in
-     * the compiler makes the .err case fail cleanly (no .myc emitted) exactly
-     * as `.myon` does, keeping the two engines in agreement (Step 7-b). */
+    /* Resolve all parents first so validation is independent of source order. */
     for (int i = 0; i < c->struct_count; i++) {
         StructDecl *sd = c->structs[i];
-        if (sd->parent_name && !sd->parent) {
-            sd->parent = find_struct(c, sd->parent_name);
-            if (!sd->parent)
-                compile_error(c, 0, "struct '%s' extends unknown struct '%s'",
-                              sd->name, sd->parent_name);
+        if (!sd->parent_name) continue;
+        sd->parent = find_struct(c, sd->parent_name);
+        if (!sd->parent)
+            compile_error(c, 0, "struct '%s' extends unknown struct '%s'",
+                          sd->name, sd->parent_name);
+    }
+    for (int i = 0; i < c->struct_count; i++) {
+        StructDecl *sd = c->structs[i];
+        int remaining = c->struct_count;
+        for (StructDecl *parent = sd->parent; parent; parent = parent->parent) {
+            if (--remaining == 0)
+                compile_error(c, 0, "cyclic inheritance involving '%s'", sd->name);
             for (int a = 0; a < sd->field_count; a++)
-                for (StructDecl *pc = sd->parent; pc; pc = pc->parent)
-                    for (int b = 0; b < pc->field_count; b++)
-                        if (strcmp(sd->fields[a].name, pc->fields[b].name) == 0)
-                            compile_error(c, 0,
-                                "field '%s' in struct '%s' collides with parent (spec 14.6)",
-                                sd->fields[a].name, sd->name);
+                for (int b = 0; b < parent->field_count; b++)
+                    if (strcmp(sd->fields[a].name, parent->fields[b].name) == 0)
+                        compile_error(c, 0,
+                            "field '%s' in struct '%s' collides with parent (spec 14.6)",
+                            sd->fields[a].name, sd->name);
         }
     }
 

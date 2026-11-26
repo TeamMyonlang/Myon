@@ -21,8 +21,8 @@ make
 system myon.useversion=1
 module myon.stdio
 
-name = str("人間")
-myon.print("Hello, ", name)
+x = str("人間")
+myon.print("Hello Worlddd! ", x + "!")
 ```
 
 ## ビルド環境
@@ -50,8 +50,11 @@ make win-cross WIN_OPENSSL_LDLIBS="-L/path/to/windows/openssl/lib -lcrypt32"
 
 ```sh
 ./myon program.myon
+./myon --check program.myon
 ./myon --compile program.myon -o program.myc
+./myon --compile --reproducible program.myon -o program.myc
 ./myon program.myc
+./myon --receipt program.myc
 ./myon --dump-bytecode program.myc
 ./myon --tokens program.myon
 ./myon --help
@@ -63,8 +66,13 @@ make win-cross WIN_OPENSSL_LDLIBS="-L/path/to/windows/openssl/lib -lcrypt32"
 `--run-mvm program.myon` は、ソースをメモリ上でコンパイルして MVM で実行する検証用の経路です。
 
 `.myc` の実行時には元ソースとの不一致を調べ、検出すると警告します。
-`--strict-stale` を付けると不一致をエラーにします。元ソースがない場合はこの検査を省略します。
+`--strict-stale` を付けると不一致をエラーにします。ハッシュを比較できる場合、更新時刻だけの変更は無視します。元ソースがなければ検査を省略します。
 バイトコードの形式は [MVM 仕様](docs/mvm_spec.md) を参照してください。
+
+`--check` はソースを解析・コンパイルし、成功時は何も出力しません。
+`--reproducible` は保存するパスと更新時刻を省き、ソースの内容ハッシュを残します。
+`--receipt` は実行経路、明示的な型変換回数、標準入出力APIが stdout に書いたバイト数、
+終了コードを stderr に表示します。
 
 スクリプトパスの後ろの引数は `myon.argv()` で取得します。
 
@@ -88,15 +96,15 @@ REPLと取り込んだコードではインタプリタのセッション内で�
 スカラー型の変換、制御構文、型注釈、既存の配列・Mapのメソッド自体には宣言を要求しません。
 宣言はAPIの利用条件で、実行権限を分離するサンドボックスではありません。
 
-この規則はソースとMVMで共通です。保存済みバイトコードはMYC1 1.4へ再コンパイルしてください。
-旧minor形式は読み込み時に拒否します。詳しくは [言語リファレンス11節](docs/myon_spec.md#11-モジュール) を参照してください。
+この規則はソースとMVMで共通です。現在の書き込み形式はMYC1 1.5です。
+MYC1 1.4も読み込めます。詳しくは [言語リファレンス11節](docs/myon_spec.md#11-モジュール) を参照してください。
 
 ## 言語機能と標準ライブラリ
 
 - 整数・浮動小数点数・文字列・文字・真偽値。異なる型の算術演算には明示的な変換が必要です。
 - 条件分岐、ループ、関数、複数戻り値、ラムダ、構造体、継承、ジェネリクス。
 - ブロックスコープと `myon.expose`、文字列の式補間。
-- 配列・Map、数学、文字列操作、ファイル入出力、時刻、乱数。
+- 配列・Map、数学、文字列操作、JSONの検査・読み取り、ファイル入出力、時刻、乱数。
 - 単一スレッドの協調的な async/await、IPv4 TCP/UDP、HTTP サーバー、HTTP/HTTPS クライアント。
 - 共有ライブラリを呼び出す C FFI、メモリブロック、構造体レイアウト、コールバック。
 
@@ -116,9 +124,8 @@ MVM とツリーウォークは標準ライブラリの実装を共有します�
 | FFI コールバック | 対応 | 対応 |
 | REPL | 対応 | 対応（`--repl-mvm`） |
 
-保存済み `.myc` は構造体宣言の AST を保持しません。ソース内で宣言した構造体を
-その `.myc` から生成すると、実行時エラーになります。
-`--run-mvm` と保存済みバイトコードの検証範囲は [MVM 仕様7節](docs/mvm_spec.md#7-対応範囲と制約) を参照してください。
+`--run-mvm` とMYC1 1.5の保存済みバイトコードは、ソース内で宣言した構造体の生成と
+メソッド呼び出しに対応します。詳しくは [MVM 仕様7節](docs/mvm_spec.md#7-対応範囲と制約) を参照してください。
 
 未修正の不具合と未対応機能は [既知の問題](known-issues.md) を参照してください。
 文字列は NUL 終端で、任意のバイナリデータを保持する型ではありません。
@@ -170,12 +177,16 @@ FFI は呼び出し先の C ヘッダを読みません。利用者が ABI、引
 |---|---|
 | [hello.myon](examples/hello.myon) | 基本的な代入と出力 |
 | [control_flow.myon](examples/control_flow.myon) | 条件分岐・ループ |
+| [follow.myon](examples/follow.myon) | 非同期タスクで現在値と一つ前の値を出力 |
+| [prep.myon](examples/prep.myon) | JSONレシピの分量を換算してCSVで出力 |
 | [http_static_server.myon](examples/http_static_server.myon) | 静的ファイルの HTTP 配信 |
 | [http_router_server.myon](examples/http_router_server.myon) | HTTP ハンドラ |
 | [http_https_get.myon](examples/http_https_get.myon) | HTTPS クライアント |
 | [net_game_echo.myon](examples/net_game_echo.myon) | UDP 通信 |
 | [ffi_math.myon](examples/ffi_math.myon) | C 数学ライブラリの呼び出し |
 | [ffi_sdl_window.myon](examples/ffi_sdl_window.myon) | SDL2 によるウィンドウ表示 |
+
+`./myon examples/prep.myon examples/recipe.json 3` は、レシピを3人分に換算します。
 
 サーバーの例は常駐します。FFI・SDL の例には対応する共有ライブラリが必要です。
 [cli_progress.myon](examples/cli_progress.myon) は `\r` を使った進捗表示の例です。
