@@ -187,11 +187,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install OpenSSL (Homebrew)
+      - name: Install build and test dependencies (Homebrew)
         run: |
           set -eux
           brew install openssl@3 || brew upgrade openssl@3 || true
           brew --prefix openssl@3
+          brew install coreutils
+          gtimeout --version
 
       - name: Build
         run: |
