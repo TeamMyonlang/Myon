@@ -1,0 +1,7 @@
+{
+  "servings": 4,
+  "ingredients": [
+    {"name": "flour", "amount": 200, "unit": "g"},
+    {"name": "egg", "amount": 2, "unit": "piece"}
+  ]
+}

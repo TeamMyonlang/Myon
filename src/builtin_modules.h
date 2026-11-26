@@ -21,7 +21,7 @@
 
 static const char *const myon_builtin_modules[] = {
     "myon.stdio", "myon.math", "myon.string", "myon.ffi", "myon.time",
-    "myon.random", "myon.net", "myon.http", "myon.file", "myon.array", "myon.map"
+    "myon.random", "myon.net", "myon.http", "myon.file", "myon.array", "myon.map", "myon.json"
 };
 static inline uint32_t myon_builtin_module_bit(const char *name) {
     for (unsigned int i = 0; i < sizeof(myon_builtin_modules)/sizeof(myon_builtin_modules[0]); i++)

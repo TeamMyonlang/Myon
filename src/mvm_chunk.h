@@ -20,6 +20,7 @@
 #include <stdint.h>
 #include <stdio.h>
 
+#include "ast.h"
 #include "value.h"
 #include "types.h"
 #include "mvm_bytecode.h"
@@ -96,6 +97,7 @@ typedef struct Module {
     int         chunk_cap;
 
     int         entry_chunk;  /* usually 0 (main) */
+    Program    *stored_structs; /* owned declarations from a saved module */
 
     /* Source Info (spec §6.5) — best-effort, filled by the compiler driver. */
     int64_t     src_mtime;
@@ -160,7 +162,8 @@ void mvm_module_disassemble(const Module *m, FILE *out);
 
 /* ---- .myc serialization (spec §6) ---- */
 /* Returns 0 on success, non-zero on I/O error. */
-int  mvm_module_write_file(const Module *m, const char *path);
+int  mvm_module_write_file(const Module *m, const Program *program,
+                           const char *path, int reproducible);
 /* Loads a .myc into a fresh Module (VM/tooling side). NULL on error. */
 Module *mvm_module_read_file(const char *path);
 

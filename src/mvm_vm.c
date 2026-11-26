@@ -30,6 +30,7 @@
 #include "value.h"
 #include "types.h"
 #include "common.h"
+#include "receipt.h"
 #include "diag.h"
 #include "interpreter.h"
 #include "mvm_bytecode.h"
@@ -133,10 +134,8 @@ typedef struct {
 
 /* --- struct-decl registry (spec §4.11) ------------------------------------ */
 /*
- * NEW_STRUCT / INVOKE need field order and method bodies.  Those live in the
- * AST (StructDecl), not in the .myc, so they are only available when the VM is
- * handed the source Program.  We build a flat name->StructDecl lookup here and
- * resolve parent_name links exactly like the compiler / tree-walker do.
+ * NEW_STRUCT / INVOKE use source declarations or their saved metadata.
+ * Method bodies executed by the VM always come from bytecode chunks.
  */
 static StructDecl *find_struct_decl(VM *vm, const char *name) {
     if (!VM_PROGRAM(vm)) return NULL;
@@ -829,32 +828,25 @@ static int run(VM *vm) {
                     "(struct definitions are not stored in .myc; run the .myon "
                     "source instead)", sname);
             resolve_struct_parents(vm, sd);
-            /*
-             * Collect fields parent-first (matches the compiler's push order,
-             * spec §4.11 / note 4): gather the inheritance chain leaf..root,
-             * then emit root..leaf.
-             */
-            StructField *fields = NULL; int fc = 0, cap = 0;
-            {
-                StructDecl *chain[64]; int depth = 0;
-                for (StructDecl *cur = sd; cur && depth < 64; cur = cur->parent)
-                    chain[depth++] = cur;
-                for (int d = depth - 1; d >= 0; d--) {
-                    StructDecl *cur = chain[d];
-                    for (int i = 0; i < cur->field_count; i++) {
-                        if (fc == cap) { cap = cap ? cap * 2 : 8; fields = (StructField *)myon_xrealloc(fields, sizeof(StructField) * cap); }
-                        fields[fc++] = cur->fields[i];
-                    }
-                }
+            /* Place fields in constructor order, starting at the root. */
+            int fc = 0;
+            for (StructDecl *cur = sd; cur; cur = cur->parent) {
+                if (cur->field_count > vm->sp - fc)
+                    vm_error(vm, line, "not enough values for struct '%s'", sname);
+                fc += cur->field_count;
             }
-            /* field values are on the stack in collected order */
+            const char **fields = fc ? myon_xmalloc((size_t)fc * sizeof(*fields)) : NULL;
+            int offset = fc;
+            for (StructDecl *cur = sd; cur; cur = cur->parent) {
+                offset -= cur->field_count;
+                for (int i = 0; i < cur->field_count; i++)
+                    fields[offset + i] = cur->fields[i].name;
+            }
             Value sv = value_struct(sd->name, sd);
-            for (int i = 0; i < fc; i++) {
-                Value fv = vm->stack[vm->sp - fc + i];
-                struct_add_field(&sv, fields[i].name, fv);
-            }
+            for (int i = 0; i < fc; i++)
+                struct_add_field(&sv, fields[i], vm->stack[vm->sp - fc + i]);
             vm->sp -= fc;
-            free(fields);
+            myon_free(fields);
             vm_push(vm, sv);
             break;
         }
@@ -939,9 +931,9 @@ static int run(VM *vm) {
             break;
         }
         case MOP_TO_STR:   { Value v = vm_pop(vm); vm_push(vm, myon_bridge_cast_str(VM_BRIDGE(vm), line, v)); break; }
-        case MOP_CAST_STR: { Value v = vm_pop(vm); vm_push(vm, myon_bridge_cast_str(VM_BRIDGE(vm), line, v)); break; }
-        case MOP_CAST_INT: { Value v = vm_pop(vm); vm_push(vm, myon_bridge_cast_int(VM_BRIDGE(vm), line, v)); break; }
-        case MOP_CAST_CHAR:{ Value v = vm_pop(vm); vm_push(vm, myon_bridge_cast_char(VM_BRIDGE(vm), line, v)); break; }
+        case MOP_CAST_STR: { Value v = vm_pop(vm); receipt_conversion(); vm_push(vm, myon_bridge_cast_str(VM_BRIDGE(vm), line, v)); break; }
+        case MOP_CAST_INT: { Value v = vm_pop(vm); receipt_conversion(); vm_push(vm, myon_bridge_cast_int(VM_BRIDGE(vm), line, v)); break; }
+        case MOP_CAST_CHAR:{ Value v = vm_pop(vm); receipt_conversion(); vm_push(vm, myon_bridge_cast_char(VM_BRIDGE(vm), line, v)); break; }
         case MOP_MAKE_ERROR:{ Value v = vm_pop(vm); vm_push(vm, myon_bridge_make_error(VM_BRIDGE(vm), line, v)); break; }
 
         /* native / module calls */
@@ -1019,7 +1011,7 @@ int mvm_run_module(Module *m, Program *program, const char *source) {
     VMShared sh;
     memset(&sh, 0, sizeof(sh));
     sh.module  = m;
-    sh.program = program;
+    sh.program = program ? program : m->stored_structs;
     sh.bridge  = myon_bridge_interp_new();
     myon_bridge_set_vm_caller(sh.bridge, call_vm_callback, &sh);
 

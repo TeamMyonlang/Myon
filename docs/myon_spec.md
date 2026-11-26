@@ -347,8 +347,7 @@ p.greet()
 ```
 
 `myon.extends Parent` で親構造体を指定します。親と同名のフィールドは宣言できません。
-インスタンスの操作には self を使います。MVM で保存した `.myc` だけを実行する場合の
-宣言情報の制約は MVM リファレンス7節を参照してください。
+インスタンスの操作には self を使います。保存形式と構造体の互換性は MVM リファレンス7節を参照してください。
 
 ## 9. スコープ
 
@@ -716,16 +715,13 @@ OS のスケジューリングにより実際の間隔は変動します。
 | `secure_int` | `(lo: int, hi: int) ret int, error` | OS の CSPRNG を使った lo以上hi以下（両端含む）の乱数。`lo>hi` は `error` |
 
 seed/int/float は C の srand/rand を使います。seed の省略時は初回に時刻で初期化します。
-同じ実装の同じ seed は再現用に使えますが、OS・Cライブラリをまたいだ同一列は規定しません。
-`int` は `rand()` の結果を区間幅で剰余計算して返します。区間幅が `RAND_MAX + 1` を
-割り切らないと剰余による偏りが生じ、区間幅が `RAND_MAX + 1` を超えると出現しない値ができます。
-この乱数生成器は暗号用途には使用できません。
+同じ実装の同じ seed は再現用に使えますが、Myonの版・OS・Cライブラリをまたいだ同一列は規定しません。
+`int` は複数の出力を組み合わせ、棄却サンプリングで両端を含む全 `int` 範囲を扱います。
+この擬似乱数生成器は暗号用途には使用できません。
 
-secure_int は OS の乱数源と棄却サンプリングを使い、seed に依存しません。
-両 API の区間幅計算には、差 `hi - lo` が int の最大値を超えるとオーバーフローする
-[既知の不具合39](../known-issues.md#issue-39) があります。
+`secure_int` も全 `int` 範囲を扱い、OS の乱数源と棄却サンプリングを使います。seed には依存しません。
 macOS/BSD では `arc4random_buf()`、Linux では `/dev/urandom` を使用します。
-Windows を含め、これらの乱数源を使えない環境では error を返します。`rand()` への切り替えは行いません。
+Windows を含め、これらの乱数源を使えない環境では error を返します。
 
 ### 10.7 IPv4 ソケット
 
@@ -809,6 +805,28 @@ HTTPS の既定ポートは443、HTTPは80です。クライアントの TLS は
 クライアント証明書は未対応です。
 URLのホスト・ポート・パスに含まれる制御文字と範囲外ポートは拒否します。
 
+### 10.9 JSON
+
+`module myon.json` を宣言します。UTF-8のJSONテキストを検査し、値を型指定で読み取れます。
+selector はオプションです。省略するとルートを参照し、`str` はオブジェクトのキー、
+`int` は配列の0始まりの添字になります。重複キーを読む場合は最後の値を使います。
+
+| 関数 | 戻り値 | 動作 |
+|---|---|---|
+| `validate(text)` | `bool, error` | JSON全体を検査し、成功時は `true` |
+| `get_int(text, selector)` | `int, error` | 小数部・指数部を持たない数値を64ビット整数として読む |
+| `get_float(text, selector)` | `float, error` | JSON数値を浮動小数点数として読む |
+| `get_str(text, selector)` | `str, error` | JSON文字列のエスケープを復号する |
+| `get_bool(text, selector)` | `bool, error` | 真偽値を読む |
+| `get_object(text, selector)` / `get_array(text, selector)` | `str, error` | ネストしたコンテナをJSONテキストとして取り出す |
+| `length(text, selector)` | `int, error` | 配列要素またはオブジェクト内のキーと値の組を数える |
+| `is_null(text, selector)` | `bool, error` | 選んだ値がJSONの `null` なら `true` |
+
+JSONの不正、キーや添字の欠落、値の型の不一致、数値の範囲外は `error` を返します。
+ネストの深さには128の上限があります。JSON文字列の `\u0000` は検査できますが、
+Myonの `str` に取り出すとエラーになります。
+[分量換算のサンプル](../examples/prep.myon)は、ファイルからJSONを読み、配列の各要素を取り出します。
+
 ## 11. モジュール
 
 組み込みには myon.stdio/math/string/file/array/map/time/random/net/http/ffi があります。
@@ -844,8 +862,12 @@ external とパッケージは MVM でも共通ローダーを使用し、
 
 ```sh
 myon program.myon
+myon --check program.myon
+myon --check -
 myon --compile program.myon -o program.myc
+myon --compile --reproducible program.myon -o program.myc
 myon program.myc
+myon --receipt program.myc
 myon --run-mvm program.myon
 myon --dump-bytecode program.myc
 myon --tokens program.myon
@@ -858,6 +880,16 @@ myon --version
 それ以外はソースで、`-` は標準入力です。
 保存元のソースとの差を検出すると警告し、--strict-staleではエラーにします。
 元ソースがなければ検査を省略します。詳細は MVM リファレンス6.5節を参照してください。
+
+`--check` は字句解析・構文解析・MVMコンパイルまで行います。成功時は終了コード0で、
+書き出しや実行は行いません。実行時に計算する値の型や外部moduleの動作はこの検査の対象外です。
+`--reproducible` はビルドした場所と更新時刻を保存しないため、同じソース・Myon版・
+コンパイル設定なら、別のディレクトリでも同じ `.myc` を生成できます。
+
+`--receipt` はファイルと標準入力のソース実行、`--run-mvm`、保存済み `.myc` で使えます。
+実行終了時にstderrへ実行経路、明示的な `int()`・`str()`・`char()` の試行回数、
+`myon.print`・`myon.println`・`myon.write` がstdoutへ書いたバイト数（追記した改行を含む）、
+終了コードを出します。FFIが直接行った出力は明細のバイト数に含みません。
 
 ### 12.1 REPL
 
@@ -1046,7 +1078,6 @@ WindowsのFiberエントリはreturnせず、完了を記録してmain_fiberへ�
 ## 15. 現在の制約と検討対象
 
 この実装は IPv4 を使用し、IPv6、TLS サーバー、HTTP Keep-Alive には対応していません。
-保存済み `.myc` の構造体生成と乱数の範囲計算の不具合は [既知の問題](../known-issues.md) に記載します。
 マルチスレッド化や追加の型制約は、現実装の仕様ではありません。
 
 ## 16. 実行例
@@ -1081,5 +1112,4 @@ myon.for item myon.in numbers {
 }
 ```
 
-この例はツリーウォーク、または宣言ASTを保持する --run-mvm で実行できます。
-構造体を含む保存済み.mycの制約は MVM リファレンス7節を参照してください。
+この例はツリーウォーク、`--run-mvm`、MYC1 1.5で保存した `.myc` のいずれでも実行できます。

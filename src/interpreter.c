@@ -35,6 +35,8 @@
 #include "lexer.h"
 #include "parser.h"
 #include "diag.h"
+#include "receipt.h"
+#include "json.h"
 #include "ffi.h"
 #include "ffi_call.h"
 #include "ffi_platform.h"
@@ -863,11 +865,11 @@ static Value builtin_print_impl(Interp *it, Env *env, Expr *call,
             runtime_error(it, call->line, "%s does not accept named arguments", who);
         Value v = eval_arg(it, env, call, i);
         char *s = value_to_cstr(&v);
-        fputs(s, stream);
+        if (fputs(s, stream) != EOF && stream == stdout) receipt_stdout(strlen(s));
         free(s);
         value_free(&v);
     }
-    if (newline) fputc('\n', stream);
+    if (newline && fputc('\n', stream) != EOF && stream == stdout) receipt_stdout(1);
     return value_void();
 }
 
@@ -2170,10 +2172,27 @@ static int random_secure_bytes(unsigned char *buf, size_t n) {
 #endif
 }
 
+/* Extract uniformly distributed bits even when RAND_MAX + 1 is not a
+ * power of two. Multiple draws cover the full 64-bit integer domain. */
+static uint64_t random_prng_bits(void) {
+    uint64_t limit = 1;
+    unsigned bits = 0;
+    while (limit <= ((uint64_t)RAND_MAX + 1) / 2) {
+        limit *= 2;
+        bits++;
+    }
+    uint64_t result = 0;
+    for (unsigned offset = 0; offset < 64; offset += bits) {
+        uint64_t draw;
+        do { draw = (uint64_t)rand(); } while (draw >= limit);
+        result |= draw << offset;
+    }
+    return result;
+}
+
 static int call_random(Interp *it, Env *env, const char *name, Expr *call, Value *out) {
     int line = call->line;
 
-    /* myon.random.seed(n) ret void */
     if (strcmp(name, "myon.random.seed") == 0) {
         Value a = eval_arg(it, env, call, 0);
         if (a.type != TYPE_INT) {
@@ -2187,74 +2206,52 @@ static int call_random(Interp *it, Env *env, const char *name, Expr *call, Value
         return 1;
     }
 
-    /* myon.random.int(lo, hi) ret int, error — inclusive on both ends. */
-    if (strcmp(name, "myon.random.int") == 0) {
-        Value lo = eval_arg(it, env, call, 0), hi = eval_arg(it, env, call, 1);
-        if (lo.type != TYPE_INT || hi.type != TYPE_INT) {
-            value_free(&lo); value_free(&hi);
-            runtime_error(it, line, "myon.random.int expects (int, int)");
-        }
-        long long lov = lo.as.i, hiv = hi.as.i;
-        value_free(&lo); value_free(&hi);
-        if (lov > hiv) {
-            *out = make_result_pair(value_nil(),
-                value_error(myon_strdup("myon.random.int: lo must be <= hi")));
-            return 1;
-        }
-        random_ensure_seeded(it);
-        unsigned long long span = (unsigned long long)(hiv - lov) + 1ULL;
-        long long v = lov + (long long)((unsigned long long)rand() % span);
-        *out = make_result_pair(value_int(v), value_nil());
-        return 1;
-    }
-
-    /* myon.random.float() ret float — 0.0 <= x < 1.0 */
     if (strcmp(name, "myon.random.float") == 0) {
         random_ensure_seeded(it);
-        double v = (double)rand() / ((double)RAND_MAX + 1.0);
-        *out = value_float(v);
+        *out = value_float((double)rand() / ((double)RAND_MAX + 1.0));
         return 1;
     }
 
-    /* myon.random.secure_int(lo, hi) ret int, error — inclusive on both ends.
-     * Crypto-safe (OS CSPRNG) counterpart to myon.random.int; uses unbiased
-     * rejection sampling so every value in [lo, hi] is equiprobable.  Suitable
-     * for tokens/keys/nonces (OS CSPRNG). */
-    if (strcmp(name, "myon.random.secure_int") == 0) {
-        Value lo = eval_arg(it, env, call, 0), hi = eval_arg(it, env, call, 1);
-        if (lo.type != TYPE_INT || hi.type != TYPE_INT) {
-            value_free(&lo); value_free(&hi);
-            runtime_error(it, line, "myon.random.secure_int expects (int, int)");
+    int secure = strcmp(name, "myon.random.secure_int") == 0;
+    if (secure || strcmp(name, "myon.random.int") == 0) {
+        OwnedValues *args = owned_values_new(it, 2);
+        for (int i = 0; i < 2; i++) {
+            args->values[i] = eval_arg(it, env, call, i);
+            args->count++;
         }
-        long long lov = lo.as.i, hiv = hi.as.i;
-        value_free(&lo); value_free(&hi);
-        if (lov > hiv) {
-            *out = make_result_pair(value_nil(),
-                value_error(myon_strdup("myon.random.secure_int: lo must be <= hi")));
+        Value lo = args->values[0], hi = args->values[1];
+        if (lo.type != TYPE_INT || hi.type != TYPE_INT)
+            runtime_error(it, line, "%s expects (int, int)", name);
+        long long lower = lo.as.i, upper = hi.as.i;
+        owned_values_release(it, args);
+        if (lower > upper) {
+            char message[100];
+            snprintf(message, sizeof(message), "%s: lo must be <= hi", name);
+            *out = make_result_pair(value_nil(), value_error(myon_strdup(message)));
             return 1;
         }
-        unsigned long long span = (unsigned long long)(hiv - lov) + 1ULL;
-        unsigned long long v;
-        if (span == 0ULL) {
-            /* Full 64-bit range (lo=INT64_MIN, hi=INT64_MAX): any draw is fine. */
-            if (random_secure_bytes((unsigned char *)&v, sizeof(v)) != 0) {
+
+        const uint64_t sign = UINT64_C(1) << 63;
+        uint64_t first = (uint64_t)lower ^ sign;
+        uint64_t span = ((uint64_t)upper ^ sign) - first + 1;
+        /* Zero encodes the entire domain. Otherwise discard the partial
+         * bucket at the bottom so reduction modulo span has no bias. */
+        uint64_t threshold = span ? (UINT64_C(0) - span) % span : 0;
+        uint64_t draw;
+        if (!secure) random_ensure_seeded(it);
+        do {
+            if (!secure) {
+                draw = random_prng_bits();
+            } else if (random_secure_bytes((unsigned char *)&draw, sizeof(draw)) != 0) {
                 *out = make_result_pair(value_nil(),
                     value_error(myon_strdup("myon.random.secure_int: OS CSPRNG unavailable")));
                 return 1;
             }
-        } else {
-            /* Reject the top partial bucket to remove modulo bias. */
-            unsigned long long limit = (~0ULL) - ((~0ULL) % span);
-            do {
-                if (random_secure_bytes((unsigned char *)&v, sizeof(v)) != 0) {
-                    *out = make_result_pair(value_nil(),
-                        value_error(myon_strdup("myon.random.secure_int: OS CSPRNG unavailable")));
-                    return 1;
-                }
-            } while (v >= limit);
-            v %= span;
-        }
-        *out = make_result_pair(value_int(lov + (long long)v), value_nil());
+        } while (draw < threshold);
+        uint64_t position = first + (span ? draw % span : draw);
+        long long picked = position < sign ? INT64_MIN + (long long)position
+                                          : (long long)(position - sign);
+        *out = make_result_pair(value_int(picked), value_nil());
         return 1;
     }
 
@@ -2475,11 +2472,55 @@ static int call_net(Interp *it, Env *env, const char *name, Expr *call, Value *o
  * which the server loop depends on). */
 static int call_http(Interp *it, Env *env, const char *name, Expr *call, Value *out);
 
+static int call_json(Interp *it, Env *env, const char *name, Expr *call, Value *out) {
+    const char *op = name + strlen("myon.json.");
+    static const char *const supported[] = {
+        "validate", "length", "is_null", "get_int", "get_float", "get_str",
+        "get_bool", "get_object", "get_array"
+    };
+    size_t index = 0;
+    while (index < sizeof(supported) / sizeof(supported[0]) &&
+           strcmp(op, supported[index]) != 0) index++;
+    if (index == sizeof(supported) / sizeof(supported[0])) return 0;
+    int argc = it->bridge_args ? it->bridge_argc : call->as.call.arg_count;
+    if (argc < 1 || argc > (strcmp(op, "validate") == 0 ? 1 : 2))
+        runtime_error(it, call->line, "%s expects a JSON string and an optional selector", name);
+
+    /* Protect the first argument while evaluating an optional second one. */
+    OwnedValues *args = owned_values_new(it, argc);
+    for (int i = 0; i < argc; i++) {
+        args->values[i] = eval_arg(it, env, call, i);
+        args->count++;
+    }
+    Value *values = args->values;
+    if (values[0].type != TYPE_STR ||
+        (argc == 2 && values[1].type != TYPE_STR && values[1].type != TYPE_INT)) {
+        runtime_error(it, call->line, "%s expects a str and a str or int selector", name);
+    }
+    Value result;
+    const char *error = myon_json_read(values[0].as.obj->as.str, op,
+                                      argc == 2 ? &values[1] : NULL, &result);
+    owned_values_release(it, args);
+    if (error) {
+        char message[192];
+        snprintf(message, sizeof(message), "%s: %s", name, error);
+        value_free(&result);
+        result = value_nil();
+        *out = make_result_pair(result, value_error(myon_strdup(message)));
+    } else {
+        *out = make_result_pair(result, value_nil());
+    }
+    return 1;
+}
+
 /* dispatch a "myon.math.<fn>" or "myon.string.<fn>" call.
  * Returns 1 and sets *out if handled. */
 static int call_stdlib(Interp *it, Env *env, const char *name, Expr *call, Value *out) {
     int argc = call->as.call.arg_count;
     int line = call->line;
+
+    if (strncmp(name, "myon.json.", 10) == 0)
+        return call_json(it, env, name, call, out);
 
     /* ---- myon.file (file I/O, P4) ---- */
     if (strncmp(name, "myon.file.", 10) == 0) {
@@ -4727,12 +4768,21 @@ static Value eval_expr(Interp *it, Env *env, Expr *e) {
             return v;
         }
 
-        case EXPR_STR_CTOR:
-            return cast_to_str(it, e->line, eval_expr(it, env, e->as.operand));
-        case EXPR_INT_CTOR:
-            return cast_to_int(it, e->line, eval_expr(it, env, e->as.operand));
-        case EXPR_CHAR_CTOR:
-            return cast_to_char(it, e->line, eval_expr(it, env, e->as.operand));
+        case EXPR_STR_CTOR: {
+            Value v = eval_expr(it, env, e->as.operand);
+            receipt_conversion();
+            return cast_to_str(it, e->line, v);
+        }
+        case EXPR_INT_CTOR: {
+            Value v = eval_expr(it, env, e->as.operand);
+            receipt_conversion();
+            return cast_to_int(it, e->line, v);
+        }
+        case EXPR_CHAR_CTOR: {
+            Value v = eval_expr(it, env, e->as.operand);
+            receipt_conversion();
+            return cast_to_char(it, e->line, v);
+        }
         case EXPR_ERROR_CTOR: {
             Value v = eval_expr(it, env, e->as.operand);
             if (v.type != TYPE_STR) {

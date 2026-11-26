@@ -165,7 +165,7 @@ typedef enum {
  * Minor 3: RESET_LOCAL separates binding lifetimes; package imports use the bridge.
  * Minor 4: BIND_EXTERNAL connects local capture cells to imported namespaces.
  */
-#define MVM_VERSION_MINOR 4
+#define MVM_VERSION_MINOR 5
 #define MVM_ENDIAN_LITTLE 1
 
 /*
